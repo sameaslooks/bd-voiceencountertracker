@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Voice Encounter Overlay</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+        background: transparent;
+        font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+        color: #dcddde;
+        font-size: 13px;
+        overflow: hidden;
+        user-select: none;
+        height: 100vh;
+    }
+
+    #drag-bar {
+        height: 18px;
+        -webkit-app-region: drag;
+        cursor: grab;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 6px;
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        opacity: 0.55;
+        color: #fff;
+    }
+    #drag-bar .count { opacity: 0.7; }
+
+    #app {
+        height: calc(100vh - 18px);
+        padding: 4px 8px 8px;
+        background: rgba(14, 15, 18, 0.72);
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        backdrop-filter: blur(10px);
+        overflow-y: auto;
+        overflow-x: hidden;
+    }
+    #app::-webkit-scrollbar { width: 4px; }
+    #app::-webkit-scrollbar-thumb {
+        background: rgba(255,255,255,0.15);
+        border-radius: 2px;
+    }
+
+    /* ─── User row ─── */
+    .user {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 2px;
+        border-radius: 6px;
+        transition: background 0.15s;
+    }
+    .user:hover { background: rgba(255, 255, 255, 0.04); }
+
+    .user .avatar-wrap {
+        position: relative;
+        width: 24px;
+        height: 24px;
+        flex-shrink: 0;
+    }
+    .user .avatar-wrap img {
+        width: 100%;
+        height: 100%;
+        border-radius: 50%;
+        background: #2f3136;
+        transition: box-shadow 0.12s ease-out;
+    }
+    .user.speaking .avatar-wrap img {
+        box-shadow: 0 0 0 2px #3ba55d,
+                    0 0 8px 1px rgba(59, 165, 93, 0.5);
+    }
+
+    .user .name {
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-size: 12px;
+    }
+    .user.self .name {
+        font-weight: 600;
+        opacity: 0.85;
+    }
+
+    /* ─── Action buttons ───
+       Hidden by default. Shown only while the cursor is inside the overlay
+       window (i.e. when #app is :hover'd). Hidden buttons are also made
+       non-interactive to avoid accidental clicks. */
+    .user .actions {
+        display: flex;
+        gap: 2px;
+        flex-shrink: 0;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.15s;
+        margin-right: 4px;
+    }
+    #app:hover .user .actions {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    .user .act {
+        background: transparent;
+        border: none;
+        color: #a3a6aa;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        padding: 2px 4px;
+        line-height: 1;
+        border-radius: 3px;
+        transition: background 0.1s, color 0.1s;
+        -webkit-app-region: no-drag;
+    }
+    .user .act:hover {
+        background: rgba(255,255,255,0.08);
+        color: #fff;
+    }
+    .user .act.active { color: #fff; }
+    .user .act.block.active  { color: #ed4245; }
+    .user .act.ignore.active { color: #faa61a; }
+    .user .act.mute.active   { color: #72767d; }
+
+    /* ─── Status badge (rightmost) ─── */
+    .user .badge {
+        font-size: 13px;
+        font-weight: bold;
+        line-height: 1;
+        flex-shrink: 0;
+        width: 14px;
+        text-align: center;
+    }
+
+    /* ─── Just joined flash ─── */
+    .user.just-joined {
+        animation: joinFlash 1.2s ease-out;
+    }
+    @keyframes joinFlash {
+        0%   { background: rgba(88, 101, 242, 0.25); }
+        100% { background: transparent; }
+    }
+
+    #empty {
+        opacity: 0.45;
+        font-size: 11px;
+        padding: 12px 0;
+        text-align: center;
+    }
+
+    #status {
+        position: absolute;
+        top: 24px;
+        right: 10px;
+        font-size: 9px;
+        opacity: 0.5;
+        pointer-events: none;
+    }
+    #status.offline { color: #ed4245; opacity: 0.9; }
+    #status.online  { color: #3ba55d; opacity: 0.9; }
+</style>
+</head>
+<body>
+
+<div id="drag-bar">
+    <span id="channel-name">Voice</span>
+    <span class="count" id="count"></span>
+</div>
+
+<div id="app">
+    <div id="users"></div>
+    <div id="empty">No one in the channel</div>
+</div>
+
+<div id="status" class="offline">●</div>
+
+<script>
+const API_STATE    = "http://127.0.0.1:17842/state";
+const API_SPEAKING = "http://127.0.0.1:17842/speaking";
+const API_COMMAND  = "http://127.0.0.1:17842/command";
+
+const REFRESH_STATE_MS    = 1000;
+const REFRESH_SPEAKING_MS = 250;
+
+const elChannelName = document.getElementById("channel-name");
+const elCount       = document.getElementById("count");
+const elUsers       = document.getElementById("users");
+const elEmpty       = document.getElementById("empty");
+const elStatus      = document.getElementById("status");
+const elApp         = document.getElementById("app");
+
+let currentUsers   = [];
+let speakingSet    = new Set();
+let knownJoinTime  = new Map();
+let lastChannelId  = null;
+let lastStateSig   = "";
+
+function badgeFor(kind) {
+    switch (kind) {
+        case "blocked": return { glyph: "⊘", color: "#ed4245" };
+        case "ignored": return { glyph: "⊘", color: "#faa61a" };
+        case "muted":   return { glyph: "○", color: "#72767d" };
+        case "known":   return { glyph: "✓", color: "#3ba55d" };
+        default:        return { glyph: "!", color: "#a3a6aa" };
+    }
+}
+
+function avatarUrl(u) {
+    if (u.avatar) return `https://cdn.discordapp.com/avatars/${u.userId}/${u.avatar}.png?size=64`;
+    const idx = Number((BigInt(u.userId) >> 22n) % 6n);
+    return `https://cdn.discordapp.com/embed/avatars/${idx}.png`;
+}
+
+function esc(s) {
+    return String(s).replace(/[&<>"]/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"
+    }[c]));
+}
+
+function renderState(data) {
+    const users = Array.isArray(data.users) ? data.users : [];
+    const channelId = data.channelId ?? null;
+
+    if (channelId !== lastChannelId) {
+        knownJoinTime.clear();
+        lastChannelId = channelId;
+        lastStateSig = "";
+    }
+
+    const now = Date.now();
+    const newJoiners = [];
+    for (const u of users) {
+        if (!knownJoinTime.has(u.userId)) {
+            knownJoinTime.set(u.userId, now);
+            newJoiners.push(u.userId);
+        }
+    }
+    const present = new Set(users.map(u => u.userId));
+    for (const id of [...knownJoinTime.keys()]) {
+        if (!present.has(id)) knownJoinTime.delete(id);
+    }
+
+    users.sort((a, b) => {
+        const ta = knownJoinTime.get(a.userId) ?? 0;
+        const tb = knownJoinTime.get(b.userId) ?? 0;
+        return ta - tb;
+    });
+
+    elChannelName.textContent = data.channelName || "Voice";
+    elCount.textContent = users.length ? `(${users.length})` : "";
+
+    const sig = users.map(u =>
+        `${u.userId}:${u.kind}:${u.blocked?1:0}:${u.ignored?1:0}:${u.muted?1:0}:${u.isSelf?1:0}`
+    ).join("|");
+
+    if (sig !== lastStateSig || newJoiners.length > 0) {
+        lastStateSig = sig;
+        currentUsers = users;
+
+        if (users.length === 0) {
+            elUsers.innerHTML = "";
+            elEmpty.style.display = "block";
+            return;
+        }
+        elEmpty.style.display = "none";
+
+        elUsers.innerHTML = users.map(u => {
+            const b = badgeFor(u.kind);
+            const justJoined = newJoiners.includes(u.userId) ? " just-joined" : "";
+            const speakingCls = speakingSet.has(u.userId) ? " speaking" : "";
+            const selfCls = u.isSelf ? " self" : "";
+            const blockCls  = u.blocked ? " active" : "";
+            const ignoreCls = u.ignored ? " active" : "";
+            const muteCls   = u.muted   ? " active" : "";
+
+            const blockTitle  = u.blocked ? "Unblock"  : "Block";
+            const ignoreTitle = u.ignored ? "Unignore" : "Ignore";
+            const muteTitle   = u.muted   ? "Unmute"   : "Mute in voice";
+
+            const blockAct  = u.blocked ? "unblock"  : "block";
+            const ignoreAct = u.ignored ? "unignore" : "ignore";
+            const muteAct   = u.muted   ? "unmute"   : "mute";
+
+            const actions = u.isSelf ? "" : `
+                <div class="actions">
+                    <button class="act block${blockCls}" data-act="${blockAct}" data-uid="${u.userId}" title="${blockTitle}">⊘</button>
+                    <button class="act ignore${ignoreCls}" data-act="${ignoreAct}" data-uid="${u.userId}" title="${ignoreTitle}">⊘</button>
+                    <button class="act mute${muteCls}" data-act="${muteAct}" data-uid="${u.userId}" title="${muteTitle}">○</button>
+                </div>`;
+
+            return `<div class="user${justJoined}${speakingCls}${selfCls}" data-user-id="${u.userId}">
+                <div class="avatar-wrap">
+                    <img src="${avatarUrl(u)}" onerror="this.style.opacity='0.3'">
+                </div>
+                <span class="name" title="${esc(u.username)}">${esc(u.username)}</span>
+                ${actions}
+                <span class="badge" style="color:${b.color}" title="${u.kind}">${b.glyph}</span>
+            </div>`;
+        }).join("");
+
+        if (newJoiners.length > 0 && elApp.scrollHeight > elApp.clientHeight) {
+            elApp.scrollTop = elApp.scrollHeight;
+        }
+    }
+}
+
+function applySpeaking(newSpeakers) {
+    speakingSet = new Set(newSpeakers);
+    const rows = elUsers.querySelectorAll(".user");
+    rows.forEach(row => {
+        const userId = row.getAttribute("data-user-id");
+        const shouldSpeak = speakingSet.has(userId);
+        const has = row.classList.contains("speaking");
+        if (shouldSpeak && !has) row.classList.add("speaking");
+        else if (!shouldSpeak && has) row.classList.remove("speaking");
+    });
+}
+
+async function tickState() {
+    try {
+        const res = await fetch(API_STATE, { cache: "no-store" });
+        if (!res.ok) throw new Error("bad status");
+        const data = await res.json();
+        elStatus.className = "online";
+        renderState(data);
+    } catch (e) {
+        elStatus.className = "offline";
+        elChannelName.textContent = "Server offline";
+        elCount.textContent = "";
+        elUsers.innerHTML = "";
+        elEmpty.style.display = "block";
+        elEmpty.textContent = "Overlay server not running";
+        lastStateSig = "";
+        lastChannelId = null;
+        knownJoinTime.clear();
+        speakingSet.clear();
+    }
+    setTimeout(tickState, REFRESH_STATE_MS);
+}
+
+async function tickSpeaking() {
+    try {
+        const res = await fetch(API_SPEAKING, { cache: "no-store" });
+        if (!res.ok) throw new Error("bad status");
+        const data = await res.json();
+        applySpeaking(Array.isArray(data.speakers) ? data.speakers : []);
+    } catch (e) {}
+    setTimeout(tickSpeaking, REFRESH_SPEAKING_MS);
+}
+
+function sendCommand(action, userId) {
+    fetch(API_COMMAND, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, userId })
+    }).catch(() => {});
+}
+
+elUsers.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-act]");
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const action = btn.getAttribute("data-act");
+    const userId = btn.getAttribute("data-uid");
+    if (!action || !userId) return;
+    sendCommand(action, userId);
+});
+
+tickState();
+tickSpeaking();
+</script>
+</body>
+</html>

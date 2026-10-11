@@ -1,0 +1,13 @@
+{
+  "name": "voice-encounter-overlay",
+  "version": "1.0.0",
+  "description": "Overlay for VoiceEncounterTracker",
+  "main": "overlay-app.js",
+  "scripts": {
+    "start": "electron overlay-app.js"
+  },
+  "dependencies": {
+    "electron": "^33.4.11",
+    "pngjs": "^7.0.0"
+  }
+}
