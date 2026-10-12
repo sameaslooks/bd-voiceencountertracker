@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Stream Source</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+        background: transparent;
+        font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+        color: #dcddde;
+        font-size: 12px;
+        overflow: hidden;
+        user-select: none;
+        height: 100vh;
+    }
+    body {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        background: #1e1f22;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+        overflow: hidden;
+    }
+    #popup {
+        flex: 1 1 auto;
+        overflow-y: auto;
+        padding: 6px 0;
+        min-height: 0;
+    }
+    #popup::-webkit-scrollbar { width: 6px; }
+    #popup::-webkit-scrollbar-track { background: transparent; }
+    #popup::-webkit-scrollbar-thumb {
+        background: rgba(255,255,255,0.15);
+        border-radius: 3px;
+    }
+    .sp-group {
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        opacity: 0.5;
+        padding: 6px 12px 3px;
+    }
+    .sp-item {
+        padding: 6px 12px 6px 24px;
+        cursor: pointer;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        position: relative;
+        transition: background 0.1s;
+    }
+    .sp-item:hover {
+        background: rgba(255, 255, 255, 0.06);
+    }
+    .sp-item.active::before {
+        content: "✓";
+        position: absolute;
+        left: 10px;
+        color: #3ba55d;
+    }
+    .sp-current {
+        padding: 4px 12px 6px;
+        font-size: 11px;
+        color: #c9a9ff;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        opacity: 0.9;
+    }
+    .sp-sep {
+        height: 1px;
+        background: rgba(255, 255, 255, 0.08);
+        margin: 4px 8px;
+    }
+    .sp-footer {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        cursor: pointer;
+        user-select: none;
+        font-size: 11px;
+        color: #dcddde;
+    }
+    .sp-footer:hover {
+        background: rgba(255, 255, 255, 0.04);
+    }
+    .sp-footer input[type="checkbox"] {
+        accent-color: #5865f2;
+        cursor: pointer;
+    }
+    .sp-footer .sp-footer-label {
+        flex: 1;
+    }
+    .sp-footer .sp-footer-hint {
+        opacity: 0.5;
+        font-size: 10px;
+    }
+    .sp-empty {
+        padding: 12px;
+        opacity: 0.5;
+        text-align: center;
+        font-style: italic;
+    }
+</style>
+</head>
+<body>
+    <div id="popup"></div>
+    <div class="sp-footer" id="sound-toggle">
+        <input type="checkbox" id="sound-checkbox">
+        <span class="sp-footer-label">Include audio</span>
+        <span class="sp-footer-hint" id="sound-hint"></span>
+    </div>
+<script>
+const API_SOURCES   = "http://127.0.0.1:17842/sources";
+const API_COMMAND   = "http://127.0.0.1:17842/command";
+const API_PREFERRED = "http://127.0.0.1:17842/sources/preferred";
+const API_CLOSE     = "http://127.0.0.1:17842/popup/close";
+
+const elPopup = document.getElementById("popup");
+
+let sources = [];
+let preferredId = null;
+
+function esc(s) {
+    return String(s).replace(/[&<>"]/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"
+    }[c]));
+}
+
+function render() {
+    const screens = sources.filter(s => s.type === "screen");
+    const windows = sources.filter(s => s.type === "window");
+
+    const appCounts = new Map();
+    for (const w of windows) {
+        const k = (w.appName || w.name || "").toLowerCase();
+        appCounts.set(k, (appCounts.get(k) || 0) + 1);
+    }
+
+    const itemHtml = (s, label) => {
+        const active = s.id === preferredId ? " active" : "";
+        return `<div class="sp-item${active}" data-id="${esc(s.id)}" title="${esc(label)}">${esc(label)}</div>`;
+    };
+
+    const screensHtml = screens.length
+        ? screens.map(s => itemHtml(s, s.label || s.name || s.id)).join("")
+        : `<div class="sp-empty">No screens</div>`;
+
+    const windowsHtml = windows.length
+        ? windows.map(w => {
+            const appName = w.appName || w.name || w.id;
+            const count = appCounts.get(appName.toLowerCase()) || 1;
+            let label = appName;
+            if (count > 1) {
+                const title = w.name || "";
+                label = title ? `${appName} — ${title}` : appName;
+            }
+            return itemHtml(w, label);
+        }).join("")
+        : `<div class="sp-empty">No windows</div>`;
+
+    // Determine current source label
+    let currentLabel = "(none)";
+    if (preferredId) {
+        const cur = sources.find(s => s.id === preferredId);
+        if (cur) {
+            currentLabel = cur.label || cur.appName || cur.name || cur.id;
+        }
+    }
+
+    elPopup.innerHTML =
+        `<div class="sp-group">Current</div>` +
+        `<div class="sp-current" title="${esc(currentLabel)}">${esc(currentLabel)}</div>` +
+        `<div class="sp-sep"></div>` +
+        `<div class="sp-group">Screens</div>${screensHtml}` +
+        `<div class="sp-sep"></div>` +
+        `<div class="sp-group">Windows</div>${windowsHtml}`;
+}
+
+let soundLive = false;
+
+async function loadAndRender() {
+    try {
+        const r = await fetch(API_SOURCES, { cache: "no-store" });
+        const data = await r.json();
+        sources = Array.isArray(data?.sources) ? data.sources : [];
+        preferredId = data?.preferredId || null;
+        soundEnabled = data?.sound !== false;
+        soundLive = data?.soundLive === true;
+    } catch (e) {
+        sources = [];
+        preferredId = null;
+        soundEnabled = true;
+        soundLive = false;
+    }
+    render();
+    updateSoundUi();
+}
+
+elPopup.addEventListener("click", async (e) => {
+    const item = e.target.closest(".sp-item");
+    if (!item) return;
+    const id = item.getAttribute("data-id");
+    if (!id) return;
+
+    const src = sources.find(s => s.id === id);
+    if (!src) return;
+
+    preferredId = id;
+    render();
+
+    try {
+        await fetch(API_PREFERRED, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id })
+        });
+    } catch (e) {}
+
+    let discordSourceId = null;
+    let label = src.label || src.name || src.appName || id;
+
+    if (src.type === "screen") {
+        if (src.handle == null) return;
+        discordSourceId = `screen-handle:${src.handle}`;
+    } else if (src.type === "window") {
+        const m = /^window:(\d+):/.exec(id);
+        if (!m) return;
+        discordSourceId = `window-handle:${m[1]}`;
+    }
+    if (!discordSourceId) return;
+
+    try {
+        await fetch(API_COMMAND, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                action: "switch-source",
+                userId: "self",
+                sourceId: discordSourceId,
+                name: label
+            })
+        });
+    } catch (e) {}
+
+    fetch(API_CLOSE, { method: "POST" }).catch(() => {});
+});
+
+const elSoundToggle = document.getElementById("sound-toggle");
+const elSoundCheckbox = document.getElementById("sound-checkbox");
+const elSoundHint = document.getElementById("sound-hint");
+
+function updateSoundUi() {
+    elSoundCheckbox.checked = soundEnabled;
+    elSoundHint.textContent = (soundEnabled ? "on" : "off") + (soundLive ? " · live" : "");
+}
+
+elSoundCheckbox.addEventListener("change", async () => {
+    soundEnabled = elSoundCheckbox.checked;
+    updateSoundUi();
+
+    // Save to settings + ask plugin to apply live if streaming.
+    try {
+        await fetch("http://127.0.0.1:17842/sources/sound", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: soundEnabled })
+        });
+    } catch (e) {}
+});
+
+elSoundToggle.addEventListener("click", (e) => {
+    if (e.target === elSoundCheckbox) return;
+    elSoundCheckbox.checked = !elSoundCheckbox.checked;
+    elSoundCheckbox.dispatchEvent(new Event("change"));
+});
+
+loadAndRender();
+setInterval(loadAndRender, 3000);
+</script>
+</body>
+</html>

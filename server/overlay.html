@@ -15,39 +15,229 @@
         height: 100vh;
     }
 
+    #app {
+        height: 100vh;
+        padding: 0;
+        background: #0e0f12;
+        border-radius: 10px;
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+    }
+
+    /* ─── Header ─── */
     #drag-bar {
-        height: 18px;
+        height: 22px;
+        flex-shrink: 0;
         -webkit-app-region: drag;
         cursor: grab;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 0 6px;
-        font-size: 9px;
+        padding: 0 10px;
+        font-size: 10px;
         text-transform: uppercase;
         letter-spacing: 0.6px;
-        opacity: 0.55;
-        color: #fff;
+        color: #dcddde;
+        background: rgba(255, 255, 255, 0.02);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        gap: 6px;
+    }
+    #drag-bar .header-left {
+        display: flex;
+        align-items: center;
+        min-width: 0;
+        flex: 1 1 auto;
+    }
+    #drag-bar .header-right {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+    }
+    #drag-bar #channel-name {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
     }
     #drag-bar .count { opacity: 0.7; }
 
-    #app {
-        height: calc(100vh - 18px);
-        padding: 4px 8px 8px;
-        background: rgba(14, 15, 18, 0.72);
-        border-radius: 10px;
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        backdrop-filter: blur(10px);
-        overflow-y: auto;
-        overflow-x: hidden;
+    #stream-source-btn {
+        background: transparent;
+        border: none;
+        color: #a3a6aa;
+        cursor: pointer;
+        padding: 2px 3px;
+        border-radius: 3px;
+        display: inline-flex;
+        align-items: center;
+        -webkit-app-region: no-drag;
+        transition: background 0.1s, color 0.1s;
     }
-    #app::-webkit-scrollbar { width: 4px; }
-    #app::-webkit-scrollbar-thumb {
-        background: rgba(255,255,255,0.15);
-        border-radius: 2px;
+    #stream-source-btn:hover {
+        background: rgba(255,255,255,0.08);
+        color: #fff;
     }
 
-    /* ─── User row ─── */
+    /* ─── Signal bars ─── */
+    #signal {
+        display: inline-flex;
+        align-items: flex-end;
+        gap: 1.5px;
+        height: 12px;
+        cursor: default;
+        flex-shrink: 0;
+    }
+    #signal .bar {
+        display: inline-block;
+        width: 3px;
+        border-radius: 1px;
+        background: currentColor;
+        opacity: 0.25;
+        transition: background 0.2s, opacity 0.2s;
+    }
+    #signal .bar:nth-child(1) { height: 4px; }
+    #signal .bar:nth-child(2) { height: 6px; }
+    #signal .bar:nth-child(3) { height: 8px; }
+    #signal .bar:nth-child(4) { height: 10px; }
+
+    #signal[data-level="ok"] { color: #3ba55d; }
+    #signal[data-level="ok"] .bar { opacity: 1; }
+
+    #signal[data-level="unstable"] { color: #faa61a; }
+    #signal[data-level="unstable"] .bar:nth-child(1),
+    #signal[data-level="unstable"] .bar:nth-child(2),
+    #signal[data-level="unstable"] .bar:nth-child(3) { opacity: 1; }
+    #signal[data-level="unstable"] .bar:nth-child(4) { opacity: 0.25; }
+
+    #signal[data-level="critical"] { color: #ff8c00; }
+    #signal[data-level="critical"] .bar:nth-child(1),
+    #signal[data-level="critical"] .bar:nth-child(2) { opacity: 1; }
+    #signal[data-level="critical"] .bar:nth-child(3),
+    #signal[data-level="critical"] .bar:nth-child(4) { opacity: 0.25; }
+
+    #signal[data-level="lost"] { color: #ed4245; }
+    #signal[data-level="lost"] .bar:nth-child(1) { opacity: 1; }
+    #signal[data-level="lost"] .bar:nth-child(2),
+    #signal[data-level="lost"] .bar:nth-child(3),
+    #signal[data-level="lost"] .bar:nth-child(4) { opacity: 0.25; }
+
+    #signal[data-level="off"] {
+        color: #4a4d52;
+        pointer-events: none;
+    }
+    #signal[data-level="off"] .bar { opacity: 0.35; }
+
+    /* ─── Network banner ─── */
+    #net {
+        display: none;
+        flex-shrink: 0;
+        padding: 3px 10px 4px;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.4px;
+        text-transform: uppercase;
+        text-align: center;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+    #net[data-level="unstable"] {
+        display: block;
+        color: #faa61a;
+        background: rgba(250, 166, 26, 0.06);
+    }
+    #net[data-level="critical"] {
+        display: block;
+        color: #ff8c00;
+        background: rgba(255, 140, 0, 0.08);
+    }
+    #net[data-level="lost"] {
+        display: block;
+        color: #ed4245;
+        background: rgba(237, 66, 69, 0.10);
+    }
+    #net .net-line-1 {
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        line-height: 1.2;
+    }
+    #net .net-line-2 {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0;
+        font-size: 9px;
+        font-weight: 500;
+        opacity: 0.85;
+        letter-spacing: 0.3px;
+        margin-top: 1px;
+        text-transform: none;
+    }
+    #net .net-line-2 .net-left,
+    #net .net-line-2 .net-right {
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+    }
+    #net .net-line-2 .net-right { opacity: 0.9; }
+    #net .net-line-2 .net-sep {
+        display: inline-block;
+        width: 1px;
+        height: 9px;
+        margin: 0 8px;
+        background: currentColor;
+        opacity: 0.35;
+        flex-shrink: 0;
+    }
+
+    /* ─── User list ─── */
+    #users-wrap {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 6px;
+        display: flex;
+        flex-direction: column;
+    }
+    #users-wrap::-webkit-scrollbar { width: 4px; }
+    #users-wrap::-webkit-scrollbar-track { background: transparent; }
+    #users-wrap::-webkit-scrollbar-thumb {
+        background: transparent;
+        border-radius: 2px;
+        transition: background 0.15s;
+    }
+    #users-wrap:hover::-webkit-scrollbar-thumb {
+        background: rgba(255,255,255,0.15);
+    }
+    #users { flex: 0 0 auto; }
+
+    #empty {
+        flex: 1 1 auto;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        opacity: 0.55;
+        font-size: 11px;
+        padding: 0;
+        text-align: center;
+        line-height: 1.5;
+        white-space: pre-line;
+        color: #a3a6aa;
+    }
+    #empty.offline {
+        color: #ed4245;
+        opacity: 0.9;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+    }
+    #empty.idle {
+        color: #a3a6aa;
+        opacity: 0.7;
+    }
+
     .user {
         display: flex;
         align-items: center;
@@ -77,21 +267,21 @@
     }
 
     .user .name {
-        flex: 1;
+        flex: 0 1 auto;
+        max-width: 140px;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
         font-size: 12px;
+        min-width: 0;
     }
     .user.self .name {
         font-weight: 600;
         opacity: 0.85;
     }
 
-    /* ─── Action buttons ───
-       Hidden by default. Shown only while the cursor is inside the overlay
-       window (i.e. when #app is :hover'd). Hidden buttons are also made
-       non-interactive to avoid accidental clicks. */
+    .user .spacer { flex: 1 1 auto; min-width: 0; }
+
     .user .actions {
         display: flex;
         gap: 2px;
@@ -101,7 +291,7 @@
         transition: opacity 0.15s;
         margin-right: 4px;
     }
-    #app:hover .user .actions {
+    #users-wrap:hover .user .actions {
         opacity: 1;
         pointer-events: auto;
     }
@@ -110,25 +300,110 @@
         background: transparent;
         border: none;
         color: #a3a6aa;
-        font-size: 12px;
-        font-weight: 700;
         cursor: pointer;
-        padding: 2px 4px;
+        padding: 3px;
         line-height: 1;
         border-radius: 3px;
         transition: background 0.1s, color 0.1s;
         -webkit-app-region: no-drag;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
     }
     .user .act:hover {
         background: rgba(255,255,255,0.08);
         color: #fff;
     }
+    .user .act svg {
+        width: 13px;
+        height: 13px;
+        display: block;
+        pointer-events: none;
+        fill: currentColor;
+    }
     .user .act.active { color: #fff; }
-    .user .act.block.active  { color: #ed4245; }
-    .user .act.ignore.active { color: #faa61a; }
-    .user .act.mute.active   { color: #72767d; }
 
-    /* ─── Status badge (rightmost) ─── */
+    .user .act.block           { color: #a3a6aa; }
+    .user .act.block:hover     { color: #ed4245; }
+    .user .act.block.active    { color: #ed4245; }
+
+    .user .act.ignore          { color: #a3a6aa; }
+    .user .act.ignore:hover    { color: #faa61a; }
+    .user .act.ignore.active   { color: #faa61a; }
+
+    .user .act.mute            { color: #a3a6aa; }
+    .user .act.mute.active     { color: #72767d; }
+
+    .user .act.self-mute.active   { color: #ed4245; }
+    .user .act.self-deaf.active   { color: #ed4245; }
+    .user .act.self-stream.active { color: #9146ff; }
+
+    .user .vstatus {
+        display: flex;
+        align-items: center;
+        gap: 3px;
+        flex-shrink: 0;
+        margin-right: 4px;
+        line-height: 1;
+    }
+    .user .vstatus .vs-svg {
+        width: 14px;
+        height: 14px;
+        display: inline-block;
+        flex-shrink: 0;
+        color: #72767d;
+        transition: color 0.4s ease-out, opacity 0.4s ease-out;
+    }
+    .user .vstatus .vs-svg.self     { color: #72767d; opacity: 0.9; }
+    .user .vstatus .vs-svg.server   { color: #ed4245; }
+    .user .vstatus .vs-svg.video    { color: #3ba55d; }
+
+    .user .vstatus .vs-svg.recent {
+        color: #ffd24a;
+        opacity: 1;
+    }
+    .user .vstatus .vs-svg.pulse {
+        animation: vsPulseYellow 0.9s ease-in-out infinite;
+    }
+    @keyframes vsPulseYellow {
+        0%   { color: #ffd24a; }
+        50%  { color: #72767d; }
+        100% { color: #ffd24a; }
+    }
+    .user .vstatus .vs-svg.recent-unmute {
+        color: #57f287;
+        opacity: 1;
+    }
+    .user .vstatus .vs-svg.pulse-unmute {
+        animation: vsPulseGreen 0.9s ease-in-out infinite;
+    }
+    @keyframes vsPulseGreen {
+        0%   { color: #57f287; }
+        50%  { color: #72767d; }
+        100% { color: #57f287; }
+    }
+
+    .user .vs-live {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 1px 5px;
+        font-size: 8px;
+        font-weight: 800;
+        letter-spacing: 0.4px;
+        line-height: 1.2;
+        color: #fff;
+        background: #ed4245;
+        border-radius: 999px;
+        cursor: pointer;
+        -webkit-app-region: no-drag;
+        user-select: none;
+        text-transform: uppercase;
+        flex-shrink: 0;
+        margin-right: 4px;
+    }
+    .user .vs-live:hover { background: #c93b3e; }
+
     .user .badge {
         font-size: 13px;
         font-weight: bold;
@@ -138,7 +413,6 @@
         text-align: center;
     }
 
-    /* ─── Just joined flash ─── */
     .user.just-joined {
         animation: joinFlash 1.2s ease-out;
     }
@@ -146,60 +420,127 @@
         0%   { background: rgba(88, 101, 242, 0.25); }
         100% { background: transparent; }
     }
-
-    #empty {
-        opacity: 0.45;
-        font-size: 11px;
-        padding: 12px 0;
-        text-align: center;
-    }
-
-    #status {
-        position: absolute;
-        top: 24px;
-        right: 10px;
-        font-size: 9px;
-        opacity: 0.5;
-        pointer-events: none;
-    }
-    #status.offline { color: #ed4245; opacity: 0.9; }
-    #status.online  { color: #3ba55d; opacity: 0.9; }
 </style>
 </head>
 <body>
 
-<div id="drag-bar">
-    <span id="channel-name">Voice</span>
-    <span class="count" id="count"></span>
-</div>
-
 <div id="app">
-    <div id="users"></div>
-    <div id="empty">No one in the channel</div>
-</div>
+    <div id="drag-bar">
+        <span class="header-left">
+            <span id="channel-name">Voice</span>
+        </span>
+        <span class="header-right">
+            <button id="stream-source-btn" type="button" title="Stream source">
+                <svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true">
+                    <path fill="currentColor" d="M4 4a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h16a3 3 0 0 0 3-3V7a3 3 0 0 0-3-3H4Zm0 2h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z"/>
+                </svg>
+            </button>
+            <span id="signal" data-level="ok">
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+            </span>
+            <span class="count" id="count"></span>
+        </span>
+    </div>
 
-<div id="status" class="offline">●</div>
+    <div id="net" data-level="ok">
+        <div class="net-line-1" id="net-line-1"></div>
+        <div class="net-line-2">
+            <span class="net-left" id="net-left"></span>
+            <span class="net-sep"></span>
+            <span class="net-right" id="net-right"></span>
+        </div>
+    </div>
+
+    <div id="users-wrap">
+        <div id="users"></div>
+        <div id="empty" class="idle">NOT IN VOICE</div>
+    </div>
+</div>
 
 <script>
 const API_STATE    = "http://127.0.0.1:17842/state";
 const API_SPEAKING = "http://127.0.0.1:17842/speaking";
 const API_COMMAND  = "http://127.0.0.1:17842/command";
 
-const REFRESH_STATE_MS    = 1000;
+const REFRESH_STATE_MS    = 250;
 const REFRESH_SPEAKING_MS = 250;
+
+const RECENT_WINDOW_MS   = 30_000;
+const PULSE_WINDOW_MS    = 15_000;
+const JOINED_MS          = 1200;
+
+const PENDING_TTL_MS     = 2000;
+
+const PATH_MUTE =
+    "m2.7 22.7 20-20a1 1 0 0 0-1.4-1.4l-20 20a1 1 0 1 0 1.4 1.4Z" +
+    "M10.8 17.32c-.21.21-.1.58.2.62V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.06A8 8 0 0 0 20 10a1 1 0 0 0-2 0c0 1.45-.52 2.79-1.38 3.83l-.02.02A5.99 5.99 0 0 1 12.32 16a.52.52 0 0 0-.34.15l-1.18 1.18Z" +
+    "M15.36 4.52c.15-.15.19-.38.08-.56A4 4 0 0 0 8 6v4c0 .3.03.58.1.86.07.34.49.43.74.18l6.52-6.52Z" +
+    "M5.06 13.98c.16.28.53.31.75.09l.75-.75c.16-.16.19-.4.08-.61A5.97 5.97 0 0 1 6 10a1 1 0 0 0-2 0c0 1.45.39 2.81 1.06 3.98Z";
+
+const PATH_DEAF =
+    "M22.7 2.7a1 1 0 0 0-1.4-1.4l-20 20a1 1 0 1 0 1.4 1.4l20-20Z" +
+    "M17.06 2.94a.48.48 0 0 0-.11-.77A11 11 0 0 0 2.18 16.94c.14.3.53.35.76.12l3.2-3.2c.25-.25.15-.68-.2-.76a5 5 0 0 0-1.02-.1H3.05a9 9 0 0 1 12.66-9.2c.2.09.44.05.59-.1l.76-.76Z" +
+    "M20.2 8.28a.52.52 0 0 1 .1-.58l.76-.76a.48.48 0 0 1 .77.11 11 11 0 0 1-4.5 14.57c-1.27.71-2.73.23-3.55-.74a3.1 3.1 0 0 1-.17-3.78l1.38-1.97a5 5 0 0 1 4.1-2.13h1.86a9.1 9.1 0 0 0-.75-4.72Z" +
+    "M10.1 17.9c.25-.25.65-.18.74.14a3.1 3.1 0 0 1-.62 2.84 2.85 2.85 0 0 1-3.55.74.16.16 0 0 1-.04-.25l3.48-3.48Z";
+
+const PATH_MIC =
+    "M12 2a4 4 0 0 0-4 4v4a4 4 0 0 0 8 0V6a4 4 0 0 0-4-4Z" +
+    "M6 10a1 1 0 0 0-2 0 8 8 0 0 0 7 7.94V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.06A8 8 0 0 0 20 10a1 1 0 1 0-2 0 6 6 0 0 1-12 0Z";
+
+const PATH_HEADPHONES =
+    "M12 3a9 9 0 0 0-8.95 10h1.87a5 5 0 0 1 4.1 2.13l1.37 1.97a3.1 3.1 0 0 1-.17 3.78 " +
+    "2.85 2.85 0 0 1-3.55.74 11 11 0 1 1 10.66 0c-1.27.71-2.73.23-3.55-.74a3.1 3.1 0 0 1-.17-3.78l1.38-1.97a5 5 0 0 1 4.1-2.13h1.86A9 9 0 0 0 12 3Z";
+
+const PATH_VIDEO =
+    "M4 4a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h11a3 3 0 0 0 3-3v-2.12a1 1 0 0 0 .55.9l3 1.5a1 1 0 0 0 1.45-.9V7.62a1 1 0 0 0-1.45-.9l-3 1.5a1 1 0 0 0-.55.9V7a3 3 0 0 0-3-3H4Z";
+
+const PATH_FORBIDDEN =
+    "M12 2C6.486 2 2 6.486 2 12C2 17.514 6.486 22 12 22C17.514 22 22 17.514 22 12C22 6.486 17.514 2 12 2ZM12 4C16.411 4 20 7.589 20 12C20 13.847 19.374 15.545 18.314 16.892L7.108 5.686C8.455 4.626 10.153 4 12 4ZM4 12C4 10.153 4.626 8.455 5.686 7.108L16.892 18.314C15.545 19.374 13.847 20 12 20C7.589 20 4 16.411 4 12Z";
+
+const PATH_STREAM =
+    "M2 5a3 3 0 0 1 3-3h14a3 3 0 0 1 3 3v14a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5Zm13.35 8.13 3.5 4.67c.37.5.02 1.2-.6 1.2H5.81a.75.75 0 0 1-.59-1.22l1.86-2.32a1.5 1.5 0 0 1 2.34 0l.5.64 2.23-2.97a2 2 0 0 1 3.2 0ZM10.2 5.98c.23-.91-.88-1.55-1.55-.9a.93.93 0 0 1-1.3 0c-.67-.65-1.78-.01-1.55.9a.93.93 0 0 1-.65 1.12c-.9.26-.9 1.54 0 1.8.48.14.77.63.65 1.12-.23.91.88 1.55 1.55.9a.93.93 0 0 1 1.3 0c.67.65 1.78.01 1.55-.9a.93.93 0 0 1 .65-1.12c.9-.26.9-1.54 0-1.8a.93.93 0 0 1-.65-1.12Z";
+
+const PATH_BY_KIND = {
+    mute: PATH_MUTE,
+    deaf: PATH_DEAF,
+    mic:  PATH_MIC,
+    headphones: PATH_HEADPHONES,
+    video: PATH_VIDEO
+};
 
 const elChannelName = document.getElementById("channel-name");
 const elCount       = document.getElementById("count");
 const elUsers       = document.getElementById("users");
+const elUsersWrap   = document.getElementById("users-wrap");
 const elEmpty       = document.getElementById("empty");
-const elStatus      = document.getElementById("status");
-const elApp         = document.getElementById("app");
+const elNet         = document.getElementById("net");
+const elNetLine1    = document.getElementById("net-line-1");
+const elNetLeft     = document.getElementById("net-left");
+const elNetRight    = document.getElementById("net-right");
+const elSignal      = document.getElementById("signal");
 
 let currentUsers   = [];
 let speakingSet    = new Set();
 let knownJoinTime  = new Map();
 let lastChannelId  = null;
 let lastStateSig   = "";
+
+let flashIconOnMute = true;
+
+let netState = {
+    level: "ok",
+    since: 0,
+    phaseMs: 0,
+    totalMs: 0,
+    last: null,
+    avg: null,
+    updatedAt: 0
+};
+
+const pendingEdits = new Map();
 
 function badgeFor(kind) {
     switch (kind) {
@@ -223,22 +564,272 @@ function esc(s) {
     }[c]));
 }
 
+function showMessage(kind, text, channelLabel) {
+    elChannelName.textContent = channelLabel || "Voice";
+    elCount.textContent = "";
+    elUsers.innerHTML = "";
+    elEmpty.style.display = "flex";
+    elEmpty.className = kind;
+    elEmpty.textContent = text;
+    lastStateSig = "";
+    lastChannelId = null;
+    knownJoinTime.clear();
+    speakingSet.clear();
+    pendingEdits.clear();
+    renderNet(null);
+}
+
+function iconSvg(kind, classes, title) {
+    const d = PATH_BY_KIND[kind] || "";
+    const cls = classes.filter(Boolean).join(" ");
+    const tAttr = title ? ` title="${esc(title)}"` : "";
+    return `<svg class="vs-svg ${cls}" viewBox="0 0 24 24" aria-hidden="true"${tAttr}>` +
+           `<path fill="currentColor" d="${d}"/></svg>`;
+}
+
+function actionButton(action, title, active, svgPath, userId) {
+    const cls = `act ${action}${active ? " active" : ""}`;
+    return `<button class="${cls}" data-act="${esc(action)}" data-uid="${esc(userId)}" title="${esc(title)}">` +
+           `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="${svgPath}"/></svg>` +
+           `</button>`;
+}
+
+function liveBadgeHtml(u) {
+    if (!u.streaming) return "";
+    return `<span class="vs-live" data-act="watch-stream" data-uid="${esc(u.userId)}" ` +
+           `title="Streaming — click to watch">LIVE</span>`;
+}
+
+function voiceStatusHtml(u, now) {
+    const parts = [];
+
+    if (u.video) {
+        parts.push(iconSvg("video", ["video"], "Camera on"));
+    }
+
+    const computeFlash = (at) => {
+        const age = at > 0 ? (now - at) : Infinity;
+        const recent  = flashIconOnMute && at > 0 && age < RECENT_WINDOW_MS;
+        const pulsing = recent && age < PULSE_WINDOW_MS;
+        return { recent, pulsing };
+    };
+
+    if (u.selfMute) {
+        const { recent, pulsing } = computeFlash(u.selfMuteAt);
+        const cls = ["self"];
+        if (recent)  cls.push("recent");
+        if (pulsing) cls.push("pulse");
+        parts.push(iconSvg("mute", cls, recent ? "Recently muted themselves" : "Muted"));
+    } else if (u.selfUnmuteAt) {
+        const { recent, pulsing } = computeFlash(u.selfUnmuteAt);
+        if (recent) {
+            const cls = ["self", "recent-unmute"];
+            if (pulsing) cls.push("pulse-unmute");
+            parts.push(iconSvg("mic", cls, "Recently unmuted themselves"));
+        }
+    }
+
+    if (u.selfDeaf) {
+        const { recent, pulsing } = computeFlash(u.selfDeafAt);
+        const cls = ["self"];
+        if (recent)  cls.push("recent");
+        if (pulsing) cls.push("pulse");
+        parts.push(iconSvg("deaf", cls, recent ? "Recently deafened themselves" : "Deafened"));
+    } else if (u.selfUndeafAt) {
+        const { recent, pulsing } = computeFlash(u.selfUndeafAt);
+        if (recent) {
+            const cls = ["self", "recent-unmute"];
+            if (pulsing) cls.push("pulse-unmute");
+            parts.push(iconSvg("headphones", cls, "Recently undeafened themselves"));
+        }
+    }
+
+    if (u.serverMute) parts.push(iconSvg("mute", ["server"], "Server muted"));
+    if (u.serverDeaf) parts.push(iconSvg("deaf", ["server"], "Server deafened"));
+
+    if (parts.length === 0) return "";
+    return `<div class="vstatus">${parts.join("")}</div>`;
+}
+
+function renderUsersList(now = Date.now()) {
+    if (currentUsers.length === 0) {
+        elUsers.innerHTML = "";
+        return;
+    }
+
+    elUsers.innerHTML = currentUsers.map(u => {
+        const b = badgeFor(u.kind);
+
+        const joinedAt = knownJoinTime.get(u.userId) ?? 0;
+        const justJoined = (joinedAt > 0 && (now - joinedAt) < JOINED_MS) ? " just-joined" : "";
+
+        const speakingCls = speakingSet.has(u.userId) ? " speaking" : "";
+        const selfCls = u.isSelf ? " self" : "";
+
+        const shownName = u.displayName || u.username || "(unknown)";
+        const titleAttr = u.displayName && u.displayName !== u.username
+            ? `${u.displayName} (@${u.username})`
+            : u.username;
+
+        let actions = "";
+
+        if (u.isSelf) {
+            const mutePath = u.selfMute ? PATH_MUTE : PATH_MIC;
+            const deafPath = u.selfDeaf ? PATH_DEAF : PATH_HEADPHONES;
+
+            actions = `<div class="actions">` +
+                actionButton("self-mute",
+                             u.selfMute ? "Unmute yourself" : "Mute yourself",
+                             u.selfMute, mutePath, u.userId) +
+                actionButton("self-deaf",
+                             u.selfDeaf ? "Undeafen yourself" : "Deafen yourself",
+                             u.selfDeaf, deafPath, u.userId) +
+                actionButton("self-stream",
+                             u.streaming ? "Stop your stream" : "Start streaming your screen",
+                             u.streaming, PATH_STREAM, u.userId) +
+                `</div>`;
+        } else {
+            actions = `<div class="actions">` +
+                actionButton(u.blocked ? "unblock" : "block",
+                             u.blocked ? "Unblock" : "Block",
+                             u.blocked, PATH_FORBIDDEN, u.userId) +
+                actionButton(u.ignored ? "unignore" : "ignore",
+                             u.ignored ? "Unignore" : "Ignore",
+                             u.ignored, PATH_FORBIDDEN, u.userId) +
+                actionButton(u.muted ? "unmute" : "mute",
+                             u.muted ? "Unmute" : "Mute in voice",
+                             u.muted, PATH_MUTE, u.userId) +
+                `</div>`;
+        }
+
+        return `<div class="user${justJoined}${speakingCls}${selfCls}" data-user-id="${u.userId}">
+            <div class="avatar-wrap">
+                <img src="${avatarUrl(u)}" onerror="this.style.opacity='0.3'">
+            </div>
+            <span class="name" title="${esc(titleAttr)}">${esc(shownName)}</span>
+            ${voiceStatusHtml(u, now)}
+            ${liveBadgeHtml(u)}
+            <span class="spacer"></span>
+            ${actions}
+            <span class="badge" style="color:${b.color}" title="${u.kind}">${b.glyph}</span>
+        </div>`;
+    }).join("");
+}
+
+function renderNet(net, active = true) {
+    if (!active) {
+        elSignal.setAttribute("data-level", "off");
+        elSignal.title = "—";
+    } else {
+        const level = net?.level || "ok";
+        elSignal.setAttribute("data-level", level);
+
+        if (net && typeof net.last === "number" && isFinite(net.last) && net.last > 0) {
+            elSignal.title = `${Math.round(net.last)}ms`;
+        } else {
+            elSignal.title = "—";
+        }
+    }
+
+    if (!active || !net || net.level === "ok") {
+        elNet.setAttribute("data-level", "ok");
+        elNetLine1.textContent = "";
+        elNetLeft.textContent = "";
+        elNetRight.textContent = "";
+        return;
+    }
+
+    elNet.setAttribute("data-level", net.level);
+
+    const line1 = {
+        unstable: "UNSTABLE CONNECTION",
+        critical: "CRITICAL CONNECTION · CHECK NETWORK",
+        lost:     "CONNECTION LOST"
+    }[net.level] || "";
+
+    const lastTxt = (typeof net.last === "number") ? `${Math.round(net.last)} ms` : "—";
+    const avgTxt  = (typeof net.avg  === "number") ? `${Math.round(net.avg)} ms`  : "—";
+
+    const phaseTxt = net.phaseMs > 0
+        ? `${Math.round(net.phaseMs / 1000)}s`
+        : "0s";
+    const totalTxt = net.totalMs > 0
+        ? `${Math.round(net.totalMs / 1000)}s`
+        : "0s";
+
+    elNetLine1.textContent = line1;
+    elNetLeft.textContent  = `ping ${lastTxt} · avg ${avgTxt}`;
+    elNetRight.textContent = `${phaseTxt} / ${totalTxt}`;
+}
+
+function applyPendingEdits(users) {
+    const now = Date.now();
+    for (const u of users) {
+        const fields = pendingEdits.get(u.userId);
+        if (!fields) continue;
+        for (const field of Object.keys(fields)) {
+            const entry = fields[field];
+            if (now >= entry.until) {
+                delete fields[field];
+                continue;
+            }
+            u[field] = entry.value;
+            if (field === "selfMute") {
+                if (entry.value) { u.selfMuteAt = now; u.selfUnmuteAt = 0; }
+                else             { u.selfMuteAt = 0; u.selfUnmuteAt = now; }
+            } else if (field === "selfDeaf") {
+                if (entry.value) { u.selfDeafAt = now; u.selfUndeafAt = 0; }
+                else             { u.selfDeafAt = 0; u.selfUndeafAt = now; }
+            }
+        }
+        if (Object.keys(fields).length === 0) pendingEdits.delete(u.userId);
+    }
+}
+
 function renderState(data) {
+    const pluginAlive = data.pluginAlive !== false;
     const users = Array.isArray(data.users) ? data.users : [];
     const channelId = data.channelId ?? null;
+
+    flashIconOnMute = data?.prefs?.flashIconOnMute !== false;
+
+    const net = data && data.net ? data.net : null;
+
+    if (!pluginAlive) {
+        renderNet(null, false);
+        showMessage("offline", "PLUGIN OFFLINE\nVoice Encounter Tracker not connected", "Voice");
+        return;
+    }
+
+    if (!channelId) {
+        renderNet(net, false);
+        showMessage("idle", "NOT IN VOICE\nJoin a voice channel", "Voice");
+        renderNet(net, false);
+        return;
+    }
+
+    renderNet(net, true);
+
+    elEmpty.style.display = users.length === 0 ? "flex" : "none";
+    if (users.length === 0) {
+        elEmpty.className = "idle";
+        elEmpty.textContent = "Waiting for voice states…";
+    }
 
     if (channelId !== lastChannelId) {
         knownJoinTime.clear();
         lastChannelId = channelId;
         lastStateSig = "";
+        pendingEdits.clear();
     }
 
     const now = Date.now();
-    const newJoiners = [];
+
+    applyPendingEdits(users);
+
     for (const u of users) {
         if (!knownJoinTime.has(u.userId)) {
             knownJoinTime.set(u.userId, now);
-            newJoiners.push(u.userId);
         }
     }
     const present = new Set(users.map(u => u.userId));
@@ -255,58 +846,28 @@ function renderState(data) {
     elChannelName.textContent = data.channelName || "Voice";
     elCount.textContent = users.length ? `(${users.length})` : "";
 
-    const sig = users.map(u =>
-        `${u.userId}:${u.kind}:${u.blocked?1:0}:${u.ignored?1:0}:${u.muted?1:0}:${u.isSelf?1:0}`
-    ).join("|");
+    const bucket = ts => {
+        if (!ts || !flashIconOnMute) return 3;
+        const age = now - ts;
+        if (age < PULSE_WINDOW_MS) return 1;
+        if (age < RECENT_WINDOW_MS) return 2;
+        return 3;
+    };
 
-    if (sig !== lastStateSig || newJoiners.length > 0) {
+    const sig = users.map(u =>
+        `${u.userId}:${u.kind}:${u.blocked?1:0}:${u.ignored?1:0}:${u.muted?1:0}:${u.isSelf?1:0}` +
+        `:${u.selfMute?1:0}:${u.selfDeaf?1:0}:${u.serverMute?1:0}:${u.serverDeaf?1:0}` +
+        `:${u.streaming?1:0}:${u.video?1:0}:${u.suppress?1:0}` +
+        `:${bucket(u.selfMuteAt)}:${bucket(u.selfDeafAt)}` +
+        `:${bucket(u.selfUnmuteAt)}:${bucket(u.selfUndeafAt)}`
+    ).join("|") +
+        `|pref:${flashIconOnMute ? 1 : 0}` +
+        `|net:${net?.level || "ok"}:${net?.last ?? -1}:${net?.avg ?? -1}`;
+
+    if (sig !== lastStateSig) {
         lastStateSig = sig;
         currentUsers = users;
-
-        if (users.length === 0) {
-            elUsers.innerHTML = "";
-            elEmpty.style.display = "block";
-            return;
-        }
-        elEmpty.style.display = "none";
-
-        elUsers.innerHTML = users.map(u => {
-            const b = badgeFor(u.kind);
-            const justJoined = newJoiners.includes(u.userId) ? " just-joined" : "";
-            const speakingCls = speakingSet.has(u.userId) ? " speaking" : "";
-            const selfCls = u.isSelf ? " self" : "";
-            const blockCls  = u.blocked ? " active" : "";
-            const ignoreCls = u.ignored ? " active" : "";
-            const muteCls   = u.muted   ? " active" : "";
-
-            const blockTitle  = u.blocked ? "Unblock"  : "Block";
-            const ignoreTitle = u.ignored ? "Unignore" : "Ignore";
-            const muteTitle   = u.muted   ? "Unmute"   : "Mute in voice";
-
-            const blockAct  = u.blocked ? "unblock"  : "block";
-            const ignoreAct = u.ignored ? "unignore" : "ignore";
-            const muteAct   = u.muted   ? "unmute"   : "mute";
-
-            const actions = u.isSelf ? "" : `
-                <div class="actions">
-                    <button class="act block${blockCls}" data-act="${blockAct}" data-uid="${u.userId}" title="${blockTitle}">⊘</button>
-                    <button class="act ignore${ignoreCls}" data-act="${ignoreAct}" data-uid="${u.userId}" title="${ignoreTitle}">⊘</button>
-                    <button class="act mute${muteCls}" data-act="${muteAct}" data-uid="${u.userId}" title="${muteTitle}">○</button>
-                </div>`;
-
-            return `<div class="user${justJoined}${speakingCls}${selfCls}" data-user-id="${u.userId}">
-                <div class="avatar-wrap">
-                    <img src="${avatarUrl(u)}" onerror="this.style.opacity='0.3'">
-                </div>
-                <span class="name" title="${esc(u.username)}">${esc(u.username)}</span>
-                ${actions}
-                <span class="badge" style="color:${b.color}" title="${u.kind}">${b.glyph}</span>
-            </div>`;
-        }).join("");
-
-        if (newJoiners.length > 0 && elApp.scrollHeight > elApp.clientHeight) {
-            elApp.scrollTop = elApp.scrollHeight;
-        }
+        renderUsersList(now);
     }
 }
 
@@ -327,19 +888,10 @@ async function tickState() {
         const res = await fetch(API_STATE, { cache: "no-store" });
         if (!res.ok) throw new Error("bad status");
         const data = await res.json();
-        elStatus.className = "online";
         renderState(data);
     } catch (e) {
-        elStatus.className = "offline";
-        elChannelName.textContent = "Server offline";
-        elCount.textContent = "";
-        elUsers.innerHTML = "";
-        elEmpty.style.display = "block";
-        elEmpty.textContent = "Overlay server not running";
-        lastStateSig = "";
-        lastChannelId = null;
-        knownJoinTime.clear();
-        speakingSet.clear();
+        renderNet(null, false);
+        showMessage("offline", "PLUGIN OFFLINE\nOverlay server unreachable", "Voice");
     }
     setTimeout(tickState, REFRESH_STATE_MS);
 }
@@ -362,6 +914,66 @@ function sendCommand(action, userId) {
     }).catch(() => {});
 }
 
+function optimisticToggle(userId, field) {
+    const u = currentUsers.find(x => x.userId === userId);
+    if (!u) return;
+
+    const now = Date.now();
+    const edits = [];
+
+    if (field === "selfMute") {
+        const newMute = !u.selfMute;
+        if (newMute === false && u.selfDeaf === true) {
+            edits.push({ field: "selfMute", value: false });
+            edits.push({ field: "selfDeaf", value: false });
+        } else if (newMute === true) {
+            edits.push({ field: "selfMute", value: true });
+        } else {
+            edits.push({ field: "selfMute", value: false });
+        }
+    } else if (field === "selfDeaf") {
+        const newDeaf = !u.selfDeaf;
+        if (newDeaf === true) {
+            edits.push({ field: "selfDeaf", value: true });
+            edits.push({ field: "selfMute", value: true });
+        } else {
+            edits.push({ field: "selfDeaf", value: false });
+        }
+    } else if (field === "streaming") {
+        edits.push({ field: "streaming", value: !u.streaming });
+    }
+
+    if (edits.length === 0) return;
+
+    let fields = pendingEdits.get(userId);
+    if (!fields) {
+        fields = {};
+        pendingEdits.set(userId, fields);
+    }
+
+    for (const f of Object.keys(fields)) {
+        fields[f].until = now + PENDING_TTL_MS;
+    }
+
+    for (const { field: f, value } of edits) {
+        fields[f] = { value, until: now + PENDING_TTL_MS };
+    }
+
+    for (const { field: f, value } of edits) {
+        u[f] = value;
+
+        if (f === "selfMute") {
+            if (value) { u.selfMuteAt = now; u.selfUnmuteAt = 0; }
+            else       { u.selfMuteAt = 0; u.selfUnmuteAt = now; }
+        } else if (f === "selfDeaf") {
+            if (value) { u.selfDeafAt = now; u.selfUndeafAt = 0; }
+            else       { u.selfDeafAt = 0; u.selfUndeafAt = now; }
+        }
+    }
+
+    renderUsersList(now);
+}
+
 elUsers.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-act]");
     if (!btn) return;
@@ -369,8 +981,36 @@ elUsers.addEventListener("click", (e) => {
     e.stopPropagation();
     const action = btn.getAttribute("data-act");
     const userId = btn.getAttribute("data-uid");
-    if (!action || !userId) return;
+    if (!action) return;
+
+    if (action === "watch-stream") {
+        fetch(API_COMMAND, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "watch-stream", userId })
+        }).catch(() => {});
+        return;
+    }
+
+    if (!userId) return;
+
+    if (action === "self-mute")        optimisticToggle(userId, "selfMute");
+    else if (action === "self-deaf")   optimisticToggle(userId, "selfDeaf");
+    else if (action === "self-stream") optimisticToggle(userId, "streaming");
+
     sendCommand(action, userId);
+});
+
+// ─── Stream source picker button ───
+const elSrcBtn = document.getElementById("stream-source-btn");
+
+elSrcBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    fetch("http://127.0.0.1:17842/popup/open", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ winId: window.__vetWinId || null })
+    }).catch(() => {});
 });
 
 tickState();

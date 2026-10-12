@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Stream Viewer</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+        background: #000; color: #dcddde;
+        font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+        font-size: 12px; overflow: hidden; user-select: none; height: 100vh;
+    }
+    #root { position: relative; width: 100vw; height: 100vh; background: #000; overflow: hidden; }
+    #view { width: 100%; height: 100%; background: #000; display: block; }
+    #controls {
+        position: absolute; top: 0; left: 0; right: 0; height: 26px;
+        display: flex; align-items: center; justify-content: flex-end; gap: 4px;
+        padding: 0 6px;
+        background: linear-gradient(to bottom, rgba(0,0,0,0.65), rgba(0,0,0,0));
+        -webkit-app-region: drag; opacity: 0; transition: opacity 0.15s; z-index: 10;
+    }
+    #root:hover #controls { opacity: 1; }
+    .btn { -webkit-app-region: no-drag; background: rgba(255,255,255,0.08);
+        border: none; color: #fff; cursor: pointer; border-radius: 3px;
+        padding: 3px 6px; font-size: 11px; display: inline-flex;
+        align-items: center; justify-content: center; line-height: 1; }
+    .btn:hover { background: rgba(255,255,255,0.18); }
+    .btn svg { width: 12px; height: 12px; display: block; }
+    #status { position: absolute; inset: 0; display: flex; align-items: center;
+        justify-content: center; color: #72767d; font-size: 12px;
+        pointer-events: none; z-index: 5; }
+</style>
+</head>
+<body>
+<div id="root">
+    <canvas id="view"></canvas>
+    <div id="controls">
+        <button class="btn" id="btn-pin" title="Preview mode">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h6v2H6v4H4V4Zm10 0h6v6h-2V6h-4V4ZM4 14h2v4h4v2H4v-6Zm14 0h2v6h-6v-2h4v-4Z"/></svg>
+        </button>
+        <button class="btn" id="btn-close" title="Close">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7 12 12l6.3 6.3-1.4 1.4L10.6 13.4 4.3 19.7 2.9 18.3 9.2 12 2.9 5.7 4.3 4.3l6.3 6.3 6.3-6.3z"/></svg>
+        </button>
+    </div>
+    <div id="status">Waiting for stream…</div>
+</div>
+
+<script>
+const API_BASE = "http://127.0.0.1:17842";
+const elView = document.getElementById("view");
+const elStatus = document.getElementById("status");
+const ctx = elView.getContext("2d", { alpha: false, desynchronized: true });
+
+let pc = null;
+let readerLoopRunning = false;
+
+// ─── NO mediaTime. NO baseWallMs. Simple: 60 fps cap + drop old. ───
+const FRAME_HOLD = 1000 / 62;   // ~60 fps cap (62, чтобы не пропускать vsync)
+const MAX_HOLD = 2;             // максимум 2 кадра в буфере, остальные дропаем
+const FRAME_BUFFER = [];
+let lastShownFrame = null;
+let lastFrameWall = 0;
+let raf = 0;
+
+function log(...args) { console.log("[video]", ...args); }
+function setStatus(txt) {
+    if (!elStatus) return;
+    if (!txt) elStatus.style.display = "none";
+    else { elStatus.style.display = "flex"; elStatus.textContent = txt; }
+}
+
+function fitCanvas() {
+    const w = Math.max(1, elView.clientWidth);
+    const h = Math.max(1, elView.clientHeight);
+    if (elView.width !== w || elView.height !== h) {
+        elView.width = w;
+        elView.height = h;
+    }
+}
+window.addEventListener("resize", fitCanvas);
+fitCanvas();
+
+function drawOne(frame) {
+    const vw = frame.displayWidth || frame.codedWidth;
+    const vh = frame.displayHeight || frame.codedHeight;
+    if (!vw || !vh) return;
+    const cw = elView.width;
+    const ch = elView.height;
+    const scale = Math.min(cw / vw, ch / vh);
+    const dw = vw * scale, dh = vh * scale;
+    const dx = (cw - dw) / 2, dy = (ch - dh) / 2;
+    if (dw < cw || dh < ch) {
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, cw, ch);
+    }
+    ctx.drawImage(frame, dx, dy, dw, dh);
+}
+
+function tick() {
+    raf = requestAnimationFrame(tick);
+
+    if (FRAME_BUFFER.length === 0) return;
+
+    const now = performance.now();
+
+    // Жёсткий cap: не чаще 1/60 сек.
+    // Никакого mediaTime — просто не рендерим чаще 60 раз в секунду.
+    if (now - lastFrameWall < FRAME_HOLD) return;
+
+    lastFrameWall = now;
+
+    // Берём САМЫЙ СВЕЖИЙ кадр, все старые закрываем.
+    // Это исключает "нагон": даже если в буфере 10 кадров — покажем только 1.
+    let newest = null;
+    while (FRAME_BUFFER.length > 0) {
+        const f = FRAME_BUFFER.shift();
+        if (newest) { try { newest.frame.close(); } catch(e){} }
+        newest = f;
+    }
+
+    if (newest) {
+        if (lastShownFrame) { try { lastShownFrame.close(); } catch(e){} }
+        lastShownFrame = newest.frame;
+        drawOne(lastShownFrame);
+    }
+}
+
+function enqueueFrame(frame) {
+    // Если буфер переполнен — дропаем самый старый.
+    while (FRAME_BUFFER.length >= MAX_HOLD) {
+        const dropped = FRAME_BUFFER.shift();
+        try { dropped.frame.close(); } catch(e){}
+    }
+    FRAME_BUFFER.push({ frame });
+    if (!raf) raf = requestAnimationFrame(tick);
+}
+
+async function startReader(track) {
+    if (!("MediaStreamTrackProcessor" in window)) {
+        log("MediaStreamTrackProcessor unavailable");
+        setStatus("WebCodecs unavailable");
+        return;
+    }
+    if (readerLoopRunning) return;
+    readerLoopRunning = true;
+    const processor = new MediaStreamTrackProcessor({ track });
+    const reader = processor.readable.getReader();
+    log("reader started");
+    setStatus("");
+    try {
+        while (true) {
+            const { done, value: frame } = await reader.read();
+            if (done) { log("reader done"); break; }
+            enqueueFrame(frame);
+        }
+    } catch (e) {
+        log("reader error:", e.message);
+    } finally {
+        readerLoopRunning = false;
+    }
+}
+
+async function handleOffer({ sdp, candidates }) {
+    if (!sdp) return;
+    log("offer received");
+    if (pc) { try { pc.close(); } catch(e){} pc = null; }
+    if (raf) { try { cancelAnimationFrame(raf); } catch(e){} raf = 0; }
+    while (FRAME_BUFFER.length) {
+        try { FRAME_BUFFER.shift().frame.close(); } catch(e){}
+    }
+    if (lastShownFrame) { try { lastShownFrame.close(); } catch(e){} lastShownFrame = null; }
+    lastFrameWall = 0;
+
+    pc = new RTCPeerConnection({ iceServers: [] });
+
+    pc.ontrack = (event) => {
+        log("ontrack", event.track.kind, event.streams.length);
+        if (event.track.kind === "video") {
+            startReader(event.track).catch(e => log("startReader:", e.message));
+        }
+    };
+
+    pc.onconnectionstatechange = () => {
+        log("conn state:", pc.connectionState);
+        if (pc.connectionState === "connected") setStatus("");
+        else if (pc.connectionState === "failed") setStatus("Connection failed");
+        else if (pc.connectionState === "disconnected") setStatus("Connection lost");
+    };
+
+    try { await pc.setRemoteDescription(sdp); }
+    catch (e) { log("setRemoteDescription:", e.message); setStatus("SDP error"); return; }
+    for (const c of (candidates || [])) {
+        try { await pc.addIceCandidate(c); } catch(e){}
+    }
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await new Promise((resolve) => {
+        if (pc.iceGatheringState === "complete") return resolve();
+        const check = () => {
+            if (pc.iceGatheringState === "complete") {
+                pc.removeEventListener("icegatheringstatechange", check);
+                resolve();
+            }
+        };
+        pc.addEventListener("icegatheringstatechange", check);
+        setTimeout(resolve, 1500);
+    });
+    const desc = pc.localDescription;
+    log("sending answer");
+    try {
+        window.vetWebRTC.sendAnswer({
+            sdp: { type: desc.type, sdp: desc.sdp },
+            candidates: []
+        });
+    } catch(e) { log("sendAnswer failed:", e.message); }
+}
+
+if (window.vetWebRTC) {
+    window.vetWebRTC.onOffer(handleOffer);
+    window.vetWebRTC.ready();
+} else {
+    log("bridge missing");
+    setStatus("Bridge missing");
+}
+
+document.getElementById("btn-close").addEventListener("click", () => {
+    fetch(API_BASE + "/video/close", { method: "POST" }).catch(() => {});
+});
+document.getElementById("btn-pin").addEventListener("click", () => {
+    fetch(API_BASE + "/video/preview", { method: "POST" }).catch(() => {});
+});
+</script>
+</body>
+</html>
