@@ -96,6 +96,38 @@ module.exports = class VoiceEncounterTracker {
             this._origConsoleLog = origLog;
         }
 
+        // ── Patch nz to catch streamId ──
+        if (!this._nzPatched) {
+            this._nzPatched = true;
+            const self = this;
+            let nzMod = null;
+            try {
+                BdApi.Webpack.getModule((m) => {
+                    if (m && typeof m === "object" && typeof m.nz === "function"
+                        && m.nz.toString().includes("addDirectVideoOutputSink")) {
+                        nzMod = m;
+                        return true;
+                    }
+                    return false;
+                }, { searchExports: true });
+            } catch (e) {}
+            if (nzMod && typeof nzMod.nz === "function") {
+                BdApi.Patcher.after(this.meta.name, nzMod, "nz", (_, args) => {
+                    try {
+                        const id = args?.[0];
+                        if (id != null) {
+                            self._lastDiscordStreamId = String(id);
+                            BdApi.Logger.info(self.meta.name, "caught streamId from nz patch:", id);
+                        }
+                    } catch (e) {}
+                });
+                this._nzModule = nzMod;
+                BdApi.Logger.info(this.meta.name, "nz patched");
+            } else {
+                BdApi.Logger.warn(this.meta.name, "nz module not found for patching");
+            }
+        }
+
         this.loadPrefs();
         this._initStoreCache();
         this.loadEncounters();
@@ -1688,11 +1720,11 @@ module.exports = class VoiceEncounterTracker {
                                 "muted:", nativeTrack.muted,
                                 "label:", nativeTrack.label
                             );
-                            let cloned;
-                            try { cloned = nativeTrack.clone(); }
-                            catch (e) { cloned = nativeTrack; }
-                            BdApi.Logger.info(this.meta.name, "native cloned:", cloned.readyState);
-                            return new MediaStream([cloned]);
+                            // Отдаём ОРИГИНАЛЬНЫЙ трек — без clone.
+                            // Clone дропает кадры, если RTC-энкодер не успевает.
+                            // Оригинал уже обслуживает DirectVideo, мы подключаемся вторым.
+                            BdApi.Logger.info(this.meta.name, "returning original native track (no clone)");
+                            return new MediaStream([nativeTrack]);
                         }
                     }
                 } catch (e) {
@@ -1725,40 +1757,14 @@ module.exports = class VoiceEncounterTracker {
     }
 
     _extractStreamId(video) {
-        // Вариант 1: dataset на самом <video>
-        if (video?.dataset) {
-            const ds = video.dataset.streamId || video.dataset.streamid;
-            if (ds) {
-                BdApi.Logger.info(this.meta.name, "_extractStreamId: found in video.dataset:", ds);
-                return String(ds);
-            }
-        }
-
-        // Вариант 2: dataset у родителя
-        let el = video?.parentElement;
-        for (let i = 0; i < 12 && el; i++) {
-            if (el.dataset) {
-                const ds = el.dataset.streamId || el.dataset.streamid;
-                if (ds) {
-                    BdApi.Logger.info(this.meta.name, "_extractStreamId: found in parent.dataset:", ds);
-                    return String(ds);
-                }
-            }
-            el = el.parentElement;
-        }
-
-        // Вариант 3: из перехваченного console.log
+        // streamId приходит из патча nz — Discord сам вызывает nz(streamId),
+        // когда создаёт DirectVideo. Никаких dataset-проверок не нужно.
         if (this._lastDiscordStreamId) {
-            BdApi.Logger.info(this.meta.name, "_extractStreamId: using caught streamId:", this._lastDiscordStreamId);
+            BdApi.Logger.info(this.meta.name, "_extractStreamId: using nz-patched streamId:",
+                this._lastDiscordStreamId);
             return String(this._lastDiscordStreamId);
         }
-
-        // Диагностика
-        try {
-            BdApi.Logger.warn(this.meta.name, "_extractStreamId: failed. video.dataset:", JSON.stringify(video?.dataset));
-            BdApi.Logger.warn(this.meta.name, "_extractStreamId: video.parent class:", video?.parentElement?.className);
-            BdApi.Logger.warn(this.meta.name, "_extractStreamId: _lastDiscordStreamId =", this._lastDiscordStreamId);
-        } catch (e) {}
+        BdApi.Logger.warn(this.meta.name, "_extractStreamId: no streamId from nz patch");
         return null;
     }
 

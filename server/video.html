@@ -49,14 +49,14 @@
 const API_BASE = "http://127.0.0.1:17842";
 const elView = document.getElementById("view");
 const elStatus = document.getElementById("status");
-const ctx = elView.getContext("2d", { alpha: false, desynchronized: true });
+const ctx = elView.getContext("2d", { alpha: false });  // БЕЗ desynchronized
 
 let pc = null;
 let readerLoopRunning = false;
 
-// ─── NO mediaTime. NO baseWallMs. Simple: 60 fps cap + drop old. ───
-const FRAME_HOLD = 1000 / 62;   // ~60 fps cap (62, чтобы не пропускать vsync)
-const MAX_HOLD = 2;             // максимум 2 кадра в буфере, остальные дропаем
+// ─── Простой: 60 fps cap + drop old. Никакого mediaTime. ───
+const FRAME_HOLD = 1000 / 65;   // ~60 fps cap
+const MAX_HOLD = 2;             // очередь максимум 2 кадра
 const FRAME_BUFFER = [];
 let lastShownFrame = null;
 let lastFrameWall = 0;
@@ -97,20 +97,19 @@ function drawOne(frame) {
 }
 
 function tick() {
-    raf = requestAnimationFrame(tick);
-
+    raf = 0;
     if (FRAME_BUFFER.length === 0) return;
 
     const now = performance.now();
-
-    // Жёсткий cap: не чаще 1/60 сек.
-    // Никакого mediaTime — просто не рендерим чаще 60 раз в секунду.
-    if (now - lastFrameWall < FRAME_HOLD) return;
+    if (now - lastFrameWall < FRAME_HOLD) {
+        // Слишком рано. Перепланируем.
+        raf = requestAnimationFrame(tick);
+        return;
+    }
 
     lastFrameWall = now;
 
-    // Берём САМЫЙ СВЕЖИЙ кадр, все старые закрываем.
-    // Это исключает "нагон": даже если в буфере 10 кадров — покажем только 1.
+    // Взять САМЫЙ СВЕЖИЙ кадр, все старые закрыть.
     let newest = null;
     while (FRAME_BUFFER.length > 0) {
         const f = FRAME_BUFFER.shift();
@@ -126,7 +125,7 @@ function tick() {
 }
 
 function enqueueFrame(frame) {
-    // Если буфер переполнен — дропаем самый старый.
+    // Дроп старых при переполнении.
     while (FRAME_BUFFER.length >= MAX_HOLD) {
         const dropped = FRAME_BUFFER.shift();
         try { dropped.frame.close(); } catch(e){}
@@ -175,14 +174,60 @@ async function handleOffer({ sdp, candidates }) {
 
     pc.ontrack = (event) => {
         log("ontrack", event.track.kind, event.streams.length);
-        if (event.track.kind === "video") {
-            startReader(event.track).catch(e => log("startReader:", e.message));
-        }
+        if (event.track.kind !== "video") return;
+
+        pc.getReceivers().forEach(r => {
+            try { r.jitterBufferTarget = 0; } catch (e) {}
+            try { r.playoutDelayHint = 0; } catch (e) {}
+        });
+
+        const v = document.createElement("video");
+        v.id = "testRemote";
+        v.muted = true;
+        v.autoplay = true;
+        v.playsInline = true;
+        v.srcObject = event.streams[0];
+        v.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;object-fit:contain;background:#000;z-index:9999";
+        document.body.appendChild(v);
+        v.play().catch(e => log("play failed:", e.message));
+        setStatus("");
+
+        setTimeout(() => {
+            let last = 0;
+            const d = [];
+            const t0 = performance.now();
+            v.requestVideoFrameCallback(function loop(now) {
+                if (last) d.push(now - last);
+                last = now;
+                if (performance.now() - t0 < 10000) {
+                    v.requestVideoFrameCallback(loop);
+                } else {
+                    const s = d.slice().sort((a,b)=>a-b);
+                    console.log("=== WebRTC → <video> DIRECT (10s) ===");
+                    console.log("fps:", (d.length/10).toFixed(1));
+                    console.log("p50:", s[Math.floor(s.length*0.5)]?.toFixed(1),
+                                "p95:", s[Math.floor(s.length*0.95)]?.toFixed(1),
+                                "p99:", s[Math.floor(s.length*0.99)]?.toFixed(1),
+                                "max:", s[s.length-1]?.toFixed(1));
+                    console.log("gaps >50ms:", d.filter(x=>x>50).length);
+                    console.log("gaps >100ms:", d.filter(x=>x>100).length);
+                    console.log("gaps >200ms:", d.filter(x=>x>200).length);
+                    console.log("top 10:", s.slice(-10).reverse().map(x=>x.toFixed(0)).join(","));
+                }
+            });
+        }, 3000);
     };
 
     pc.onconnectionstatechange = () => {
         log("conn state:", pc.connectionState);
-        if (pc.connectionState === "connected") setStatus("");
+        if (pc.connectionState === "connected") {
+            setStatus("");
+            // Ещё раз — некоторые браузеры применяют только после connected
+            pc.getReceivers().forEach(r => {
+                try { r.jitterBufferTarget = 0; } catch (e) {}
+                try { r.playoutDelayHint = 0; } catch (e) {}
+            });
+        }
         else if (pc.connectionState === "failed") setStatus("Connection failed");
         else if (pc.connectionState === "disconnected") setStatus("Connection lost");
     };
