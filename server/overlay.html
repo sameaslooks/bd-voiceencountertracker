@@ -420,6 +420,17 @@
         0%   { background: rgba(88, 101, 242, 0.25); }
         100% { background: transparent; }
     }
+
+    /* Click-through mode (game has focus, cursor hidden) */
+    body.click-through {
+        pointer-events: none !important;
+    }
+    body.click-through #app {
+        opacity: 0.55;
+        filter: grayscale(0.6);
+        transition: opacity 0.2s, filter 0.2s;
+    }
+    body.click-through .vs-live { pointer-events: none; }
 </style>
 </head>
 <body>

@@ -29,11 +29,9 @@ module.exports = class VoiceEncounterTracker {
         this._vetExpandedSession = null;
 
         this._vetSearchQuery = "";
-        this._vetInputFocused = false;
-        this._vetLastFocusedInput = null;
-        this._vetFocusGuard = null;
-        this._vetDocPointerGuard = null;
         this._vetQueryDebounce = null;
+
+        this._userContextMenuUnpatch = null;
 
         this.HEARTBEAT_MS        = 60_000;
         this.SAVE_DEBOUNCE_MS    = 60_000;
@@ -42,7 +40,7 @@ module.exports = class VoiceEncounterTracker {
         this.REFRESH_MS          = 30_000;
         this.SPEAKING_MS         = 2000;
         this.FULL_PUSH_MS        = 5_000;
-        this.PING_PUSH_MS        = 1000;  // [NEW] ping-only push cadence
+        this.PING_PUSH_MS        = 1000;
         this.COMMAND_POLL_MS     = 1_000;
         this.MAX_SESSIONS        = 500;
         this.MAX_EVENTS_PER_SESSION = 300;
@@ -138,6 +136,7 @@ module.exports = class VoiceEncounterTracker {
         this.hookSrcObject();
         this.seedSelfSession();
         this.syncActiveFromStore();
+        this.patchUserContextMenu();
 
         this._addTimer(setInterval(() => {
             try { this.heartbeat(); } catch (e) {}
@@ -154,8 +153,6 @@ module.exports = class VoiceEncounterTracker {
             try { this.pushStateToOverlay(); } catch (e) {}
         }, this.FULL_PUSH_MS));
 
-        // [NEW] Dedicated, fast ping push — the overlay needs fresh RTT
-        // to detect spikes and holds accurately.
         this._addTimer(setInterval(() => {
             try { this.pushPingToOverlay(); } catch (e) {}
         }, this.PING_PUSH_MS));
@@ -189,19 +186,19 @@ module.exports = class VoiceEncounterTracker {
         }
         this._listeners = [];
 
-        if (this._vetFocusGuard) {
-            try { document.removeEventListener("focusin", this._vetFocusGuard, true); } catch (e) {}
-            this._vetFocusGuard = null;
-        }
-        if (this._vetDocPointerGuard) {
-            try { document.removeEventListener("pointerdown", this._vetDocPointerGuard, true); } catch (e) {}
-            try { document.removeEventListener("mousedown",   this._vetDocPointerGuard, true); } catch (e) {}
-            this._vetDocPointerGuard = null;
-        }
         if (this._vetQueryDebounce) {
             try { clearTimeout(this._vetQueryDebounce); } catch (e) {}
             this._vetQueryDebounce = null;
         }
+
+        // ── Unpatch context menu ──
+        try {
+            if (typeof this._userContextMenuUnpatch === "function") {
+                this._userContextMenuUnpatch();
+            }
+        } catch (e) {}
+        this._userContextMenuUnpatch = null;
+        try { BdApi.ContextMenu.unpatch("user-context", this.meta.name); } catch (e) {}
 
         try {
             this._postJSON("/state", {
@@ -242,7 +239,6 @@ module.exports = class VoiceEncounterTracker {
         }
         try { document.getElementById("vet-settings-style")?.remove(); } catch (e) {}
 
-        // ── Restore console.log ──
         if (this._origConsoleLog) {
             try { console.log = this._origConsoleLog; } catch (e) {}
             this._origConsoleLog = null;
@@ -299,6 +295,218 @@ module.exports = class VoiceEncounterTracker {
                 display: none !important;
             }
         `);
+    }
+
+    // =====================================================================
+    // User context menu patch (MLV2-style)
+    // =====================================================================
+
+    patchUserContextMenu() {
+        try {
+            if (typeof this._userContextMenuUnpatch === "function") {
+                try { this._userContextMenuUnpatch(); } catch (e) {}
+                this._userContextMenuUnpatch = null;
+            }
+            try { BdApi.ContextMenu.unpatch("user-context", this.meta.name); } catch (e) {}
+
+            this._userContextMenuUnpatch = BdApi.ContextMenu.patch(
+                "user-context",
+                (ret, props) => {
+                    try {
+                        const user = props?.user;
+                        if (!user?.id) return;
+
+                        const userId = user.id;
+                        const me = this.getCurrentUserId();
+                        if (me && me === userId) return;
+
+                        const rec = this.encounters.get(userId);
+                        const isManualKnown = !!rec && rec.manual === true && !(rec.totalMs > 0);
+                        const hasVoiceLogs = !!rec && (rec.totalMs > 0 || (Array.isArray(rec.sessions) && rec.sessions.length > 0));
+
+                        const items = [];
+
+                        items.push({
+                            type: "item",
+                            label: "Open Encounter Tracker",
+                            action: () => {
+                                try { BdApi.ContextMenu.close?.(); } catch (e) {}
+                                try {
+                                    const container = this.settingsContainer || document.createElement("div");
+                                    this.settingsContainer = container;
+                                    this.renderSettings(container);
+                                } catch (e) {}
+                            }
+                        });
+
+                        items.push({ type: "separator" });
+
+                        if (isManualKnown) {
+                            items.push({
+                                type: "item",
+                                label: "Remove from Known",
+                                action: () => {
+                                    try { BdApi.ContextMenu.close?.(); } catch (e) {}
+                                    const ok = this.clearUserVoiceLogs(userId, { keepFlags: true, forceRemoveManual: true });
+                                    if (ok) BdApi.UI.showToast("Removed from Known", { type: "success" });
+                                    else BdApi.UI.showToast("Nothing to remove", { type: "warning" });
+                                }
+                            });
+                        } else {
+                            items.push({
+                                type: "item",
+                                label: "Mark as Known",
+                                action: () => {
+                                    try { BdApi.ContextMenu.close?.(); } catch (e) {}
+                                    const r = this.markUserAsKnown(userId);
+                                    if (r.ok) BdApi.UI.showToast("Marked as Known", { type: "success" });
+                                    else BdApi.UI.showToast("Failed to mark user", { type: "error" });
+                                }
+                            });
+                        }
+
+                        items.push({
+                            type: "item",
+                            label: "Clear Voice Logs With This User",
+                            danger: true,
+                            action: () => {
+                                try { BdApi.ContextMenu.close?.(); } catch (e) {}
+                                BdApi.UI.showConfirmationModal(
+                                    "Clear voice logs",
+                                    `Delete all stored voice encounter history with ${user.username ?? user.globalName ?? userId}?`,
+                                    {
+                                        confirmText: "Delete",
+                                        cancelText: "Cancel",
+                                        danger: true,
+                                        onConfirm: () => {
+                                            const ok = this.clearUserVoiceLogs(userId, { keepFlags: true });
+                                            if (ok) BdApi.UI.showToast("Voice logs cleared", { type: "success" });
+                                            else BdApi.UI.showToast("Nothing to clear", { type: "warning" });
+                                        }
+                                    }
+                                );
+                            }
+                        });
+
+                        items.push({
+                            type: "item",
+                            label: "Remove User Completely",
+                            danger: true,
+                            action: () => {
+                                try { BdApi.ContextMenu.close?.(); } catch (e) {}
+                                BdApi.UI.showConfirmationModal(
+                                    "Remove user",
+                                    `Remove ${user.username ?? user.globalName ?? userId} from the tracker completely (including blocked/ignored state)?`,
+                                    {
+                                        confirmText: "Remove",
+                                        cancelText: "Cancel",
+                                        danger: true,
+                                        onConfirm: () => {
+                                            const ok = this.removeUser(userId);
+                                            if (ok) BdApi.UI.showToast("Removed", { type: "success" });
+                                            else BdApi.UI.showToast("Nothing to remove", { type: "warning" });
+                                        }
+                                    }
+                                );
+                            }
+                        });
+
+                        const menu = BdApi.Utils.findInTree(
+                            ret,
+                            (e) => e && e.navId === "user-context",
+                            { walkable: ["props", "children"] }
+                        );
+                        const children = BdApi.Utils.getNestedValue(menu, "children");
+                        if (!Array.isArray(children)) return;
+
+                        children.push(
+                            BdApi.ContextMenu.buildMenuChildren([
+                                {
+                                    type: "group",
+                                    items: [
+                                        {
+                                            type: "submenu",
+                                            label: "Voice Encounter Tracker",
+                                            items
+                                        }
+                                    ]
+                                }
+                            ])
+                        );
+                    } catch (e) {
+                        BdApi.Logger.error(this.meta.name, "user-context patch error:", e);
+                    }
+                },
+                this.meta.name
+            );
+        } catch (e) {
+            BdApi.Logger.error(this.meta.name, "patchUserContextMenu failed:", e);
+        }
+    }
+
+    markUserAsKnown(userId) {
+        if (!userId) return { ok: false, reason: "empty" };
+        let rec = this.encounters.get(userId);
+        if (!rec) {
+            rec = {
+                userId,
+                username: this.getUserName(userId),
+                firstSeenAt: Date.now(),
+                lastSeenAt: Date.now(),
+                totalMs: 0,
+                meetings: 0,
+                lastGuildId: null,
+                lastChannelId: null,
+                lastGuildName: null,
+                lastChannelName: null,
+                blocked: false,
+                ignored: false,
+                manual: true,
+                sessions: []
+            };
+            this.encounters.set(userId, rec);
+        } else {
+            rec.manual = true;
+            if (!rec.username || rec.username === "(unknown)") {
+                rec.username = this.getUserName(userId);
+            }
+        }
+        this.scheduleSave();
+        this.scheduleOverlayPush();
+        return { ok: true };
+    }
+
+    clearUserVoiceLogs(userId, { keepFlags = true, forceRemoveManual = false } = {}) {
+        if (!userId) return false;
+        const rec = this.encounters.get(userId);
+        if (!rec) return false;
+
+        const had = (rec.totalMs || 0) > 0 || (Array.isArray(rec.sessions) && rec.sessions.length > 0) || (forceRemoveManual && rec.manual);
+        if (!had) return false;
+
+        rec.sessions = [];
+        rec.totalMs = 0;
+        rec.meetings = 0;
+        rec.firstSeenAt = 0;
+        rec.lastSeenAt = 0;
+        rec.lastGuildId = null;
+        rec.lastChannelId = null;
+        rec.lastGuildName = null;
+        rec.lastChannelName = null;
+
+        if (forceRemoveManual) rec.manual = false;
+
+        if (!keepFlags) {
+            rec.blocked = false;
+            rec.ignored = false;
+        }
+
+        const isEmpty = !rec.manual && !rec.blocked && !rec.ignored && !rec.totalMs;
+        if (isEmpty) this.encounters.delete(userId);
+
+        this.scheduleSave();
+        this.scheduleOverlayPush();
+        return true;
     }
 
     // =====================================================================
@@ -1032,14 +1240,6 @@ module.exports = class VoiceEncounterTracker {
         } catch { return null; }
     }
 
-    /**
-     * [NEW] Best-effort voice RTT. Returns { last, avg } where:
-     *   last — the freshest individual sample from the "default" (voice)
-     *          RTC connection.
-     *   avg  — rolling average from the same connection.
-     * Both are milliseconds. Returns { last: null, avg: null } when no
-     * voice connection is active.
-     */
     getVoicePing() {
         let last = null;
         let avg = null;
@@ -1064,7 +1264,6 @@ module.exports = class VoiceEncounterTracker {
             }
         } catch (e) {}
 
-        // Fallbacks — RTCConnectionStore only, still filter for the voice ctx.
         if (last === null && avg === null) {
             try {
                 const rtc = this._sc?.RTCConnectionStore ?? BdApi.Webpack.getStore("RTCConnectionStore");
@@ -1095,6 +1294,7 @@ module.exports = class VoiceEncounterTracker {
         const rec = this.encounters.get(userId);
         if (rec?.blocked) return "blocked";
         if (rec?.ignored) return "ignored";
+        if (rec?.manual) return "known";
         if (this.isUserLocallyMuted(userId)) return "muted";
         if (!rec) return "stranger";
         return this.isRecent(userId) ? "stranger" : "known";
@@ -1298,10 +1498,6 @@ module.exports = class VoiceEncounterTracker {
         } catch (e) {}
     }
 
-    /**
-     * [NEW] Fast push — only the ping. Keeps the overlay's RTT display
-     * fresh without re-sending the whole user list.
-     */
     pushPingToOverlay() {
         try {
             const { last, avg } = this.getVoicePing();
@@ -1403,7 +1599,6 @@ module.exports = class VoiceEncounterTracker {
             return;
         }
 
-        // switch-source needs sourceId (format: "screen-handle:N" or "window-handle:N")
         if (action === "switch-source") {
             if (!sourceId) return;
             this._switchStreamSource(sourceId, name, cmd.sound);
@@ -1497,9 +1692,6 @@ module.exports = class VoiceEncounterTracker {
                 return false;
             }
 
-            // The overlay gives us both the source list AND the HMONITOR
-            // handle for each screen. Discord's startStream needs
-            // "screen-handle:{HMONITOR}" for non-primary screens.
             let sources = [];
             let preferredId = "screen:0:0";
             try {
@@ -1555,9 +1747,6 @@ module.exports = class VoiceEncounterTracker {
                 BdApi.Logger.error(this.meta.name, "_startSelfStream:", e);
             });
 
-            // Apply saved sound setting shortly after the stream starts.
-            // The stream needs a moment to initialize before setGoLiveSource
-            // will accept a change.
             const desiredSound = this._pendingStreamSound !== undefined
                 ? !!this._pendingStreamSound
                 : true;
@@ -1627,16 +1816,13 @@ module.exports = class VoiceEncounterTracker {
             const streamKey = `guild:${mySession.guildId}:${mySession.channelId}:${userId}`;
             BdApi.Logger.info(this.meta.name, "_watchStream: key =", streamKey);
 
-            // Открыть окно оверлея для этого юзера
             this._postJSON("/video/open", { userId, streamKey });
 
-            // Если уже смотрим ЭТОТ ЖЕ стрим — переиспользуем
             if (this._watchedUserId === userId && this._framePump) {
                 BdApi.Logger.info(this.meta.name, "_watchStream: already watching, reusing");
                 return true;
             }
 
-            // Иначе — функциональный вызов STREAM_WATCH
             const stream = await this._watchStreamByUserId(userId);
             if (!stream) {
                 BdApi.Logger.warn(this.meta.name, "_watchStream: no stream");
@@ -1660,7 +1846,6 @@ module.exports = class VoiceEncounterTracker {
             return null;
         }
 
-        // 1) Если уже смотрим этот же стрим — переиспользуем существующий <video>
         if (this._watchedUserId === userId) {
             const existing = this._findLiveVideoForStream();
             if (existing) {
@@ -1671,10 +1856,8 @@ module.exports = class VoiceEncounterTracker {
             }
         }
 
-        // 2) Запоминаем существующие <video>, чтобы поймать только НОВОЕ
         const before = new Set(document.querySelectorAll("video"));
 
-        // 3) Функциональный вызов STREAM_WATCH — без DOM-кликов
         const streamWatch = BdApi.Webpack.getByStrings("STREAM_WATCH", "allowMultiple", { searchExports: true });
         if (typeof streamWatch !== "function") {
             BdApi.Logger.error(this.meta.name, "_watchStreamByUserId: streamWatch not found");
@@ -1693,14 +1876,12 @@ module.exports = class VoiceEncounterTracker {
             return null;
         }
 
-        // 4) Ждём появления НОВОГО <video>, чтобы узнать streamId
         const video = await this._waitForLiveVideo(timeout, before);
         if (!video) {
             BdApi.Logger.warn(this.meta.name, "no live video appeared");
             return null;
         }
 
-        // 5) Пробуем нативный путь через Discord's nz(streamId)
         const streamId = this._extractStreamId(video);
         if (streamId) {
             BdApi.Logger.info(this.meta.name, "streamId =", streamId);
@@ -1720,9 +1901,6 @@ module.exports = class VoiceEncounterTracker {
                                 "muted:", nativeTrack.muted,
                                 "label:", nativeTrack.label
                             );
-                            // Отдаём ОРИГИНАЛЬНЫЙ трек — без clone.
-                            // Clone дропает кадры, если RTC-энкодер не успевает.
-                            // Оригинал уже обслуживает DirectVideo, мы подключаемся вторым.
                             BdApi.Logger.info(this.meta.name, "returning original native track (no clone)");
                             return new MediaStream([nativeTrack]);
                         }
@@ -1735,7 +1913,6 @@ module.exports = class VoiceEncounterTracker {
             BdApi.Logger.warn(this.meta.name, "no streamId — falling back to srcObject clone");
         }
 
-        // 6) FALLBACK: старый путь через srcObject.clone()
         const track = video.srcObject?.getVideoTracks?.()[0];
         if (!track) {
             BdApi.Logger.error(this.meta.name, "no video track on fallback");
@@ -1757,8 +1934,6 @@ module.exports = class VoiceEncounterTracker {
     }
 
     _extractStreamId(video) {
-        // streamId приходит из патча nz — Discord сам вызывает nz(streamId),
-        // когда создаёт DirectVideo. Никаких dataset-проверок не нужно.
         if (this._lastDiscordStreamId) {
             BdApi.Logger.info(this.meta.name, "_extractStreamId: using nz-patched streamId:",
                 this._lastDiscordStreamId);
@@ -1858,7 +2033,6 @@ module.exports = class VoiceEncounterTracker {
             pc.addTrack(track, stream);
         }
 
-        // ── Sender tuning: must run BEFORE createOffer ──
         try {
             const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
             if (sender) {
@@ -1881,7 +2055,6 @@ module.exports = class VoiceEncounterTracker {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        // Wait for ICE gathering complete. On localhost this is instant.
         await new Promise((resolve) => {
             if (pc.iceGatheringState === "complete") return resolve();
             const check = () => {
@@ -1897,11 +2070,10 @@ module.exports = class VoiceEncounterTracker {
         const desc = pc.localDescription;
         this._postJSON("/webrtc/offer", {
             offer: { type: desc.type, sdp: desc.sdp },
-            candidates: []  // embedded in SDP
+            candidates: []
         });
         BdApi.Logger.info(this.meta.name, "watch peer: offer sent");
 
-        // Poll for answer (video window sends it via IPC → HTTP GET)
         let answer = null;
         for (let i = 0; i < 60; i++) {
             try {
@@ -1928,8 +2100,6 @@ module.exports = class VoiceEncounterTracker {
             return false;
         }
 
-        // ── Sender tuning: raise bitrate, pin fps, keep resolution on degrade ──
-        // Must run after setRemoteDescription so parameters actually apply.
         try {
             const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
             if (sender) {
@@ -2017,7 +2187,6 @@ module.exports = class VoiceEncounterTracker {
             const quality = current.quality || {};
             const soundBool = !!enabled;
 
-            // Step 1: update STREAM_UPDATE_SETTINGS (this is what UI does).
             try {
                 const settingsStore = (() => {
                     let ref = null;
@@ -2046,7 +2215,6 @@ module.exports = class VoiceEncounterTracker {
                 BdApi.Logger.warn(this.meta.name, "_setStreamSound: STREAM_UPDATE_SETTINGS failed", e);
             }
 
-            // Step 2: update the go-live source with the new sound flag.
             const payload = {
                 desktopSettings: {
                     sourceId: current.desktopSource.id,
@@ -2075,12 +2243,10 @@ module.exports = class VoiceEncounterTracker {
             const current = mes?.getGoLiveSource?.();
             if (!current) return null;
 
-            // Prefer explicit desktopSource.sound if present.
             if (current.desktopSource && typeof current.desktopSource.sound === "boolean") {
                 return current.desktopSource.sound;
             }
 
-            // Fallback: read soundshareEnabled from the settings store.
             let ref = null;
             BdApi.Webpack.getModule(m => {
                 if (!m || typeof m !== "object") return false;
@@ -2217,8 +2383,6 @@ module.exports = class VoiceEncounterTracker {
             try { active.blur(); } catch (e) {}
         }
         try { input.focus({ preventScroll: true }); } catch (e) {}
-        this._vetInputFocused = true;
-        this._vetLastFocusedInput = input;
     }
 
     renderSettings(container) {
@@ -2622,18 +2786,7 @@ module.exports = class VoiceEncounterTracker {
             try { overlay.remove(); } catch (e) {}
             this._vetOverlay = null;
             this._vetSearchQuery = "";
-            this._vetInputFocused = false;
-            this._vetLastFocusedInput = null;
 
-            if (this._vetFocusGuard) {
-                try { document.removeEventListener("focusin", this._vetFocusGuard, true); } catch (e) {}
-                this._vetFocusGuard = null;
-            }
-            if (this._vetDocPointerGuard) {
-                try { document.removeEventListener("pointerdown", this._vetDocPointerGuard, true); } catch (e) {}
-                try { document.removeEventListener("mousedown",   this._vetDocPointerGuard, true); } catch (e) {}
-                this._vetDocPointerGuard = null;
-            }
             if (this._vetQueryDebounce) {
                 try { clearTimeout(this._vetQueryDebounce); } catch (e) {}
                 this._vetQueryDebounce = null;
@@ -2812,17 +2965,6 @@ module.exports = class VoiceEncounterTracker {
             input.removeAttribute("readonly");
             input.removeAttribute("disabled");
             input.tabIndex = 0;
-
-            input.addEventListener("focus", () => {
-                this._vetInputFocused = true;
-                this._vetLastFocusedInput = input;
-            });
-            input.addEventListener("blur", () => {
-                setTimeout(() => {
-                    this._vetInputFocused = container.contains(document.activeElement);
-                }, 50);
-            });
-
             input.addEventListener("keydown", (e) => {
                 if (e.key === "Tab") return;
                 e.stopPropagation();
@@ -2833,35 +2975,6 @@ module.exports = class VoiceEncounterTracker {
             }, true);
             input.addEventListener("keypress", (e) => e.stopPropagation(), true);
         }
-
-        if (this._vetDocPointerGuard) {
-            try { document.removeEventListener("pointerdown", this._vetDocPointerGuard, true); } catch (e) {}
-            try { document.removeEventListener("mousedown",   this._vetDocPointerGuard, true); } catch (e) {}
-        }
-        this._vetDocPointerGuard = (e) => {
-            const target = e.target;
-            if (!(target instanceof HTMLElement)) return;
-            if (!container.contains(target)) return;
-            if (!target.matches("[data-role='search-input'], [data-role='manual-input']")) return;
-            e.stopPropagation();
-            try { target.focus({ preventScroll: true }); } catch (err) {}
-        };
-        document.addEventListener("pointerdown", this._vetDocPointerGuard, true);
-        document.addEventListener("mousedown",   this._vetDocPointerGuard, true);
-
-        if (this._vetFocusGuard) {
-            try { document.removeEventListener("focusin", this._vetFocusGuard, true); } catch (e) {}
-        }
-        this._vetFocusGuard = (e) => {
-            if (!this._vetInputFocused) return;
-            if (container.contains(e.target)) return;
-            if (container.contains(document.activeElement)) return;
-            const target = this._vetLastFocusedInput || searchInput || manualInput;
-            if (!target) return;
-            if (target.disabled || target.readOnly) return;
-            try { target.focus({ preventScroll: true }); } catch (err) {}
-        };
-        document.addEventListener("focusin", this._vetFocusGuard, true);
     }
 
     _refreshSettingsContents(overlay, container) {

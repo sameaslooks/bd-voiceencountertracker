@@ -13,9 +13,6 @@ const crypto = require("crypto");
 const { execFile } = require("child_process");
 
 // ─── Chromium flags: kill occlusion detection + background throttling ───
-// Windows/Chromium pause requestAnimationFrame when the window is minimized
-// or occluded. This breaks our video.html frame pump (draw gaps of 5–10s).
-// These switches must be applied before app.whenReady().
 app.commandLine.appendSwitch("disable-features",
     "CalculateNativeWinOcclusion,CalculateNativeWinOcclusionOnScreen");
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
@@ -39,7 +36,7 @@ const ROW_HEIGHT       = 32;
 const NET_BANNER_HEIGHT = 30;
 
 const PORT = 17842;
-const PLUGIN_STALE_MS = 15000;
+const PLUGIN_STALE_MS = 30000;
 const MONITOR_RETRY_MS = 30_000;
 
 // ─── Network quality thresholds ───
@@ -55,6 +52,22 @@ const NET = {
     LOST_HOLD_MS:         3000,
     STALE_PING_MS:        2000
 };
+
+// ─── Click-through / cursor / fullscreen state ───
+const CURSOR_CHECK_MS     = 300;
+const CURSOR_CACHE_MS     = 200;
+const CURSOR_STABLE_TICKS = 1;
+
+// Fullscreen detection tolerance — DWM может давать rect чуть больше монитора
+// (невидимые рамки окна). Позволяем разницу вплоть до 2 px по каждой стороне.
+const FULLSCREEN_TOLERANCE_PX = 2;
+
+let _clickThroughState  = false;
+let _cachedCursorState  = { showing: true, at: 0 };
+let _cachedFgState      = { hwnd: 0, pid: 0, cursorShowing: 1, rect: null, at: 0 };
+let _cursorCheckBusy    = false;
+let _cursorStableCount  = 0;
+let _cursorStableValue  = true;
 
 // ─── Shared state ───
 let state = {
@@ -106,14 +119,13 @@ let _webrtcOfferCandidates = [];
 let _webrtcAnswer = null;
 let _webrtcAnswerCandidates = [];
 
-// Legacy ICE buffers — kept in case sender.html still used. Not touched by
-// the new simplified flow.
 let _webrtcIceForSender = [];
 let _webrtcIceForReceiver = [];
 
 let _videoFullscreenState = false;
 let _videoPreviewState = false;
 let _videoSavedBounds = null;
+let _videoAlpha = 1.0;
 
 let _saveWindowsTimer = null;
 let _monitorRetryTimer = null;
@@ -172,7 +184,8 @@ function settingsFile() {
 let settings = {
     preferredSourceId: "screen:0:0",
     preferredSourceName: null,
-    streamSound: true
+    streamSound: true,
+    clickThroughOnGameFocus: true
 };
 
 function loadSettings() {
@@ -191,6 +204,163 @@ function saveSettings() {
     } catch (e) {
         console.error("[settings.json] save failed:", e.message);
     }
+}
+
+// =====================================================================
+// Cursor + foreground window check (single PowerShell call)
+// =====================================================================
+
+function checkForegroundAndCursor() {
+    const now = Date.now();
+    if (now - _cachedFgState.at < CURSOR_CACHE_MS) {
+        return Promise.resolve(_cachedFgState);
+    }
+    if (_cursorCheckBusy) {
+        return Promise.resolve(_cachedFgState);
+    }
+    _cursorCheckBusy = true;
+
+    return new Promise((resolve) => {
+        const ps = `
+Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class VetFg {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CURSORINFO {
+        public int cbSize;
+        public int flags;
+        public IntPtr hCursor;
+        public int ptX;
+        public int ptY;
+    }
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+    [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO pci);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    public static string GetInfo() {
+        IntPtr hwnd = GetForegroundWindow();
+        uint pid = 0;
+        GetWindowThreadProcessId(hwnd, out pid);
+
+        RECT r;
+        GetWindowRect(hwnd, out r);
+
+        CURSORINFO ci = new CURSORINFO();
+        ci.cbSize = Marshal.SizeOf(ci);
+        GetCursorInfo(ref ci);
+        int cursorShowing = (ci.flags & 1) != 0 ? 1 : 0;
+
+        return hwnd.ToInt64() + "|" + pid + "|" + cursorShowing + "|"
+             + r.Left + "|" + r.Top + "|" + r.Right + "|" + r.Bottom;
+    }
+}
+"@
+[VetFg]::GetInfo()
+        `.trim();
+
+        execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps],
+            { windowsHide: true, timeout: 2000 },
+            (err, stdout) => {
+                _cursorCheckBusy = false;
+                if (err) { resolve(_cachedFgState); return; }
+
+                const raw = String(stdout || "").trim();
+                const parts = raw.split("|");
+                if (parts.length !== 7) { resolve(_cachedFgState); return; }
+
+                const hwnd = Number(parts[0]);
+                const pid = Number(parts[1]);
+                const cursorShowing = parseInt(parts[2], 10);
+                const l = Number(parts[3]);
+                const t = Number(parts[4]);
+                const r = Number(parts[5]);
+                const b = Number(parts[6]);
+
+                if (![hwnd, pid, cursorShowing, l, t, r, b].every(Number.isFinite)) {
+                    resolve(_cachedFgState);
+                    return;
+                }
+
+                _cachedFgState = {
+                    hwnd, pid, cursorShowing,
+                    rect: { x: l, y: t, width: r - l, height: b - t },
+                    at: Date.now()
+                };
+                resolve(_cachedFgState);
+            });
+    });
+}
+
+// Проверяет, покрывает ли rect активного окна bounds одного из мониторов
+// (с допуском FULLSCREEN_TOLERANCE_PX на каждую сторону).
+function rectCoversAnyMonitor(rect) {
+    if (!rect) return false;
+    const displays = screen.getAllDisplays();
+    const T = FULLSCREEN_TOLERANCE_PX;
+    for (const d of displays) {
+        const b = d.bounds;
+        const coversX = rect.x <= b.x + T && rect.x + rect.width  >= b.x + b.width  - T;
+        const coversY = rect.y <= b.y + T && rect.y + rect.height >= b.y + b.height - T;
+        if (coversX && coversY) return true;
+    }
+    return false;
+}
+
+function setClickThrough(enabled) {
+    if (_clickThroughState === enabled) return;
+    _clickThroughState = enabled;
+    console.log("[click-through]", enabled ? "ON" : "OFF");
+
+    for (const rec of windows.values()) {
+        if (!rec.win || rec.win.isDestroyed()) continue;
+        try {
+            rec.win.setIgnoreMouseEvents(enabled, { forward: false });
+        } catch (e) {}
+        try {
+            rec.win.webContents.executeJavaScript(
+                `document.body.classList.toggle("click-through", ${enabled});`
+            ).catch(() => {});
+        } catch (e) {}
+    }
+}
+
+function startCursorWatchdog() {
+    setInterval(async () => {
+        try {
+            if (!settings.clickThroughOnGameFocus) {
+                if (_clickThroughState) setClickThrough(false);
+                _cursorStableCount = 0;
+                return;
+            }
+
+            const info = await checkForegroundAndCursor();
+            const cursorHidden = info.cursorShowing === 0;
+            const isFullscreen = rectCoversAnyMonitor(info.rect);
+
+            // Click-through только когда:
+            //  1) курсор скрыт системой,
+            //  2) активное окно покрывает весь монитор (fullscreen).
+            const wantClickThrough = cursorHidden && isFullscreen;
+
+            if (wantClickThrough === _cursorStableValue) {
+                _cursorStableCount++;
+            } else {
+                _cursorStableValue = wantClickThrough;
+                _cursorStableCount = 1;
+            }
+
+            if (_cursorStableCount >= CURSOR_STABLE_TICKS) {
+                if (_clickThroughState !== _cursorStableValue) {
+                    setClickThrough(_cursorStableValue);
+                }
+                _cursorStableCount = CURSOR_STABLE_TICKS;
+            }
+        } catch (e) {}
+    }, CURSOR_CHECK_MS);
 }
 
 // =====================================================================
@@ -565,9 +735,6 @@ function startServer() {
             return;
         }
 
-        // ─── WebRTC signaling relay (simplified) ───
-        // Plugin POSTs { offer, candidates } -> we forward to videoWindow via IPC.
-        // videoWindow replies with { answer, candidates } via IPC -> plugin GETs.
         if (req.method === "POST" && url === "/webrtc/offer") {
             try {
                 const body = await readBody(req);
@@ -616,7 +783,6 @@ function startServer() {
             return;
         }
 
-        // ─── Legacy ICE relay (sender.html compatibility) ───
         if (req.method === "POST" && url === "/webrtc/ice") {
             try {
                 const body = await readBody(req);
@@ -638,14 +804,8 @@ function startServer() {
             return;
         }
 
-        // ─── Video window controls ───
         if (req.method === "POST" && url === "/video/close") {
             closeVideoWindow();
-            jsonReply(res, 200, { ok: true });
-            return;
-        }
-        if (req.method === "POST" && url === "/video/fullscreen") {
-            toggleVideoFullscreen();
             jsonReply(res, 200, { ok: true });
             return;
         }
@@ -1032,12 +1192,18 @@ function createWindowFromRecord(record) {
     win.setAlwaysOnTop(true, "screen-saver");
     win.setVisibleOnAllWorkspaces(true);
     win.setOpacity(OPACITY);
+
+    try {
+        win.setIgnoreMouseEvents(_clickThroughState, { forward: false });
+    } catch (e) {}
+
     win.loadFile(path.join(__dirname, "overlay.html"));
 
     win.webContents.on("did-finish-load", () => {
         try {
             win.webContents.executeJavaScript(
-                `window.__vetWinId = ${JSON.stringify(rec.id)};`
+                `window.__vetWinId = ${JSON.stringify(rec.id)};` +
+                `document.body.classList.toggle("click-through", ${_clickThroughState});`
             );
         } catch (e) {}
     });
@@ -1314,6 +1480,20 @@ function rebuildTrayMenu() {
                 { label: "90%",  click: () => setOpacityAll(0.9) },
                 { label: "100%", click: () => setOpacityAll(1.0) }
             ]
+        },
+        { type: "separator" },
+        {
+            label: "Click-through on fullscreen",
+            type: "checkbox",
+            checked: settings.clickThroughOnGameFocus !== false,
+            click: (item) => {
+                settings.clickThroughOnGameFocus = !!item.checked;
+                saveSettings();
+                if (!settings.clickThroughOnGameFocus) {
+                    setClickThrough(false);
+                }
+                rebuildTrayMenu();
+            }
         }
     ];
 
@@ -1364,6 +1544,7 @@ function wireVideoWindowIpc(win) {
 
     ipcMain.removeAllListeners(ch + ":answer");
     ipcMain.removeAllListeners(ch + ":ready");
+    ipcMain.removeAllListeners(ch + ":alpha");
 
     ipcMain.on(ch + ":answer", (_e, payload) => {
         _webrtcAnswer = payload?.sdp || null;
@@ -1380,6 +1561,15 @@ function wireVideoWindowIpc(win) {
                 });
             } catch (e) {}
         }
+        try { win.webContents.send("video:alpha-state", _videoAlpha); } catch (e) {}
+    });
+
+    ipcMain.on(ch + ":alpha", (_e, alpha) => {
+        const v = Math.max(0.2, Math.min(1, Number(alpha)));
+        if (Number.isFinite(v)) {
+            _videoAlpha = v;
+            try { win.setOpacity(v); } catch (e) {}
+        }
     });
 
     win.webContents._vetIpcChannel = ch;
@@ -1392,7 +1582,7 @@ function openVideoWindow(params) {
     }
     videoWindow = new BrowserWindow({
         width: 640, height: 380, minWidth: 320, minHeight: 200,
-        frame: false, transparent: false, backgroundColor: "#000000",
+        frame: false, transparent: true, backgroundColor: "#00000000",
         alwaysOnTop: true, resizable: true, skipTaskbar: false, hasShadow: true,
         show: false,
         webPreferences: {
@@ -1404,6 +1594,7 @@ function openVideoWindow(params) {
     });
     videoWindow.setAlwaysOnTop(true, "screen-saver");
     videoWindow.setVisibleOnAllWorkspaces(true);
+    try { videoWindow.setOpacity(_videoAlpha); } catch (e) {}
     videoWindow.loadFile(path.join(__dirname, "video.html"));
 
     wireVideoWindowIpc(videoWindow);
@@ -1429,7 +1620,6 @@ function openVideoWindow(params) {
         _videoPreviewState = false;
         _videoSavedBounds = null;
 
-        // Reset WebRTC state so a fresh open starts clean.
         _webrtcOffer = null;
         _webrtcOfferCandidates = [];
         _webrtcAnswer = null;
@@ -1442,21 +1632,6 @@ function closeVideoWindow() {
         try { videoWindow.close(); } catch (e) {}
     }
     videoWindow = null;
-}
-
-function toggleVideoFullscreen() {
-    if (!videoWindow || videoWindow.isDestroyed()) return;
-    if (!_videoFullscreenState) {
-        _videoSavedBounds = videoWindow.getBounds();
-        const d = screen.getDisplayNearestPoint(
-            screen.getPoint(videoWindow.getBounds().x, videoWindow.getBounds().y)
-        );
-        videoWindow.setBounds(d.bounds);
-        _videoFullscreenState = true;
-    } else {
-        if (_videoSavedBounds) videoWindow.setBounds(_videoSavedBounds);
-        _videoFullscreenState = false;
-    }
 }
 
 function toggleVideoPreview() {
@@ -1508,6 +1683,7 @@ app.whenReady().then(async () => {
     startLivenessWatchdog();
     startMonitorRetryTimer();
     startNetTicker();
+    startCursorWatchdog();
 
     setInterval(() => {
         refreshSources(true).then(rebuildTrayMenu).catch(() => {});

@@ -6,41 +6,94 @@
 <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
-        background: #000; color: #dcddde;
+        background: transparent;
+        color: #dcddde;
         font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-        font-size: 12px; overflow: hidden; user-select: none; height: 100vh;
+        font-size: 12px;
+        overflow: hidden;
+        user-select: none;
+        height: 100vh;
     }
-    #root { position: relative; width: 100vw; height: 100vh; background: #000; overflow: hidden; }
-    #view { width: 100%; height: 100%; background: #000; display: block; }
+    #root {
+        position: relative;
+        width: 100vw; height: 100vh;
+        background: #000;
+        overflow: hidden;
+    }
+    #view {
+        width: 100%; height: 100%;
+        background: #000;
+        display: block;
+    }
     #controls {
-        position: absolute; top: 0; left: 0; right: 0; height: 26px;
+        position: absolute; top: 0; left: 0; right: 0; height: 28px;
         display: flex; align-items: center; justify-content: flex-end; gap: 4px;
         padding: 0 6px;
-        background: linear-gradient(to bottom, rgba(0,0,0,0.65), rgba(0,0,0,0));
-        -webkit-app-region: drag; opacity: 0; transition: opacity 0.15s; z-index: 10;
+        background: linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0));
+        -webkit-app-region: drag;
+        opacity: 0; transition: opacity 0.15s;
+        z-index: 10000;
     }
-    #root:hover #controls { opacity: 1; }
-    .btn { -webkit-app-region: no-drag; background: rgba(255,255,255,0.08);
-        border: none; color: #fff; cursor: pointer; border-radius: 3px;
-        padding: 3px 6px; font-size: 11px; display: inline-flex;
-        align-items: center; justify-content: center; line-height: 1; }
+    #root:hover #controls,
+    #controls.show { opacity: 1; }
+    .btn {
+        -webkit-app-region: no-drag;
+        background: rgba(255,255,255,0.08);
+        border: none; color: #fff; cursor: pointer;
+        border-radius: 3px; padding: 3px 6px; font-size: 11px;
+        display: inline-flex; align-items: center; justify-content: center;
+        line-height: 1; min-width: 22px; height: 20px;
+    }
     .btn:hover { background: rgba(255,255,255,0.18); }
+    .btn.active { background: rgba(88,101,242,0.85); color: #fff; }
     .btn svg { width: 12px; height: 12px; display: block; }
-    #status { position: absolute; inset: 0; display: flex; align-items: center;
-        justify-content: center; color: #72767d; font-size: 12px;
-        pointer-events: none; z-index: 5; }
+
+    #alpha-pop {
+        position: absolute; top: 28px; right: 34px;
+        background: rgba(0,0,0,0.85);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 4px;
+        padding: 6px 8px;
+        display: none;
+        align-items: center;
+        gap: 6px;
+        -webkit-app-region: no-drag;
+        z-index: 10001;
+        color: #fff;
+    }
+    #alpha-pop.show { display: flex; }
+    #alpha-range { width: 120px; accent-color: #5865f2; }
+    #alpha-val { width: 32px; text-align: right; font-variant-numeric: tabular-nums; opacity: 0.8; }
+
+    #status {
+        position: absolute; inset: 0;
+        display: flex; align-items: center; justify-content: center;
+        color: #72767d; font-size: 12px;
+        pointer-events: none; z-index: 5;
+    }
 </style>
 </head>
 <body>
 <div id="root">
     <canvas id="view"></canvas>
     <div id="controls">
-        <button class="btn" id="btn-pin" title="Preview mode">
+        <button class="btn" id="btn-alpha" title="Opacity">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2a10 10 0 1 0 0 20V2z" opacity="0.9"/>
+                <path d="M12 2a10 10 0 1 1 0 20V2z" fill="none" stroke="currentColor" stroke-width="1.4"/>
+            </svg>
+        </button>
+        <button class="btn" id="btn-pin" title="Preview mode (small corner)">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h6v2H6v4H4V4Zm10 0h6v6h-2V6h-4V4ZM4 14h2v4h4v2H4v-6Zm14 0h2v6h-6v-2h4v-4Z"/></svg>
         </button>
         <button class="btn" id="btn-close" title="Close">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7 12 12l6.3 6.3-1.4 1.4L10.6 13.4 4.3 19.7 2.9 18.3 9.2 12 2.9 5.7 4.3 4.3l6.3 6.3 6.3-6.3z"/></svg>
         </button>
+    </div>
+    <div id="alpha-pop">
+        <span>Alpha</span>
+        <input id="alpha-range" type="range" min="20" max="100" step="1" value="100">
+        <span id="alpha-val">100%</span>
     </div>
     <div id="status">Waiting for stream…</div>
 </div>
@@ -49,14 +102,13 @@
 const API_BASE = "http://127.0.0.1:17842";
 const elView = document.getElementById("view");
 const elStatus = document.getElementById("status");
-const ctx = elView.getContext("2d", { alpha: false });  // БЕЗ desynchronized
+const ctx = elView.getContext("2d", { alpha: false });
 
 let pc = null;
 let readerLoopRunning = false;
 
-// ─── Простой: 60 fps cap + drop old. Никакого mediaTime. ───
-const FRAME_HOLD = 1000 / 65;   // ~60 fps cap
-const MAX_HOLD = 2;             // очередь максимум 2 кадра
+const FRAME_HOLD = 1000 / 65;
+const MAX_HOLD = 2;
 const FRAME_BUFFER = [];
 let lastShownFrame = null;
 let lastFrameWall = 0;
@@ -102,21 +154,17 @@ function tick() {
 
     const now = performance.now();
     if (now - lastFrameWall < FRAME_HOLD) {
-        // Слишком рано. Перепланируем.
         raf = requestAnimationFrame(tick);
         return;
     }
-
     lastFrameWall = now;
 
-    // Взять САМЫЙ СВЕЖИЙ кадр, все старые закрыть.
     let newest = null;
     while (FRAME_BUFFER.length > 0) {
         const f = FRAME_BUFFER.shift();
         if (newest) { try { newest.frame.close(); } catch(e){} }
         newest = f;
     }
-
     if (newest) {
         if (lastShownFrame) { try { lastShownFrame.close(); } catch(e){} }
         lastShownFrame = newest.frame;
@@ -125,7 +173,6 @@ function tick() {
 }
 
 function enqueueFrame(frame) {
-    // Дроп старых при переполнении.
     while (FRAME_BUFFER.length >= MAX_HOLD) {
         const dropped = FRAME_BUFFER.shift();
         try { dropped.frame.close(); } catch(e){}
@@ -173,7 +220,7 @@ async function handleOffer({ sdp, candidates }) {
     pc = new RTCPeerConnection({ iceServers: [] });
 
     pc.ontrack = (event) => {
-        log("ontrack", event.track.kind, event.streams.length);
+        log("ontrack", event.track.kind);
         if (event.track.kind !== "video") return;
 
         pc.getReceivers().forEach(r => {
@@ -181,48 +228,17 @@ async function handleOffer({ sdp, candidates }) {
             try { r.playoutDelayHint = 0; } catch (e) {}
         });
 
-        const v = document.createElement("video");
-        v.id = "testRemote";
-        v.muted = true;
-        v.autoplay = true;
-        v.playsInline = true;
-        v.srcObject = event.streams[0];
-        v.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:100vh;object-fit:contain;background:#000;z-index:9999";
-        document.body.appendChild(v);
-        v.play().catch(e => log("play failed:", e.message));
         setStatus("");
 
-        setTimeout(() => {
-            let last = 0;
-            const d = [];
-            const t0 = performance.now();
-            v.requestVideoFrameCallback(function loop(now) {
-                if (last) d.push(now - last);
-                last = now;
-                if (performance.now() - t0 < 10000) {
-                    v.requestVideoFrameCallback(loop);
-                } else {
-                    const s = d.slice().sort((a,b)=>a-b);
-                    console.log("=== WebRTC → <video> DIRECT (10s) ===");
-                    console.log("fps:", (d.length/10).toFixed(1));
-                    console.log("p50:", s[Math.floor(s.length*0.5)]?.toFixed(1),
-                                "p95:", s[Math.floor(s.length*0.95)]?.toFixed(1),
-                                "p99:", s[Math.floor(s.length*0.99)]?.toFixed(1),
-                                "max:", s[s.length-1]?.toFixed(1));
-                    console.log("gaps >50ms:", d.filter(x=>x>50).length);
-                    console.log("gaps >100ms:", d.filter(x=>x>100).length);
-                    console.log("gaps >200ms:", d.filter(x=>x>200).length);
-                    console.log("top 10:", s.slice(-10).reverse().map(x=>x.toFixed(0)).join(","));
-                }
-            });
-        }, 3000);
+        // WebCodecs pipeline — читаем кадры напрямую с трека.
+        // <video> не нужен — рисуем через <canvas> в drawOne().
+        startReader(event.track);
     };
 
     pc.onconnectionstatechange = () => {
         log("conn state:", pc.connectionState);
         if (pc.connectionState === "connected") {
             setStatus("");
-            // Ещё раз — некоторые браузеры применяют только после connected
             pc.getReceivers().forEach(r => {
                 try { r.jitterBufferTarget = 0; } catch (e) {}
                 try { r.playoutDelayHint = 0; } catch (e) {}
@@ -264,6 +280,15 @@ async function handleOffer({ sdp, candidates }) {
 if (window.vetWebRTC) {
     window.vetWebRTC.onOffer(handleOffer);
     window.vetWebRTC.ready();
+    if (window.vetWebRTC.onAlphaState) {
+        window.vetWebRTC.onAlphaState((alpha) => {
+            const r = document.getElementById("alpha-range");
+            const v = document.getElementById("alpha-val");
+            const pct = Math.round((alpha ?? 1) * 100);
+            if (r) r.value = String(pct);
+            if (v) v.textContent = `${pct}%`;
+        });
+    }
 } else {
     log("bridge missing");
     setStatus("Bridge missing");
@@ -272,8 +297,55 @@ if (window.vetWebRTC) {
 document.getElementById("btn-close").addEventListener("click", () => {
     fetch(API_BASE + "/video/close", { method: "POST" }).catch(() => {});
 });
+
 document.getElementById("btn-pin").addEventListener("click", () => {
     fetch(API_BASE + "/video/preview", { method: "POST" }).catch(() => {});
+});
+
+const btnAlpha = document.getElementById("btn-alpha");
+const alphaPop = document.getElementById("alpha-pop");
+const alphaRange = document.getElementById("alpha-range");
+const alphaVal = document.getElementById("alpha-val");
+
+let _hideAlphaTimer = null;
+function showAlphaPop() {
+    if (_hideAlphaTimer) { clearTimeout(_hideAlphaTimer); _hideAlphaTimer = null; }
+    alphaPop.classList.add("show");
+    document.getElementById("controls").classList.add("show");
+}
+function scheduleHideAlphaPop() {
+    if (_hideAlphaTimer) clearTimeout(_hideAlphaTimer);
+    _hideAlphaTimer = setTimeout(() => {
+        alphaPop.classList.remove("show");
+        document.getElementById("controls").classList.remove("show");
+        _hideAlphaTimer = null;
+    }, 1500);
+}
+
+btnAlpha.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (alphaPop.classList.contains("show")) {
+        alphaPop.classList.remove("show");
+    } else {
+        showAlphaPop();
+        scheduleHideAlphaPop();
+    }
+});
+
+alphaPop.addEventListener("mouseenter", () => {
+    if (_hideAlphaTimer) { clearTimeout(_hideAlphaTimer); _hideAlphaTimer = null; }
+});
+alphaPop.addEventListener("mouseleave", () => scheduleHideAlphaPop());
+
+alphaRange.addEventListener("input", () => {
+    const pct = parseInt(alphaRange.value, 10) || 100;
+    alphaVal.textContent = `${pct}%`;
+    try {
+        window.vetWebRTC?.setAlpha?.(pct / 100);
+    } catch (e) {}
+});
+alphaRange.addEventListener("change", () => {
+    scheduleHideAlphaPop();
 });
 </script>
 </body>
