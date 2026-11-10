@@ -2,10 +2,11 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.0.0
+ * @version 1.0.1
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
+ * @updateUrl https://raw.githubusercontent.com/sameaslooks/bd-voiceencountertracker/refs/heads/master/VoiceEncounterTracker.plugin.js
  */
 
 module.exports = class VoiceEncounterTracker {
@@ -1353,7 +1354,7 @@ module.exports = class VoiceEncounterTracker {
                 continue;
             }
 
-            const usernameEl = row.querySelector("[class*='username__']");
+            const usernameEl = row.querySelector("[class*='username_']");
             if (!usernameEl) continue;
 
             if (!this.modifiedStyles.has(usernameEl)) {
