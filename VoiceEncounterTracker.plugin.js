@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.0.1
+ * @version 1.0.2
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -1287,8 +1287,8 @@ module.exports = class VoiceEncounterTracker {
 
     isRecent(userId) {
         const rec = this.encounters.get(userId);
-        if (!rec || !rec.lastSeenAt) return false;
-        return (Date.now() - rec.lastSeenAt) <= this.RECENT_MS;
+        if (!rec || !rec.firstSeenAt) return false;
+        return (Date.now() - rec.firstSeenAt) <= this.RECENT_MS;
     }
 
     getBadgeKind(userId) {
