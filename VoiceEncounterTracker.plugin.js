@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.1.2
+ * @version 1.1.3
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -1132,8 +1132,14 @@ module.exports = class VoiceEncounterTracker {
             startedAt, endedAt, durationMs: duration,
             guildId, guildName, channelId, channelName,
             isDM,
+            username: null, globalName: null,
             events
         };
+        const liveName = this._liveName(userId);
+        if (liveName) {
+            session.username = liveName.username;
+            session.globalName = liveName.globalName;
+        }
 
         const cur = this.encounters.get(userId);
 
@@ -1164,9 +1170,6 @@ module.exports = class VoiceEncounterTracker {
             cur.lastChannelId = channelId;
             cur.lastGuildName = guildName;
             cur.lastChannelName = channelName;
-            if (!cur.username || cur.username === "(unknown)") {
-                cur.username = this.getUserName(userId);
-            }
             if (!Array.isArray(cur.sessions)) cur.sessions = [];
             cur.sessions.push(session);
             if (cur.sessions.length > this.MAX_SESSIONS) {
@@ -1174,6 +1177,7 @@ module.exports = class VoiceEncounterTracker {
             }
         }
 
+        this._rememberName(this.encounters.get(userId));
         this.scheduleSave();
     }
 
@@ -1225,10 +1229,51 @@ module.exports = class VoiceEncounterTracker {
     // =====================================================================
 
     getUserName(userId) {
+        const live = this._liveName(userId);
+        if (live?.username) return live.username;
+        const rec = this.encounters.get(userId);
+        if (rec?.username && rec.username !== "(unknown)") return rec.username;
+        const sessions = Array.isArray(rec?.sessions) ? rec.sessions : [];
+        for (let i = sessions.length - 1; i >= 0; i--) {
+            const sn = sessions[i];
+            if (sn?.username || sn?.globalName) return sn.username || sn.globalName;
+        }
+        return rec?.globalName || "(unknown)";
+    }
+
+    _escape(str) {
+        return String(str ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    // Last known display name (globalName): live, else stored, else from sessions
+    getStoredDisplayName(userId) {
+        const live = this._liveName(userId);
+        if (live?.globalName) return live.globalName;
+        const rec = this.encounters.get(userId);
+        if (rec?.globalName) return rec.globalName;
+        const sessions = Array.isArray(rec?.sessions) ? rec.sessions : [];
+        for (let i = sessions.length - 1; i >= 0; i--) {
+            if (sessions[i]?.globalName) return sessions[i].globalName;
+        }
+        return null;
+    }
+
+    _liveName(userId) {
         try {
             const user = (this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore"))?.getUser?.(userId);
-            return user?.username ?? user?.globalName ?? "(unknown)";
-        } catch { return "(unknown)"; }
+            if (!user || (!user.username && !user.globalName)) return null;
+            return { username: user.username ?? null, globalName: user.globalName ?? null };
+        } catch { return null; }
+    }
+
+    // Keep the record's "last known name" current; per-session names are the history.
+    _rememberName(rec) {
+        if (!rec) return null;
+        const live = this._liveName(rec.userId);
+        if (!live) return null;
+        if (live.username) rec.username = live.username;
+        if (live.globalName) rec.globalName = live.globalName;
+        return live;
     }
 
     getDisplayName(userId, guildId) {
@@ -2663,7 +2708,7 @@ module.exports = class VoiceEncounterTracker {
                 }
                 .vet-session-entry {
                     display: grid;
-                    grid-template-columns: 90px 140px 80px minmax(140px, 1fr) minmax(120px, 1fr) 90px;
+                    grid-template-columns: 90px 140px 80px minmax(140px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr) 90px;
                     gap: 12px;
                     padding: 5px 4px;
                     border-bottom: 1px solid rgba(255,255,255,0.04);
@@ -3091,7 +3136,7 @@ module.exports = class VoiceEncounterTracker {
         if (sort) {
             const kindRank = { blocked: 0, ignored: 1, muted: 2, stranger: 3, known: 4 };
             const getters = {
-                user:     r => this.getUserName(r.userId).toLowerCase(),
+                user:     r => (this.getStoredDisplayName(r.userId) || this.getUserName(r.userId)).toLowerCase(),
                 id:       r => BigInt(r.userId || 0),
                 status:   r => kindRank[this.getBadgeKind(r.userId)] ?? 9,
                 badge:    r => kindRank[this.getBadgeKind(r.userId)] ?? 9,
@@ -3124,7 +3169,7 @@ module.exports = class VoiceEncounterTracker {
             entries = entries.filter(rec => {
                 const uid = String(rec.userId || "").toLowerCase();
                 const uname = this.getUserName(rec.userId).toLowerCase();
-                const disp = this.getDisplayName(rec.userId, null).toLowerCase();
+                const disp = (this.getStoredDisplayName(rec.userId) || "").toLowerCase();
                 return uid.includes(query)
                     || uname.includes(query)
                     || disp.includes(query);
@@ -3157,8 +3202,25 @@ module.exports = class VoiceEncounterTracker {
         const expandedSession = this._vetExpandedSession;
 
         const html = entries.map((rec, i) => {
-            const username = this.getUserName(rec.userId);
+            const rawUsername = this.getUserName(rec.userId);
+            const username = this._escape(rawUsername);
+            const rawDisplay = this.getStoredDisplayName(rec.userId);
+            const displayName = rawDisplay ? this._escape(rawDisplay) : null;
             const kind = this.getBadgeKind(rec.userId);
+            // Name history = name changes across recorded sessions
+            const prevNames = [];
+            let prevKey = null;
+            for (const sn of (Array.isArray(rec.sessions) ? rec.sessions : [])) {
+                if (!sn?.username && !sn?.globalName) continue;
+                const k = `${sn.username}|${sn.globalName}`;
+                if (k === prevKey) continue;
+                prevKey = k;
+                prevNames.push({ at: sn.startedAt, username: sn.username, globalName: sn.globalName });
+            }
+            const prevNameLines = prevNames
+                .map(n => `${this.formatDate(n.at)}  ${n.globalName && n.globalName !== n.username ? n.globalName + " (" + n.username + ")" : (n.username || n.globalName)}`);
+            const nameTitle = this._escape(`${this.getUserName(rec.userId)} (${rec.userId})` +
+                (prevNameLines.length > 1 ? "\nName history:\n" + prevNameLines.join("\n") : ""));
             let glyph, glyphColor, status;
             if (kind === "blocked")      { glyph = "⊘"; glyphColor = "#ed4245"; status = "blocked"; }
             else if (kind === "ignored") { glyph = "⊘"; glyphColor = "#faa61a"; status = "ignored"; }
@@ -3173,8 +3235,10 @@ module.exports = class VoiceEncounterTracker {
 
             const mainRow = `<tr class="vet-main-row${isExpanded ? " expanded" : ""}" data-user-id="${rec.userId}">
                 <td class="vet-num">${i + 1}</td>
-                <td class="vet-name" title="${username} (${rec.userId})">
-                    <span class="vet-expand-arrow">${arrow}</span>${username}
+                <td class="vet-name" title="${nameTitle}">
+                    <span class="vet-expand-arrow">${arrow}</span>${displayName && rawDisplay !== rawUsername
+                        ? `${displayName} <span style="opacity:.55">${username}</span>`
+                        : username}
                 </td>
                 <td class="vet-id" title="${rec.userId}">${rec.userId}</td>
                 <td class="vet-status" data-status="${status}">${status}</td>
@@ -3220,6 +3284,9 @@ module.exports = class VoiceEncounterTracker {
                 const dur = this.formatDuration(s.durationMs ?? (s.endedAt - s.startedAt));
                 const guild = s.guildName || (s.guildId ? s.guildId.slice(-6) : "📞 DM");
                 const channel = s.channelName || (s.channelId ? s.channelId.slice(-6) : "—");
+                const sessName = this._escape(s.username
+                    ? (s.globalName && s.globalName !== s.username ? `${s.globalName} (${s.username})` : s.username)
+                    : (s.globalName || "—"));
                 const isSessExpanded = expandedSession &&
                     expandedSession.userId === rec.userId &&
                     expandedSession.sessionIndex === idx;
@@ -3238,6 +3305,7 @@ module.exports = class VoiceEncounterTracker {
                     <span class="vet-session-dur">${dur}</span>
                     <span class="vet-session-guild" title="${guild}">${guild}</span>
                     <span class="vet-session-channel" title="${channel}">${channel}</span>
+                    <span class="vet-session-name" title="${sessName}">${sessName}</span>
                     <span class="vet-session-open">${openLabel}</span>
                 </div>`;
             }).join("");
