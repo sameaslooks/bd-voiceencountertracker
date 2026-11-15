@@ -475,9 +475,10 @@
 const API_STATE    = "http://127.0.0.1:17842/state";
 const API_SPEAKING = "http://127.0.0.1:17842/speaking";
 const API_COMMAND  = "http://127.0.0.1:17842/command";
+const API_EVENTS   = "http://127.0.0.1:17842/events";
 
 const REFRESH_STATE_MS    = 250;
-const REFRESH_SPEAKING_MS = 250;
+const REFRESH_SPEAKING_MS = 40;
 
 const RECENT_WINDOW_MS   = 30_000;
 const PULSE_WINDOW_MS    = 15_000;
@@ -1026,8 +1027,52 @@ elSrcBtn.addEventListener("click", (e) => {
     }).catch(() => {});
 });
 
-tickState();
-tickSpeaking();
+// Live updates via SSE; fall back to polling only while the stream is down.
+let sseConnected = false;
+let pollTimer = null;
+
+function showOffline() {
+    renderNet(null, false);
+    showMessage("offline", "PLUGIN OFFLINE\nOverlay server unreachable", "Voice");
+}
+
+function startFallbackPoll() {
+    if (pollTimer) return;
+    const poll = async () => {
+        if (sseConnected) { pollTimer = null; return; }
+        try {
+            const [st, sp] = await Promise.all([
+                fetch(API_STATE, { cache: "no-store" }).then(r => r.json()),
+                fetch(API_SPEAKING, { cache: "no-store" }).then(r => r.json())
+            ]);
+            renderState(st);
+            applySpeaking(Array.isArray(sp.speakers) ? sp.speakers : []);
+        } catch (e) { showOffline(); }
+        pollTimer = setTimeout(poll, 1000);
+    };
+    pollTimer = setTimeout(poll, 0);
+}
+
+function connectEvents() {
+    const es = new EventSource(API_EVENTS);
+    es.addEventListener("open", () => { sseConnected = true; });
+    es.addEventListener("state", (e) => {
+        try { renderState(JSON.parse(e.data)); } catch (err) {}
+    });
+    es.addEventListener("speaking", (e) => {
+        try {
+            const d = JSON.parse(e.data);
+            applySpeaking(Array.isArray(d.speakers) ? d.speakers : []);
+        } catch (err) {}
+    });
+    es.addEventListener("error", () => {
+        // EventSource reconnects by itself (retry: 1000)
+        sseConnected = false;
+        startFallbackPoll();
+    });
+}
+
+connectEvents();
 </script>
 </body>
 </html>

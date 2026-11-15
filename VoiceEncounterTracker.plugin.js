@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.1.3
+ * @version 1.1.4
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -583,6 +583,7 @@ module.exports = class VoiceEncounterTracker {
                     try { self.injectBadges(); } catch (e) {}
                     try { self.scheduleOverlayPush(); } catch (e) {}
                 } else if (
+                    action.type === "SPEAKING" ||
                     action.type === "SPEAKING_START" ||
                     action.type === "SPEAKING_STOP" ||
                     action.type === "SPEAKING_STOP_USERS"
@@ -1650,6 +1651,20 @@ module.exports = class VoiceEncounterTracker {
                 if (s.channelId !== mySession.channelId) continue;
                 inChannel.add(userId);
             }
+
+            // Ask the store per user: getSpeakers() is not reliable across Discord builds
+            try {
+                const ss3 = this._sc?.SpeakingStore ?? BdApi.Webpack.getStore("SpeakingStore");
+                if (ss3 && typeof ss3.isSpeaking === "function") {
+                    const set = new Set(speakers);
+                    for (const uid of inChannel) {
+                        if (ss3.isSpeaking(uid)) set.add(uid);
+                        else set.delete(uid);
+                    }
+                    speakers = [...set];
+                }
+            } catch (e) {}
+
             speakers = speakers.filter(id => inChannel.has(id));
 
             const key = speakers.slice().sort().join(",");

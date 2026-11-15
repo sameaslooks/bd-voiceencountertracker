@@ -105,6 +105,24 @@ let nextCommandId = 1;
 
 let tray = null;
 let server = null;
+
+// ─── SSE (server-sent events) ───
+const sseClients = new Set();
+
+function sseSend(res, event, data) {
+    try { res.write("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n"); }
+    catch (e) { sseClients.delete(res); }
+}
+
+function sseBroadcast(event, data) {
+    if (sseClients.size === 0) return;
+    for (const res of sseClients) sseSend(res, event, data);
+}
+
+function broadcastState() {
+    if (sseClients.size === 0) return;
+    try { sseBroadcast("state", buildStateResponse()); } catch (e) {}
+}
 let isQuitting = false;
 let lastAliveState = false;
 
@@ -663,6 +681,20 @@ function startServer() {
 
         const url = req.url.split("?")[0];
 
+        if (req.method === "GET" && url === "/events") {
+            res.writeHead(200, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            });
+            res.write("retry: 1000\n\n");
+            sseClients.add(res);
+            try { sseSend(res, "state", buildStateResponse()); } catch (e) {}
+            sseSend(res, "speaking", speaking);
+            req.on("close", () => sseClients.delete(res));
+            return;
+        }
+
         if (req.method === "GET" && url === "/sources") {
             try {
                 const sources = cachedSources;
@@ -853,6 +885,7 @@ function startServer() {
                 pingState = { last, avg, updatedAt: now };
                 updateNetMachine();
                 jsonReply(res, 200, { ok: true });
+                broadcastState();
             } catch (e) { jsonReply(res, 400, { ok: false, error: e.message }); }
             return;
         }
@@ -864,6 +897,7 @@ function startServer() {
                 state = Object.assign({ updatedAt: Date.now() }, JSON.parse(body));
                 lastPluginSeen = Date.now();
                 jsonReply(res, 200, { ok: true });
+                broadcastState();
                 applyAutoResizeAll();
                 if (state.streamSound !== prevSound) {
                     try { rebuildTrayMenu(); } catch (e) {}
@@ -882,6 +916,7 @@ function startServer() {
                 const parsed = JSON.parse(body);
                 speaking = { speakers: Array.isArray(parsed?.speakers) ? parsed.speakers : [] };
                 jsonReply(res, 200, { ok: true });
+                sseBroadcast("speaking", speaking);
             } catch (e) { jsonReply(res, 400, { ok: false, error: e.message }); }
             return;
         }
@@ -932,6 +967,13 @@ function startServer() {
         res.writeHead(404, { "Content-Type": "text/plain" });
         res.end("Not found");
     });
+
+    // Time-derived fields (plugin offline, net state) change without input: refresh every second.
+    // Comment lines keep idle connections alive.
+    setInterval(broadcastState, 1000);
+    setInterval(() => {
+        for (const res of sseClients) { try { res.write(": ka\n\n"); } catch (e) { sseClients.delete(res); } }
+    }, 15000);
 
     server.listen(PORT, "127.0.0.1", () => {
         console.log(`[server] listening on http://127.0.0.1:${PORT}/`);
