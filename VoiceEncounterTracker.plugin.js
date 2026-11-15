@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.1.1
+ * @version 1.1.2
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -2587,6 +2587,9 @@ module.exports = class VoiceEncounterTracker {
                     border-bottom: 1px solid var(--background-modifier-accent, #3f4147);
                     white-space: nowrap;
                 }
+                .vet-table thead th[data-sort] { cursor: pointer; user-select: none; }
+                .vet-table thead th[data-sort]:hover { opacity: 1; }
+                .vet-table thead th.vet-sorted { opacity: 1; color: var(--text-link, #00a8fc); }
                 .vet-table td {
                     padding: 8px 10px; white-space: nowrap;
                     border-bottom: 1px solid var(--background-modifier-accent, #3f4147);
@@ -2830,14 +2833,14 @@ module.exports = class VoiceEncounterTracker {
                             <thead>
                                 <tr>
                                     <th class="vet-num">#</th>
-                                    <th>User</th>
-                                    <th>User ID</th>
-                                    <th>Status</th>
-                                    <th class="vet-num">Total</th>
-                                    <th class="vet-num">Sessions</th>
-                                    <th>First seen</th>
-                                    <th>Last seen</th>
-                                    <th class="vet-badge">!</th>
+                                    <th data-sort="user">User</th>
+                                    <th data-sort="id">User ID</th>
+                                    <th data-sort="status">Status</th>
+                                    <th class="vet-num" data-sort="total">Total</th>
+                                    <th class="vet-num" data-sort="sessions">Sessions</th>
+                                    <th data-sort="first">First seen</th>
+                                    <th data-sort="last">Last seen</th>
+                                    <th class="vet-badge" data-sort="badge">!</th>
                                     <th class="vet-actions">Actions</th>
                                 </tr>
                             </thead>
@@ -2851,6 +2854,18 @@ module.exports = class VoiceEncounterTracker {
         document.body.appendChild(overlay);
 
         const rerender = () => this._refreshSettingsContents(overlay, container);
+
+        overlay.querySelectorAll("th[data-sort]").forEach(th => {
+            th.addEventListener("click", () => {
+                const key = th.getAttribute("data-sort");
+                const cur = this._vetSort;
+                // asc -> desc -> default order
+                if (!cur || cur.key !== key) this._vetSort = { key, dir: 1 };
+                else if (cur.dir === 1) this._vetSort = { key, dir: -1 };
+                else this._vetSort = null;
+                rerender();
+            });
+        });
 
         const close = () => {
             try { overlay.remove(); } catch (e) {}
@@ -3071,6 +3086,38 @@ module.exports = class VoiceEncounterTracker {
                 if (ra !== rb) return ra - rb;
                 return (b.lastSeenAt || 0) - (a.lastSeenAt || 0);
             });
+
+        const sort = this._vetSort;
+        if (sort) {
+            const kindRank = { blocked: 0, ignored: 1, muted: 2, stranger: 3, known: 4 };
+            const getters = {
+                user:     r => this.getUserName(r.userId).toLowerCase(),
+                id:       r => BigInt(r.userId || 0),
+                status:   r => kindRank[this.getBadgeKind(r.userId)] ?? 9,
+                badge:    r => kindRank[this.getBadgeKind(r.userId)] ?? 9,
+                total:    r => r.totalMs || 0,
+                sessions: r => (r.sessions || []).length,
+                first:    r => r.firstSeenAt || 0,
+                last:     r => r.lastSeenAt || 0
+            };
+            const get = getters[sort.key];
+            if (get) {
+                const keyed = entries.map(r => {
+                    let v; try { v = get(r); } catch (e) { v = 0; }
+                    return { r, v };
+                });
+                keyed.sort((a, b) => (a.v < b.v ? -1 : a.v > b.v ? 1 : 0) * sort.dir);
+                entries = keyed.map(x => x.r);
+            }
+        }
+        overlay.querySelectorAll("th[data-sort]").forEach(th => {
+            const k = th.getAttribute("data-sort");
+            const label = th.getAttribute("data-label") ?? th.textContent;
+            th.setAttribute("data-label", label);
+            const active = sort && sort.key === k;
+            th.classList.toggle("vet-sorted", !!active);
+            th.textContent = active ? `${label} ${sort.dir === 1 ? "▲" : "▼"}` : label;
+        });
 
         const query = (this._vetSearchQuery || "").trim().toLowerCase();
         if (query) {
