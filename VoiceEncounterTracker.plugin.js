@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.0.2
+ * @version 1.1.0
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -798,6 +798,22 @@ module.exports = class VoiceEncounterTracker {
                     return;
                 }
             }
+
+            // DM / group DM call (no guild)
+            let vs = null;
+            try { vs = store.getVoiceState(null, me); } catch (e) {}
+            if (!vs?.channelId) {
+                try {
+                    const chId = store.getVoiceChannelId?.();
+                    if (chId && !this.getChannelGuildId(chId)) {
+                        const arr = store.getVoiceStatesForChannel?.(chId);
+                        vs = arr ? Object.values(arr).find(v => v?.userId === me) : null;
+                    }
+                } catch (e) {}
+            }
+            if (vs?.channelId) {
+                this.active.set(me, this._makeSessionFromVoiceState(me, vs, null, now));
+            }
         } catch (e) {}
     }
 
@@ -823,18 +839,15 @@ module.exports = class VoiceEncounterTracker {
             }
 
             if (myChannelId && !myGuildId) {
-                try {
-                    const ch = (this._sc?.ChannelStore ?? BdApi.Webpack.getStore("ChannelStore"))?.getChannel?.(myChannelId);
-                    myGuildId = ch?.guild_id ?? null;
-                } catch (e) {}
+                myGuildId = this.getChannelGuildId(myChannelId);
             }
 
-            if (!myChannelId || !myGuildId) return;
+            if (!myChannelId) return;
 
             let guildStates = null;
 
             try {
-                if (typeof store.getVoiceStates === "function") {
+                if (myGuildId && typeof store.getVoiceStates === "function") {
                     guildStates = store.getVoiceStates(myGuildId);
                 }
             } catch (e) {}
@@ -940,8 +953,6 @@ module.exports = class VoiceEncounterTracker {
             }
             return;
         }
-
-        if (!guildId) return;
 
         if (existing && existing.channelId !== channelId) {
             this.closeSessionAndMeetings(userId, existing, now);
@@ -1059,7 +1070,13 @@ module.exports = class VoiceEncounterTracker {
 
             if (canVerify) {
                 let live = null;
-                try { live = store.getVoiceState(s.guildId, userId); } catch (e) {}
+                try { live = store.getVoiceState(s.guildId ?? null, userId); } catch (e) {}
+                if (!live && !s.guildId) {
+                    try {
+                        const arr = store.getVoiceStatesForChannel?.(s.channelId);
+                        live = arr ? (Object.values(arr).find(v => v?.userId === userId) ?? null) : null;
+                    } catch (e) {}
+                }
                 if (!live || live.channelId !== s.channelId) {
                     try { this.closeSessionAndMeetings(userId, s, now); } catch (e) {}
                     this.active.delete(userId);
@@ -1100,18 +1117,20 @@ module.exports = class VoiceEncounterTracker {
 
     recordEncounter(userId, channelId, guildId, startedAt, endedAt, events = []) {
         if (endedAt <= startedAt) return;
-        if (!guildId) return;
 
         const me = this.getCurrentUserId();
         if (me && me === userId) return;
 
         const duration = endedAt - startedAt;
-        const guildName = this.getGuildName(guildId);
+        guildId = guildId ?? null;
+        const isDM = !guildId;
+        const guildName = this.getGuildName(guildId, channelId);
         const channelName = this.getChannelName(channelId);
 
         const session = {
             startedAt, endedAt, durationMs: duration,
             guildId, guildName, channelId, channelName,
+            isDM,
             events
         };
 
@@ -1229,16 +1248,47 @@ module.exports = class VoiceEncounterTracker {
         } catch { return "(unknown)"; }
     }
 
-    getGuildName(guildId) {
+    getGuildName(guildId, channelId = null) {
+        if (!guildId) {
+            // DM / group DM call
+            const ch = channelId ? this._getChannel(channelId) : null;
+            return this._isGroupDM(ch) ? "Group DM" : "Direct Messages";
+        }
         try {
             return (this._sc?.GuildStore ?? BdApi.Webpack.getStore("GuildStore"))?.getGuild?.(guildId)?.name ?? null;
         } catch { return null; }
     }
 
-    getChannelName(channelId) {
+    _getChannel(channelId) {
         try {
-            return (this._sc?.ChannelStore ?? BdApi.Webpack.getStore("ChannelStore"))?.getChannel?.(channelId)?.name ?? null;
+            return (this._sc?.ChannelStore ?? BdApi.Webpack.getStore("ChannelStore"))?.getChannel?.(channelId) ?? null;
         } catch { return null; }
+    }
+
+    _isGroupDM(ch) {
+        if (!ch) return false;
+        if (ch.type === 3) return true;
+        try { return typeof ch.isGroupDM === "function" && ch.isGroupDM(); } catch { return false; }
+    }
+
+    getChannelGuildId(channelId) {
+        return this._getChannel(channelId)?.guild_id ?? null;
+    }
+
+    getChannelName(channelId) {
+        const ch = this._getChannel(channelId);
+        if (!ch) return null;
+        if (ch.guild_id) return ch.name ?? null;
+
+        // DM / group DM: explicit group name, else recipients' names
+        if (ch.name) return ch.name;
+        const me = this.getCurrentUserId();
+        const ids = (Array.isArray(ch.recipients) ? ch.recipients : [])
+            .map(r => (typeof r === "string" ? r : r?.id))
+            .filter(id => id && id !== me);
+        if (ids.length === 0) return this._isGroupDM(ch) ? "Group call" : "DM call";
+        const names = ids.map(id => this.getDisplayName(id, null));
+        return names.join(", ");
     }
 
     getVoicePing() {
@@ -1491,7 +1541,8 @@ module.exports = class VoiceEncounterTracker {
                 guildId: mySession.guildId ?? null,
                 channelId: mySession.channelId,
                 channelName: this.getChannelName(mySession.channelId),
-                guildName: this.getGuildName(mySession.guildId),
+                guildName: this.getGuildName(mySession.guildId, mySession.channelId),
+                isDM: !mySession.guildId,
                 users,
                 prefs: this._prefsPayload(),
                 streamSound: this._getLiveStreamSound()
@@ -1814,7 +1865,9 @@ module.exports = class VoiceEncounterTracker {
                 return false;
             }
 
-            const streamKey = `guild:${mySession.guildId}:${mySession.channelId}:${userId}`;
+            const streamKey = mySession.guildId
+                ? `guild:${mySession.guildId}:${mySession.channelId}:${userId}`
+                : `call:${mySession.channelId}:${userId}`;
             BdApi.Logger.info(this.meta.name, "_watchStream: key =", streamKey);
 
             this._postJSON("/video/open", { userId, streamKey });
@@ -3085,7 +3138,7 @@ module.exports = class VoiceEncounterTracker {
                 const startTime = `${String(start.getHours()).padStart(2,"0")}:${String(start.getMinutes()).padStart(2,"0")}`;
                 const endTime   = `${String(end.getHours()).padStart(2,"0")}:${String(end.getMinutes()).padStart(2,"0")}`;
                 const dur = this.formatDuration(s.durationMs ?? (s.endedAt - s.startedAt));
-                const guild = s.guildName || (s.guildId ? s.guildId.slice(-6) : "—");
+                const guild = s.guildName || (s.guildId ? s.guildId.slice(-6) : "📞 DM");
                 const channel = s.channelName || (s.channelId ? s.channelId.slice(-6) : "—");
                 const isSessExpanded = expandedSession &&
                     expandedSession.userId === rec.userId &&

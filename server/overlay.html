@@ -854,7 +854,9 @@ function renderState(data) {
         return ta - tb;
     });
 
-    elChannelName.textContent = data.channelName || "Voice";
+    elChannelName.textContent = data.isDM
+        ? `📞 ${data.channelName || "DM call"}`
+        : (data.channelName || "Voice");
     elCount.textContent = users.length ? `(${users.length})` : "";
 
     const bucket = ts => {
