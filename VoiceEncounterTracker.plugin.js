@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.1.0
+ * @version 1.1.1
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -60,7 +60,8 @@ module.exports = class VoiceEncounterTracker {
             hideMuteForBlocked: true,
             flashIconOnMute: true,
             showPingWarn: true,
-            showPingLost: true
+            showPingLost: true,
+            knownMinMinutes: 15
         };
 
         this.NATIVE_MUTE_STYLE_ID = "VoiceEncounterTracker-native-mute";
@@ -1348,7 +1349,17 @@ module.exports = class VoiceEncounterTracker {
         if (rec?.manual) return "known";
         if (this.isUserLocallyMuted(userId)) return "muted";
         if (!rec) return "stranger";
-        return this.isRecent(userId) ? "stranger" : "known";
+        if (this.isRecent(userId)) return "stranger";
+        return this.hasEnoughTime(rec) ? "known" : "stranger";
+    }
+
+    getKnownMinMs() {
+        const m = Number(this.prefs.knownMinMinutes);
+        return (Number.isFinite(m) && m >= 0 ? m : 15) * 60_000;
+    }
+
+    hasEnoughTime(rec) {
+        return (rec?.totalMs || 0) >= this.getKnownMinMs();
     }
 
     formatDuration(ms) {
@@ -1446,7 +1457,7 @@ module.exports = class VoiceEncounterTracker {
         } else {
             glyph = "!";
             title = rec
-                ? `New encounter · first seen ${this.formatDate(rec.firstSeenAt)}`
+                ? `New encounter · first seen ${this.formatDate(rec.firstSeenAt)} · together ${this.formatDuration(rec.totalMs || 0)} / ${this.formatDuration(this.getKnownMinMs())}`
                 : "You've never shared a voice channel with this user";
             color = "var(--text-muted, #a3a6aa)"; opacity = "0.40";
         }
@@ -2788,6 +2799,11 @@ module.exports = class VoiceEncounterTracker {
                                 <span style="opacity:.6">— pulse for 15s, then solid yellow for 15s, then back to normal.</span>
                             </span>
                         </label>
+                        <label class="vet-pref-label">
+                            <input type="number" min="0" max="1440" step="5" data-pref-num="knownMinMinutes"
+                                style="width:64px;padding:2px 4px;background:var(--background-secondary,#2b2d31);color:inherit;border:1px solid var(--background-modifier-accent,#444);border-radius:4px">
+                            <span>Minutes together in voice before a user counts as known (✓)</span>
+                        </label>
                     </div>
 
                     <div class="vet-search">
@@ -2856,6 +2872,22 @@ module.exports = class VoiceEncounterTracker {
 
         overlay.querySelector("[data-action='close']").addEventListener("click", close);
         overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+
+        overlay.querySelectorAll("input[data-pref-num]").forEach(inp => {
+            inp.addEventListener("change", () => {
+                const key = inp.getAttribute("data-pref-num");
+                const v = Math.max(0, Math.min(1440, Math.round(Number(inp.value))));
+                if (!Number.isFinite(v)) { inp.value = this.prefs[key]; return; }
+                inp.value = v;
+                this.prefs[key] = v;
+                this.savePrefs();
+                for (const [uid, el] of this.badgeNodes) {
+                    try { this.applyBadgeStyle(el, this.getBadgeKind(uid), uid); } catch (e) {}
+                }
+                try { this.injectBadges(); } catch (e) {}
+                try { this.pushStateToOverlay(); } catch (e) {}
+            });
+        });
 
         overlay.querySelectorAll("input[data-pref]").forEach(cb => {
             cb.addEventListener("change", () => {
@@ -3069,6 +3101,7 @@ module.exports = class VoiceEncounterTracker {
         overlay.querySelector("input[data-pref='autoMuteBlocked']").checked = this.prefs.autoMuteBlocked;
         overlay.querySelector("input[data-pref='hideMuteForBlocked']").checked = this.prefs.hideMuteForBlocked;
         overlay.querySelector("input[data-pref='flashIconOnMute']").checked = this.prefs.flashIconOnMute;
+        overlay.querySelector("input[data-pref-num='knownMinMinutes']").value = this.prefs.knownMinMinutes ?? 15;
 
         const tbody = overlay.querySelector("[data-role='tbody']");
         if (!tbody) return;

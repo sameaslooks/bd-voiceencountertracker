@@ -120,7 +120,8 @@ The overlay is optional. When running, the plugin pushes the current state to `h
 **Wrong user shows a `✓` / `!` badge**
 
 - The `✓` / `!` decision is based on `RECENT_MS` (8 hours by default). If you first met a user within that window, they show as `!` (just met). If it was earlier than that, they show as `✓` (known).
-- To change the threshold, edit `this.RECENT_MS` in the plugin constructor.
+- A user also needs at least *N* minutes together in voice (15 by default, configurable in the settings panel) before turning `✓`.
+- To change the 8-hour window, edit `this.RECENT_MS` in the plugin constructor.
 
 **After restarting Discord, users already in voice don't show up in the overlay**
 
