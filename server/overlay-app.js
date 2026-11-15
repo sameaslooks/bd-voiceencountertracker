@@ -119,6 +119,20 @@ function sseBroadcast(event, data) {
     for (const res of sseClients) sseSend(res, event, data);
 }
 
+// ─── Command long-poll waiters ───
+const commandWaiters = new Set();
+
+function flushCommandWaiters() {
+    if (commandWaiters.size === 0 || commandQueue.length === 0) return;
+    // Hand the whole queue to one waiting poller (normally there is exactly one plugin)
+    const waiter = commandWaiters.values().next().value;
+    commandWaiters.delete(waiter);
+    clearTimeout(waiter.timer);
+    const pending = commandQueue;
+    commandQueue = [];
+    try { jsonReply(waiter.res, 200, { commands: pending }); } catch (e) {}
+}
+
 function broadcastState() {
     if (sseClients.size === 0) return;
     try { sseBroadcast("state", buildStateResponse()); } catch (e) {}
@@ -937,15 +951,31 @@ function startServer() {
                 };
                 if (!cmd.action) { jsonReply(res, 400, { ok: false, error: "missing action" }); return; }
                 commandQueue.push(cmd);
+                flushCommandWaiters();
                 jsonReply(res, 200, { ok: true, id: cmd.id });
             } catch (e) { jsonReply(res, 400, { ok: false, error: e.message }); }
             return;
         }
 
         if (req.method === "GET" && url === "/commands") {
-            const pending = commandQueue;
-            commandQueue = [];
-            jsonReply(res, 200, { commands: pending });
+            // Long-poll: ?wait=<ms> holds the request until a command arrives or the timeout ends
+            const m = /[?&]wait=(\d+)/.exec(req.url);
+            const waitMs = m ? Math.min(Number(m[1]), 30000) : 0;
+            if (commandQueue.length > 0 || waitMs <= 0) {
+                const pending = commandQueue;
+                commandQueue = [];
+                jsonReply(res, 200, { commands: pending });
+                return;
+            }
+            const waiter = { res, timer: null };
+            waiter.timer = setTimeout(() => {
+                commandWaiters.delete(waiter);
+                jsonReply(res, 200, { commands: [] });
+            }, waitMs);
+            commandWaiters.add(waiter);
+            req.on("close", () => {
+                if (commandWaiters.delete(waiter)) clearTimeout(waiter.timer);
+            });
             return;
         }
 

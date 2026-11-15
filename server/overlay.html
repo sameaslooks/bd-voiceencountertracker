@@ -89,6 +89,9 @@
         height: 12px;
         cursor: default;
         flex-shrink: 0;
+        /* header is a drag region, which eats mouse events; opt out so hover works */
+        -webkit-app-region: no-drag;
+        padding: 2px;
     }
     #signal .bar {
         display: inline-block;
@@ -129,6 +132,15 @@
         pointer-events: none;
     }
     #signal[data-level="off"] .bar { opacity: 0.35; }
+
+    #signal-tip {
+        display: none;
+        position: fixed; z-index: 1000;
+        padding: 3px 7px; border-radius: 4px;
+        background: rgba(17,18,20,0.95); color: #dbdee1;
+        font-size: 11px; white-space: nowrap; pointer-events: none;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+    }
 
     /* ─── Network banner ─── */
     #net {
@@ -534,6 +546,29 @@ const elNetLeft     = document.getElementById("net-left");
 const elNetRight    = document.getElementById("net-right");
 const elSignal      = document.getElementById("signal");
 
+// Custom tooltip: native title tooltips don't show reliably in the overlay window
+let signalTip = "—";
+const elSignalTip = document.createElement("div");
+elSignalTip.id = "signal-tip";
+document.body.appendChild(elSignalTip);
+let signalTipTimer = null;
+elSignal.addEventListener("mouseenter", () => {
+    clearTimeout(signalTipTimer);
+    signalTipTimer = setTimeout(showSignalTip, 400);
+});
+function showSignalTip() {
+    elSignalTip.textContent = signalTip;
+    const r = elSignal.getBoundingClientRect();
+    elSignalTip.style.display = "block";
+    const w = elSignalTip.offsetWidth;
+    elSignalTip.style.left = Math.max(4, Math.min(window.innerWidth - w - 4, r.right - w)) + "px";
+    elSignalTip.style.top = (r.bottom + 4) + "px";
+}
+elSignal.addEventListener("mouseleave", () => {
+    clearTimeout(signalTipTimer);
+    elSignalTip.style.display = "none";
+});
+
 let currentUsers   = [];
 let speakingSet    = new Set();
 let knownJoinTime  = new Map();
@@ -588,7 +623,7 @@ function showMessage(kind, text, channelLabel) {
     knownJoinTime.clear();
     speakingSet.clear();
     pendingEdits.clear();
-    renderNet(null);
+    renderNet(null, false);
 }
 
 function iconSvg(kind, classes, title) {
@@ -729,19 +764,21 @@ function renderUsersList(now = Date.now()) {
 }
 
 function renderNet(net, active = true) {
-    if (!active) {
+    // No ping data -> grey, never "ok" green
+    if (!active || !net) {
         elSignal.setAttribute("data-level", "off");
-        elSignal.title = "—";
+        signalTip = "—";
     } else {
-        const level = net?.level || "ok";
+        const level = net.level || "ok";
         elSignal.setAttribute("data-level", level);
 
-        if (net && typeof net.last === "number" && isFinite(net.last) && net.last > 0) {
-            elSignal.title = `${Math.round(net.last)}ms`;
-        } else {
-            elSignal.title = "—";
-        }
+        const lastOk = typeof net.last === "number" && isFinite(net.last) && net.last > 0;
+        const avgOk  = typeof net.avg  === "number" && isFinite(net.avg)  && net.avg  > 0;
+        signalTip = lastOk
+            ? `${Math.round(net.last)} ms` + (avgOk ? ` · avg ${Math.round(net.avg)} ms` : "")
+            : "—";
     }
+    if (elSignalTip.style.display === "block") elSignalTip.textContent = signalTip;
 
     if (!active || !net || net.level === "ok") {
         elNet.setAttribute("data-level", "ok");

@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.1.4
+ * @version 1.1.5
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -163,9 +163,7 @@ module.exports = class VoiceEncounterTracker {
             try { this.pushSpeakingToOverlay(); } catch (e) {}
         }, this.SPEAKING_MS));
 
-        this._addTimer(setInterval(() => {
-            try { this.pollOverlayCommands(); } catch (e) {}
-        }, this.COMMAND_POLL_MS));
+        this.startCommandLoop();
 
         try { this.pushStateToOverlay(); } catch (e) {}
         try { this.pushSpeakingToOverlay(); } catch (e) {}
@@ -176,6 +174,7 @@ module.exports = class VoiceEncounterTracker {
 
     stop() {
         BdApi.Logger.info(this.meta.name, "Stopping...");
+        this._cmdLoopGen = (this._cmdLoopGen || 0) + 1; // ends the command long-poll loop
 
         for (const t of this._timers) {
             try { clearTimeout(t); } catch (e) {}
@@ -1695,20 +1694,38 @@ module.exports = class VoiceEncounterTracker {
         return false;
     }
 
-    pollOverlayCommands() {
-        try {
-            BdApi.Net.fetch(`${this.OVERLAY_URL}/commands`, { method: "GET" })
-                .then(r => r.json())
-                .then(data => {
-                    const cmds = Array.isArray(data?.commands) ? data.commands : [];
-                    if (!cmds.length) return;
-                    for (const cmd of cmds) {
-                        try { this.executeOverlayCommand(cmd); } catch (e) {}
-                        this._postJSON("/command-done", { id: cmd.id });
-                    }
-                })
-                .catch(() => {});
-        } catch (e) {}
+    // Long-poll: the server holds GET /commands?wait=… until a command arrives,
+    // so overlay clicks reach Discord immediately instead of on a 1 s poll.
+    async startCommandLoop() {
+        const gen = this._cmdLoopGen = (this._cmdLoopGen || 0) + 1;
+        const WAIT_MS = 20000;
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+        while (this._cmdLoopGen === gen) {
+            const t0 = Date.now();
+            let cmds = null;
+            try {
+                const r = await BdApi.Net.fetch(`${this.OVERLAY_URL}/commands?wait=${WAIT_MS}`,
+                    { method: "GET", timeout: WAIT_MS + 10000 });
+                const data = await r.json();
+                cmds = Array.isArray(data?.commands) ? data.commands : [];
+            } catch (e) {
+                cmds = null; // overlay not running
+            }
+            if (this._cmdLoopGen !== gen) return;
+
+            if (cmds && cmds.length) {
+                for (const cmd of cmds) {
+                    try { this.executeOverlayCommand(cmd); } catch (e) {}
+                    this._postJSON("/command-done", { id: cmd.id });
+                }
+                continue;
+            }
+
+            // Server down, or an older server that answers at once: don't spin
+            if (cmds === null) await sleep(2000);
+            else if (Date.now() - t0 < 500) await sleep(this.COMMAND_POLL_MS);
+        }
     }
 
     executeOverlayCommand(cmd) {
