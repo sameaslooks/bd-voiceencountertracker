@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.1.5
+ * @version 1.1.6
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -36,6 +36,7 @@ module.exports = class VoiceEncounterTracker {
 
         this.HEARTBEAT_MS        = 60_000;
         this.SAVE_DEBOUNCE_MS    = 60_000;
+        this.MEETING_SAVE_MS     = 3_000;
         this.RECENT_MS           = 8 * 60 * 60_000;
         this.INJECT_THROTTLE_MS  = 250;
         this.REFRESH_MS          = 30_000;
@@ -948,6 +949,8 @@ module.exports = class VoiceEncounterTracker {
         };
 
         if (!channelId) {
+            BdApi.Logger.info(this.meta.name,
+                `[leave] ${this.getUserName(userId)} (${userId}) left; tracked=${!!existing}`);
             if (existing) {
                 this.closeSessionAndMeetings(userId, existing, now);
                 this.active.delete(userId);
@@ -1033,27 +1036,28 @@ module.exports = class VoiceEncounterTracker {
         Object.assign(existing, flags);
     }
 
-    closeSessionAndMeetings(userId, session, endedAt) {
+    closeSessionAndMeetings(userId, session, endedAt, trusted = true) {
         const me = this.getCurrentUserId();
         if (!me) return;
 
         if (userId === me) {
             for (const [otherId, otherSession] of this.active) {
                 if (otherId === me) continue;
-                this.finalizeMeeting(otherId, session, otherSession, endedAt);
+                this.finalizeMeeting(otherId, session, otherSession, endedAt, trusted);
             }
         } else {
             const mySession = this.active.get(me);
             if (mySession) {
-                this.finalizeMeeting(userId, mySession, session, endedAt);
+                this.finalizeMeeting(userId, mySession, session, endedAt, trusted);
             }
         }
     }
 
     heartbeat() {
         const now = Date.now();
-        for (const s of this.active.values()) s.lastSeen = now;
+        // Prune first: ghosts must keep their old lastSeen so their meeting ends there
         this._pruneGhosts();
+        for (const s of this.active.values()) s.lastSeen = now;
         this.syncActiveFromStore();
     }
 
@@ -1079,13 +1083,13 @@ module.exports = class VoiceEncounterTracker {
                     } catch (e) {}
                 }
                 if (!live || live.channelId !== s.channelId) {
-                    try { this.closeSessionAndMeetings(userId, s, now); } catch (e) {}
+                    try { this.closeSessionAndMeetings(userId, s, now, false); } catch (e) {}
                     this.active.delete(userId);
                     continue;
                 }
             } else {
                 if (now - (s.lastSeen ?? now) > STALE_MS) {
-                    try { this.closeSessionAndMeetings(userId, s, now); } catch (e) {}
+                    try { this.closeSessionAndMeetings(userId, s, now, false); } catch (e) {}
                     this.active.delete(userId);
                 }
             }
@@ -1096,17 +1100,29 @@ module.exports = class VoiceEncounterTracker {
     // Encounter recording
     // =====================================================================
 
-    finalizeMeeting(userId, mySession, otherSession, endedAt) {
-        if (!mySession || !otherSession) return;
-        if (mySession.channelId !== otherSession.channelId) return;
+    // trusted = endedAt comes from a real event (someone left / we left / plugin stop),
+    // so both were present until then. Only unverified ghost pruning clamps to lastSeen.
+    finalizeMeeting(userId, mySession, otherSession, endedAt, trusted = true) {
+        const name = `${this.getUserName(userId)} (${userId})`;
+        if (!mySession || !otherSession) {
+            BdApi.Logger.info(this.meta.name, `[meeting] skip ${name}: no session (me=${!!mySession}, other=${!!otherSession})`);
+            return;
+        }
+        if (mySession.channelId !== otherSession.channelId) {
+            BdApi.Logger.info(this.meta.name, `[meeting] skip ${name}: different channel`);
+            return;
+        }
 
         const start = Math.max(mySession.startedAt, otherSession.startedAt);
-        const end = Math.min(
-            endedAt,
-            otherSession.lastSeen ?? endedAt,
-            mySession.lastSeen ?? endedAt
-        );
-        if (end <= start) return;
+        const end = trusted
+            ? endedAt
+            : Math.min(endedAt, otherSession.lastSeen ?? endedAt, mySession.lastSeen ?? endedAt);
+        if (end <= start) {
+            BdApi.Logger.info(this.meta.name, `[meeting] skip ${name}: empty interval`);
+            return;
+        }
+        BdApi.Logger.info(this.meta.name,
+            `[meeting] record ${name}: ${this.formatDuration(end - start)}, ${this.formatTime(start)} → ${this.formatTime(end)}`);
 
         const rawEvents = Array.isArray(otherSession.events) ? otherSession.events : [];
         const events = rawEvents
@@ -1178,7 +1194,79 @@ module.exports = class VoiceEncounterTracker {
         }
 
         this._rememberName(this.encounters.get(userId));
-        this.scheduleSave();
+        // A finished meeting is worth persisting soon, not after the 60 s debounce
+        this.scheduleSave(this.MEETING_SAVE_MS);
+        this._refreshOpenTracker();
+    }
+
+    // Merge several sessions of one user into one continuous session (as if nobody left).
+    // Sessions lying inside the merged span are absorbed too, so the history never overlaps.
+    mergeSessions(userId, indexes) {
+        const rec = this.encounters.get(userId);
+        if (!rec || !Array.isArray(rec.sessions)) return false;
+        const sessions = rec.sessions;
+
+        const picked = [...new Set(indexes)]
+            .filter(i => Number.isInteger(i) && sessions[i])
+            .map(i => sessions[i]);
+        if (picked.length < 2) return false;
+
+        const spanStart = Math.min(...picked.map(s => s.startedAt));
+        const spanEnd   = Math.max(...picked.map(s => s.endedAt));
+        const involved = sessions
+            .filter(s => s.startedAt >= spanStart && s.endedAt <= spanEnd)
+            .sort((a, b) => a.startedAt - b.startedAt);
+
+        const first = involved[0];
+        const last  = involved[involved.length - 1];
+        const merged = {
+            startedAt: spanStart,
+            endedAt: spanEnd,
+            durationMs: spanEnd - spanStart,
+            guildId: first.guildId ?? null,
+            guildName: first.guildName ?? null,
+            channelId: first.channelId ?? null,
+            channelName: first.channelName ?? null,
+            isDM: !!first.isDM,
+            username: last.username ?? first.username ?? null,
+            globalName: last.globalName ?? first.globalName ?? null,
+            mergedFrom: involved.reduce((n, s) => n + (s.mergedFrom || 1), 0),
+            events: involved
+                .flatMap(s => Array.isArray(s.events) ? s.events : [])
+                .sort((a, b) => a.at - b.at)
+        };
+
+        // Totals: swap the old durations for the merged span; drop the meeting
+        // boundaries that existed between the merged sessions.
+        const oldMs = involved.reduce((n, s) => n + (s.durationMs ?? (s.endedAt - s.startedAt)), 0);
+        let boundaries = 0;
+        for (let i = 1; i < involved.length; i++) {
+            if (involved[i].startedAt - involved[i - 1].endedAt > this.RECENT_MS) boundaries++;
+        }
+        rec.totalMs = Math.max(0, (rec.totalMs || 0) - oldMs + merged.durationMs);
+        rec.meetings = Math.max(1, (rec.meetings || 1) - boundaries);
+
+        const involvedSet = new Set(involved);
+        rec.sessions = sessions.filter(s => !involvedSet.has(s));
+        rec.sessions.push(merged);
+        rec.sessions.sort((a, b) => a.startedAt - b.startedAt);
+
+        BdApi.Logger.info(this.meta.name,
+            `[merge] ${this.getUserName(userId)}: ${involved.length} sessions → ${this.formatDuration(merged.durationMs)}`);
+        this.scheduleSave(this.MEETING_SAVE_MS);
+        return true;
+    }
+
+    // Re-render the tracker window if it is open, so new meetings show up immediately
+    _refreshOpenTracker() {
+        const overlay = this._vetOverlay;
+        if (!overlay || !overlay.isConnected) return;
+        if (this._vetRefreshPending) return;
+        this._vetRefreshPending = true;
+        requestAnimationFrame(() => {
+            this._vetRefreshPending = false;
+            try { if (overlay.isConnected) this._refreshSettingsContents(overlay, null); } catch (e) {}
+        });
     }
 
     // =====================================================================
@@ -1217,11 +1305,17 @@ module.exports = class VoiceEncounterTracker {
 
     flushEncounters() { this.saveEncounters(); }
 
-    scheduleSave() {
+    scheduleSave(delayMs = this.SAVE_DEBOUNCE_MS) {
+        // Never push an already-scheduled save further out than the new deadline
+        const due = Date.now() + delayMs;
+        if (this._saveDebounce && this._saveDue && this._saveDue <= due) return;
         if (this._saveDebounce) clearTimeout(this._saveDebounce);
+        this._saveDue = due;
         this._saveDebounce = this._addTimer(setTimeout(() => {
+            this._saveDebounce = null;
+            this._saveDue = 0;
             try { this.flushEncounters(); } catch (e) {}
-        }, this.SAVE_DEBOUNCE_MS));
+        }, delayMs));
     }
 
     // =====================================================================
@@ -2738,9 +2832,19 @@ module.exports = class VoiceEncounterTracker {
                     text-transform: uppercase;
                     letter-spacing: 0.4px;
                 }
+                .vet-session-pick {
+                    cursor: pointer; opacity: .6; font-size: 13px; line-height: 1;
+                    user-select: none; text-align: center;
+                }
+                .vet-session-pick:hover { opacity: 1; }
+                .vet-session-entry.selected { background: rgba(59,165,93,0.12); }
+                .vet-session-entry.selected .vet-session-pick { opacity: 1; color: #3ba55d; }
+                .vet-merge-bar { margin-left: 12px; text-transform: none; letter-spacing: 0; }
+                .vet-merge-bar .vet-btn { margin-left: 4px; }
+                .vet-merge-bar .vet-btn[disabled] { opacity: .45; cursor: default; }
                 .vet-session-entry {
                     display: grid;
-                    grid-template-columns: 90px 140px 80px minmax(140px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr) 90px;
+                    grid-template-columns: 22px 90px 140px 80px minmax(140px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr) 90px;
                     gap: 12px;
                     padding: 5px 4px;
                     border-bottom: 1px solid rgba(255,255,255,0.04);
@@ -3082,7 +3186,39 @@ module.exports = class VoiceEncounterTracker {
                 if (action === "history") {
                     this._vetExpandedUser = this._vetExpandedUser === userId ? null : userId;
                     this._vetExpandedSession = null;
+                    this._vetMergeSel = null;
                     rerender();
+                } else if (action === "merge-toggle") {
+                    const idx = Number(btn.getAttribute("data-session-idx"));
+                    if (!Number.isFinite(idx)) return;
+                    if (!this._vetMergeSel || this._vetMergeSel.userId !== userId) {
+                        this._vetMergeSel = { userId, idx: new Set() };
+                    }
+                    const set = this._vetMergeSel.idx;
+                    if (set.has(idx)) set.delete(idx); else set.add(idx);
+                    rerender();
+                } else if (action === "merge-clear") {
+                    this._vetMergeSel = null;
+                    rerender();
+                } else if (action === "merge-apply") {
+                    const sel = this._vetMergeSel;
+                    if (!sel || sel.userId !== userId || sel.idx.size < 2) return;
+                    const idxs = [...sel.idx];
+                    BdApi.UI.showConfirmationModal(
+                        "Merge sessions",
+                        `Merge ${idxs.length} sessions into one continuous session, as if you never left? ` +
+                        `Gaps between them will count as time together. This cannot be undone.`,
+                        {
+                            confirmText: "Merge",
+                            cancelText: "Cancel",
+                            onConfirm: () => {
+                                this.mergeSessions(userId, idxs);
+                                this._vetMergeSel = null;
+                                this._vetExpandedSession = null;
+                                rerender();
+                            }
+                        }
+                    );
                 } else if (action === "toggle-block") {
                     const willBeBlocked = !rec?.blocked;
                     if (willBeBlocked) rel?.blockUser?.(userId);
@@ -3306,6 +3442,8 @@ module.exports = class VoiceEncounterTracker {
                 .slice(0, 20);
 
             const hiddenCount = allSessions.length - shownSessions.length;
+            const mergeSel = this._vetMergeSel;
+            const selCount = mergeSel && mergeSel.userId === rec.userId ? mergeSel.idx.size : 0;
 
             const sessionLines = shownSessions.map(({ s, idx }) => {
                 const start = new Date(s.startedAt);
@@ -3328,9 +3466,14 @@ module.exports = class VoiceEncounterTracker {
                     ? (isSessExpanded ? "Hide" : "Timeline")
                     : "—";
 
-                return `<div class="vet-session-entry${isSessExpanded ? " expanded" : ""}"
+                const isSel = !!(mergeSel && mergeSel.userId === rec.userId && mergeSel.idx.has(idx));
+                const mergedNote = s.mergedFrom > 1 ? ` title="Merged from ${s.mergedFrom} sessions"` : "";
+                return `<div class="vet-session-entry${isSessExpanded ? " expanded" : ""}${isSel ? " selected" : ""}"
                         data-user-id="${rec.userId}" data-session-idx="${idx}">
-                    <span class="vet-session-date">
+                    <span class="vet-session-pick" data-action="merge-toggle"
+                        data-user-id="${rec.userId}" data-session-idx="${idx}"
+                        title="Select for merge">${isSel ? "☑" : "☐"}</span>
+                    <span class="vet-session-date"${mergedNote}>
                         <span class="vet-session-arrow">${arrowS}</span>${dateStr}
                     </span>
                     <span class="vet-session-time">${startTime} → ${endTime}</span>
@@ -3353,7 +3496,13 @@ module.exports = class VoiceEncounterTracker {
             const expandedRow = `<tr class="vet-sessions-row" data-parent="${rec.userId}">
                 <td colspan="10">
                     <div class="vet-sessions">
-                        <div class="vet-sessions-header">Voice sessions (newest first) — click a session to see the state timeline</div>
+                        <div class="vet-sessions-header">Voice sessions (newest first) — click a session to see the state timeline, tick ☐ to merge
+                            ${selCount > 0 ? `<span class="vet-merge-bar">
+                                <button type="button" class="vet-btn" data-action="merge-apply" data-user-id="${rec.userId}"
+                                    ${selCount < 2 ? "disabled" : ""}>Merge ${selCount} selected</button>
+                                <button type="button" class="vet-btn" data-action="merge-clear" data-user-id="${rec.userId}">Clear</button>
+                            </span>` : ""}
+                        </div>
                         ${sessionLines || sessionsEmpty}
                         ${sessionsMore}
                     </div>
