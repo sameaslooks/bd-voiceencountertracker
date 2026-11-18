@@ -591,7 +591,16 @@ async function refreshSources(force = false) {
         const displays = screen.getAllDisplays();
         const nativeMonitors = await getNativeMonitorHandles();
 
+        // Chromium drops minimized windows (and some fullscreen games while
+        // minimized) from getSources. Keep windows seen earlier as long as their
+        // HWND still belongs to a live process.
+        const freshIds = new Set(sources.map(s => s.id));
+        const carried = cachedSources.filter(c => c.type === "window" && !freshIds.has(c.id));
         const hwnds = sources.map(s => /^window:(\d+):/.exec(s.id)?.[1]).filter(Boolean).map(Number);
+        for (const c of carried) {
+            const m = /^window:(\d+):/.exec(c.id);
+            if (m) hwnds.push(Number(m[1]));
+        }
         const windowProcMap = await getWindowProcessInfo(hwnds);
 
         const hMonitorForDisplay = (display) => {
@@ -641,6 +650,12 @@ async function refreshSources(force = false) {
                 display_id: s.display_id, handle
             };
         });
+
+        for (const c of carried) {
+            const m = /^window:(\d+):/.exec(c.id);
+            const proc = m ? windowProcMap[Number(m[1])] : null;
+            if (proc && proc.pid > 0) cachedSources.push(c);
+        }
 
         cachedSourcesAt = now;
     } catch (e) {
