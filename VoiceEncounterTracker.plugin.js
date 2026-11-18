@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.1.7
+ * @version 1.1.8
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
