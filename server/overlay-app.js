@@ -10,7 +10,7 @@ const path = require("path");
 const http = require("http");
 const fs = require("fs");
 const crypto = require("crypto");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
 
 // ─── Chromium flags: kill occlusion detection + background throttling ───
 app.commandLine.appendSwitch("disable-features",
@@ -55,7 +55,6 @@ const NET = {
 
 // ─── Click-through / cursor / fullscreen state ───
 const CURSOR_CHECK_MS     = 300;
-const CURSOR_CACHE_MS     = 200;
 const CURSOR_STABLE_TICKS = 1;
 
 // Fullscreen detection tolerance — DWM может давать rect чуть больше монитора
@@ -65,7 +64,6 @@ const FULLSCREEN_TOLERANCE_PX = 2;
 let _clickThroughState  = false;
 let _cachedCursorState  = { showing: true, at: 0 };
 let _cachedFgState      = { hwnd: 0, pid: 0, cursorShowing: 1, rect: null, at: 0 };
-let _cursorCheckBusy    = false;
 let _cursorStableCount  = 0;
 let _cursorStableValue  = true;
 
@@ -262,18 +260,30 @@ function saveSettings() {
 // Cursor + foreground window check (single PowerShell call)
 // =====================================================================
 
-function checkForegroundAndCursor() {
-    const now = Date.now();
-    if (now - _cachedFgState.at < CURSOR_CACHE_MS) {
-        return Promise.resolve(_cachedFgState);
-    }
-    if (_cursorCheckBusy) {
-        return Promise.resolve(_cachedFgState);
-    }
-    _cursorCheckBusy = true;
+// One long-lived PowerShell process prints the foreground/cursor state every
+// FG_POLL_MS. Spawning PowerShell (and compiling Add-Type) per check took
+// over a second and timed out under load (e.g. while a stream was decoding),
+// leaving the click-through state stale.
+const FG_POLL_MS = 150;
+let _fgProc = null;
+let _fgBuf = "";
 
-    return new Promise((resolve) => {
-        const ps = `
+function parseFgLine(raw) {
+    const parts = String(raw || "").trim().split("|");
+    if (parts.length !== 8) return;
+    const [hwnd, pid, cursorShowing, l, t, r, b, clipped] = parts.map(Number);
+    if (![hwnd, pid, cursorShowing, l, t, r, b, clipped].every(Number.isFinite)) return;
+    _cachedFgState = {
+        hwnd, pid, cursorShowing, clipped: clipped === 1,
+        rect: { x: l, y: t, width: r - l, height: b - t },
+        at: Date.now()
+    };
+}
+
+function startFgProbe() {
+    if (_fgProc) return;
+    const ps = `
+$ErrorActionPreference = "SilentlyContinue"
 Add-Type @"
 using System;
 using System.Text;
@@ -292,6 +302,8 @@ public class VetFg {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO pci);
+    [DllImport("user32.dll")] public static extern bool GetClipCursor(out RECT r);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
     public static string GetInfo() {
         IntPtr hwnd = GetForegroundWindow();
@@ -306,45 +318,59 @@ public class VetFg {
         GetCursorInfo(ref ci);
         int cursorShowing = (ci.flags & 1) != 0 ? 1 : 0;
 
+        // Games lock the cursor to their window (ClipCursor); a clip rect smaller
+        // than the virtual screen means the mouse is captured.
+        RECT c;
+        int clipped = 0;
+        if (GetClipCursor(out c)) {
+            int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77);
+            int vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
+            if (c.Left > vx || c.Top > vy || c.Right < vx + vw || c.Bottom < vy + vh) clipped = 1;
+        }
+
         return hwnd.ToInt64() + "|" + pid + "|" + cursorShowing + "|"
-             + r.Left + "|" + r.Top + "|" + r.Right + "|" + r.Bottom;
+             + r.Left + "|" + r.Top + "|" + r.Right + "|" + r.Bottom + "|" + clipped;
     }
 }
 "@
-[VetFg]::GetInfo()
-        `.trim();
-
-        execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps],
-            { windowsHide: true, timeout: 2000 },
-            (err, stdout) => {
-                _cursorCheckBusy = false;
-                if (err) { resolve(_cachedFgState); return; }
-
-                const raw = String(stdout || "").trim();
-                const parts = raw.split("|");
-                if (parts.length !== 7) { resolve(_cachedFgState); return; }
-
-                const hwnd = Number(parts[0]);
-                const pid = Number(parts[1]);
-                const cursorShowing = parseInt(parts[2], 10);
-                const l = Number(parts[3]);
-                const t = Number(parts[4]);
-                const r = Number(parts[5]);
-                const b = Number(parts[6]);
-
-                if (![hwnd, pid, cursorShowing, l, t, r, b].every(Number.isFinite)) {
-                    resolve(_cachedFgState);
-                    return;
-                }
-
-                _cachedFgState = {
-                    hwnd, pid, cursorShowing,
-                    rect: { x: l, y: t, width: r - l, height: b - t },
-                    at: Date.now()
-                };
-                resolve(_cachedFgState);
-            });
+while ($true) {
+    [Console]::Out.WriteLine([VetFg]::GetInfo())
+    [Console]::Out.Flush()
+    Start-Sleep -Milliseconds ${FG_POLL_MS}
+}
+`.trim();
+    try {
+        const encoded = Buffer.from(ps, "utf16le").toString("base64");
+        _fgProc = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+    } catch (e) { _fgProc = null; return; }
+    _fgProc.stdout.setEncoding("utf8");
+    _fgProc.stdout.on("data", (chunk) => {
+        _fgBuf += chunk;
+        const lines = _fgBuf.split(/\r?\n/);
+        _fgBuf = lines.pop();
+        if (lines.length) parseFgLine(lines[lines.length - 1]);
     });
+    const restart = () => {
+        _fgProc = null;
+        _fgBuf = "";
+        setTimeout(startFgProbe, 1000);
+    };
+    _fgProc.on("exit", restart);
+    _fgProc.on("error", () => {});
+}
+
+function stopFgProbe() {
+    if (!_fgProc) return;
+    const p = _fgProc;
+    _fgProc = null;
+    p.removeAllListeners("exit");
+    try { p.kill(); } catch (e) {}
+}
+
+function checkForegroundAndCursor() {
+    startFgProbe();
+    return Promise.resolve(_cachedFgState);
 }
 
 // Проверяет, покрывает ли rect активного окна bounds одного из мониторов
@@ -397,14 +423,16 @@ function startCursorWatchdog() {
             const own = info.pid === process.pid;
             const cursorHidden = info.cursorShowing === 0;
             const isFullscreen = rectCoversAnyMonitor(info.rect);
-            const sig = `pid=${info.pid} own=${own} cursorHidden=${cursorHidden} fullscreen=${isFullscreen} rect=${JSON.stringify(info.rect)}`;
+            const sig = `pid=${info.pid} own=${own} cursorHidden=${cursorHidden} fullscreen=${isFullscreen} clipped=${!!info.clipped} rect=${JSON.stringify(info.rect)}`;
             if (sig !== _lastFgSig) { _lastFgSig = sig; videoLog("[click-through check]", sig, "state=" + _clickThroughState); }
             if (own) return;
 
-            // Click-through только когда:
-            //  1) курсор скрыт системой,
-            //  2) активное окно покрывает весь монитор (fullscreen).
-            const wantClickThrough = cursorHidden && isFullscreen;
+            // Click-through (any voice/stream state) when the cursor is hidden AND
+            // a game owns the mouse: the foreground window covers a monitor, or
+            // the cursor is clipped to it (windowed/borderless games). A cursor
+            // hidden by a video player or while typing alone doesn't count.
+            const fresh = Date.now() - info.at < 2000;
+            const wantClickThrough = fresh && cursorHidden && (isFullscreen || !!info.clipped);
 
             if (wantClickThrough === _cursorStableValue) {
                 _cursorStableCount++;
@@ -2042,6 +2070,7 @@ app.on("before-quit", () => { isQuitting = true; });
 app.on("will-quit", () => {
     if (popupWindow && !popupWindow.isDestroyed()) { try { popupWindow.close(); } catch (e) {} }
     globalShortcut.unregisterAll();
+    stopFgProbe();
     if (_monitorRetryTimer) clearInterval(_monitorRetryTimer);
     if (_saveWindowsTimer) clearTimeout(_saveWindowsTimer);
     if (server) { try { server.close(); } catch (e) {} }
