@@ -4,7 +4,7 @@
 
 const {
     app, BrowserWindow, screen, globalShortcut, Tray, Menu,
-    nativeImage, shell, desktopCapturer, ipcMain
+    nativeImage, shell, desktopCapturer, ipcMain, clipboard
 } = require("electron");
 const path = require("path");
 const http = require("http");
@@ -29,9 +29,11 @@ const MARGIN_TOP     = 20;
 
 const CHROME_HEIGHT  = 34;
 const HEIGHT_OFFLINE   = 78;
-const HEIGHT_IDLE      = 78;
+const HEIGHT_IDLE      = 66;   // same as one user in voice (CHROME_HEIGHT + ROW_HEIGHT)
 const HEIGHT_EMPTY_VC  = 60;
 const ROW_HEIGHT       = 32;
+const CARD_HEIGHT      = 40;
+const NOTE_HEIGHT      = 34;
 
 const NET_BANNER_HEIGHT = 30;
 
@@ -142,6 +144,9 @@ const windows = new Map();
 const waitingWindows = new Map();
 let popupWindow = null;
 let videoWindow = null;
+let notifyWindow = null;
+let menuWindow = null;
+let tipWindow = null;
 let senderWindow = null;
 
 let _webrtcOffer = null;
@@ -406,6 +411,7 @@ function setClickThrough(enabled) {
         } catch (e) {}
     }
     applyVideoClickThrough();
+    applyNotifyClickThrough();
 }
 
 // The stream viewer follows the same state: while the overlay is dimmed the
@@ -435,6 +441,7 @@ function startCursorWatchdog() {
             const sig = `pid=${info.pid} own=${own} cursorHidden=${cursorHidden} fullscreen=${isFullscreen} clipped=${!!info.clipped} rect=${JSON.stringify(info.rect)}`;
             if (sig !== _lastFgSig) { _lastFgSig = sig; videoLog("[click-through check]", sig, "state=" + _clickThroughState); }
             if (own) return;
+            noteForegroundForProfiles(info.pid, isFullscreen || (cursorHidden && !!info.clipped));
 
             // Click-through (any voice/stream state) when the cursor is hidden AND
             // a game owns the mouse: the foreground window covers a monitor, or
@@ -588,6 +595,66 @@ foreach ($h in $hwnds) {
     });
 }
 
+// Top-level app windows as Windows sees them, including minimized ones that
+// Chromium's desktopCapturer leaves out (borderless "fullscreen" games that
+// minimize on Alt+Tab). Discord itself captures by HWND, so these work.
+function enumerateTopWindows() {
+    return new Promise((resolve) => {
+        const ps = `
+$sig = @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class VetEnum {
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int idx);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int v, int size);
+    public static string List() {
+        var sb = new StringBuilder();
+        EnumWindows((h, l) => {
+            if (!IsWindowVisible(h)) return true;
+            if (GetWindow(h, 4) != IntPtr.Zero) return true;              // owned (dialogs, popups)
+            int ex = GetWindowLong(h, -20);
+            if ((ex & 0x80) != 0) return true;                             // tool window
+            int cloaked = 0;
+            DwmGetWindowAttribute(h, 14, out cloaked, 4);
+            if (cloaked != 0) return true;                                 // hidden UWP / other desktop
+            var t = new StringBuilder(512);
+            GetWindowText(h, t, 512);
+            if (t.Length == 0) return true;
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            sb.Append(h.ToInt64()).Append('|').Append(pid).Append('|').Append(IsIconic(h) ? 1 : 0)
+              .Append('|').Append(t.ToString().Replace((char)13, ' ').Replace((char)10, ' ')).Append((char)10);
+            return true;
+        }, IntPtr.Zero);
+        return sb.ToString();
+    }
+}
+"@
+Add-Type $sig
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[VetEnum]::List()
+        `.trim();
+        execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            { windowsHide: true, encoding: "utf8", maxBuffer: 2 * 1024 * 1024, timeout: 8000 },
+            (err, stdout) => {
+                if (err) { resolve([]); return; }
+                const out = [];
+                for (const line of String(stdout || "").split(/\r?\n/)) {
+                    const m = /^(\d+)\|(\d+)\|([01])\|(.*)$/.exec(line.trim());
+                    if (m) out.push({ hwnd: Number(m[1]), pid: Number(m[2]), iconic: m[3] === "1", title: m[4] });
+                }
+                resolve(out);
+            });
+    });
+}
+
 async function refreshSources(force = false) {
     const now = Date.now();
     if (!force && now - cachedSourcesAt < SOURCES_TTL_MS) return cachedSources;
@@ -610,6 +677,10 @@ async function refreshSources(force = false) {
             const m = /^window:(\d+):/.exec(c.id);
             if (m) hwnds.push(Number(m[1]));
         }
+        // Windows Chromium didn't list (minimized and the like)
+        const seenHwnd = new Set(hwnds);
+        const extra = (await enumerateTopWindows()).filter(w => !seenHwnd.has(w.hwnd) && w.pid !== process.pid);
+        for (const w of extra) hwnds.push(w.hwnd);
         const windowProcMap = await getWindowProcessInfo(hwnds);
 
         const hMonitorForDisplay = (display) => {
@@ -660,10 +731,26 @@ async function refreshSources(force = false) {
             };
         });
 
+        const listed = new Set(cachedSources.map(c => c.id));
         for (const c of carried) {
             const m = /^window:(\d+):/.exec(c.id);
             const proc = m ? windowProcMap[Number(m[1])] : null;
-            if (proc && proc.pid > 0) cachedSources.push(c);
+            if (proc && proc.pid > 0) { cachedSources.push(c); listed.add(c.id); }
+        }
+        for (const w of extra) {
+            const id = `window:${w.hwnd}:0`;
+            if (listed.has(id)) continue;
+            const proc = windowProcMap[w.hwnd];
+            const exe = proc && proc.exeName ? proc.exeName : "";
+            // Skip shell/system leftovers that Chromium also hides on purpose.
+            if (/^(TextInputHost|ShellExperienceHost|SystemSettings|ApplicationFrameHost)\.exe$/i.test(exe)) continue;
+            cachedSources.push({
+                id, name: w.title, label: w.title,
+                appName: exe ? prettyAppName(exe) : w.title,
+                pid: proc?.pid ?? w.pid, exePath: proc?.exePath ?? "",
+                type: "window", display_id: "", handle: null, minimized: w.iconic
+            });
+            listed.add(id);
         }
 
         cachedSourcesAt = now;
@@ -808,6 +895,19 @@ function startServer() {
             return;
         }
 
+        if (req.method === "GET" && url === "/sources/thumbs") {
+            try {
+                const list = await desktopCapturer.getSources({
+                    types: ["screen", "window"], thumbnailSize: { width: 160, height: 90 }, fetchWindowIcons: false
+                });
+                const thumbs = {};
+                for (const src of list) {
+                    try { if (!src.thumbnail.isEmpty()) thumbs[src.id] = "data:image/jpeg;base64," + src.thumbnail.toJPEG(60).toString("base64"); } catch (e) {}
+                }
+                jsonReply(res, 200, { thumbs });
+            } catch (e) { jsonReply(res, 200, { thumbs: {} }); }
+            return;
+        }
         if (req.method === "POST" && url === "/sources/preferred") {
             try {
                 const body = await readBody(req);
@@ -967,6 +1067,20 @@ function startServer() {
             jsonReply(res, 200, { ok: true, live, pluginAlive: isPluginAlive() });
             return;
         }
+        if (req.method === "POST" && url === "/video/zoom") {
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                if (_videoUserId) {
+                    const vp = videoPrefs();
+                    vp.zoom = vp.zoom && typeof vp.zoom === "object" ? vp.zoom : {};
+                    if (Number(d.z) > 1) vp.zoom[_videoUserId] = { z: Number(d.z), cx: Number(d.cx), cy: Number(d.cy) };
+                    else delete vp.zoom[_videoUserId];
+                    saveSettingsSoon();
+                }
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
         if (req.method === "POST" && url === "/video/preview") {
             toggleVideoPreview();
             jsonReply(res, 200, { ok: true });
@@ -1009,6 +1123,10 @@ function startServer() {
                 const last = (typeof parsed.last === "number" && isFinite(parsed.last) && parsed.last > 0) ? parsed.last : null;
                 const avg = (typeof parsed.avg === "number" && isFinite(parsed.avg) && parsed.avg > 0) ? parsed.avg : null;
                 pingState = { last, avg, updatedAt: now };
+                if (last) {
+                    pingHistory.push({ t: now, v: last });
+                    while (pingHistory.length && pingHistory[0].t < now - 10 * 60_000) pingHistory.shift();
+                }
                 updateNetMachine();
                 jsonReply(res, 200, { ok: true });
                 broadcastState();
@@ -1049,6 +1167,133 @@ function startServer() {
         }
         if (req.method === "GET" && url === "/speaking") { jsonReply(res, 200, speaking); return; }
 
+        if (req.method === "GET" && url === "/ping/history") {
+            jsonReply(res, 200, { now: Date.now(), points: pingHistory });
+            return;
+        }
+        if (req.method === "POST" && url === "/tip/open") {
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                openTipWindow(String(d.mode || "ping"), Number(d.x), Number(d.y));
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/tip/close") {
+            closeTipWindow();
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/tip/size") {
+            try { const d = JSON.parse(await readBody(req) || "{}"); sizeTipWindow(Number(d.w), Number(d.h)); } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/note/editing") {
+            try { noteEditing = !!JSON.parse(await readBody(req) || "{}").on; applyAutoResizeAll(); } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/note") {
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                const text = String(d.text || "").slice(0, 300);
+                sessionNote = text && state.channelId ? { channelId: state.channelId, text } : null;
+                broadcastState();
+                applyAutoResizeAll();
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/menu/open") {
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                openMenuWindow(String(d.userId || ""), Number(d.x), Number(d.y));
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/menu/close") {
+            closeMenuWindow();
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/menu/size") {
+            try { sizeMenuWindow(Number(JSON.parse(await readBody(req) || "{}").height)); } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/clipboard") {
+            try { clipboard.writeText(String(JSON.parse(await readBody(req) || "{}").text || "")); } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/notify") {
+            try { addNotification(JSON.parse(await readBody(req) || "{}")); } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "GET" && url === "/notify") {
+            jsonReply(res, 200, { items: notifications, call: incomingCall });
+            return;
+        }
+        if (req.method === "POST" && url === "/call") {
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                if (d.channelId) incomingCall = {
+                    channelId: String(d.channelId), callerId: d.callerId ? String(d.callerId) : null,
+                    name: String(d.name || "Someone"), avatar: d.avatar || null, group: d.group || null
+                };
+                notifyChanged();
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/call/clear") {
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                if (!d.channelId || (incomingCall && incomingCall.channelId === String(d.channelId))) {
+                    incomingCall = null;
+                    setNotifyTyping(false);
+                    notifyChanged();
+                }
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/notify/size") {
+            try {
+                const h = Number(JSON.parse(await readBody(req) || "{}").height);
+                if (Number.isFinite(h) && h > 0 && h !== notifyContentH) { notifyContentH = h; positionNotifyWindow(); }
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/notify/typing") {
+            try { setNotifyTyping(!!JSON.parse(await readBody(req) || "{}").on); } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/notify/dismiss") {
+            try {
+                const { id } = JSON.parse(await readBody(req) || "{}");
+                notifications = notifications.filter(n => n.id !== String(id));
+                notifyChanged();
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/notify/clear") {
+            try {
+                const { channelIds } = JSON.parse(await readBody(req) || "{}");
+                const set = new Set((channelIds || []).map(String));
+                const before = notifications.length;
+                notifications = notifications.filter(n => !set.has(n.channelId));
+                if (notifications.length !== before) notifyChanged();
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
         if (req.method === "POST" && url === "/command") {
             try {
                 const body = await readBody(req);
@@ -1059,6 +1304,7 @@ function startServer() {
                     userId: String(parsed.userId || ""),
                     sourceId: parsed.sourceId ? String(parsed.sourceId) : "",
                     name: parsed.name ? String(parsed.name) : "",
+                    channelId: parsed.channelId ? String(parsed.channelId) : "",
                     sound: parsed.sound === true || parsed.sound === false ? parsed.sound : null,
                     createdAt: Date.now()
                 };
@@ -1190,6 +1436,294 @@ function openPopupWindow(winId) {
     popupWindow.on("closed", () => { popupWindow = null; });
 }
 
+// =====================================================================
+// Message notifications: a window docked under the voice overlay. Invisible
+// while empty; while the cursor is hidden (game) it never takes the mouse.
+// =====================================================================
+const NOTIFY_SHOW_MS = 12_000;
+const NOTIFY_MAX     = 4;
+const NOTIFY_ITEM_H  = 54;
+let notifications = [];      // newest first
+let incomingCall = null;     // { channelId, callerId, name, avatar, group }
+let notifyContentH = 0;      // height the page reports for its content
+let notifyTyping = false;    // reply box open: the window takes keyboard + mouse
+
+function addNotification(n) {
+    if (!n || !n.id || !n.channelId) return;
+    n = {
+        id: String(n.id), kind: ["mention", "device"].includes(n.kind) ? n.kind : "dm",
+        authorId: String(n.authorId || ""), name: String(n.name || "user"), avatar: n.avatar || null,
+        channelId: String(n.channelId), guildId: n.guildId ? String(n.guildId) : null,
+        where: n.where ? String(n.where) : null, text: String(n.text || ""),
+        expiresAt: Date.now() + Math.max(3000, Math.min(60_000, Number(n.ttlMs) || NOTIFY_SHOW_MS))
+    };
+    // One card per chat: a newer message replaces the older card.
+    notifications = [n, ...notifications.filter(x => x.channelId !== n.channelId)].slice(0, NOTIFY_MAX);
+    notifyChanged();
+}
+
+function notifyChanged() {
+    sseBroadcast("notify", { items: notifications, call: incomingCall });
+    if (notifications.length === 0 && !incomingCall) {
+        if (notifyWindow && !notifyWindow.isDestroyed()) { try { notifyWindow.hide(); } catch (e) {} }
+        return;
+    }
+    ensureNotifyWindow();
+    positionNotifyWindow();
+    if (notifyWindow && !notifyWindow.isDestroyed() && notifyWindow.webContents.isLoading() === false && !notifyWindow.isVisible()) {
+        try { notifyWindow.showInactive(); } catch (e) {}
+    }
+}
+
+setInterval(() => {
+    const now = Date.now();
+    const before = notifications.length;
+    // Cards don't expire while a reply is being typed.
+    if (notifyTyping) return;
+    notifications = notifications.filter(n => n.expiresAt > now);
+    if (notifications.length !== before) notifyChanged();
+}, 1000);
+
+function notifyAnchor() {
+    for (const rec of windows.values()) {
+        if (rec.win && !rec.win.isDestroyed() && rec.win.isVisible()) return rec.win;
+    }
+    return null;
+}
+
+function ensureNotifyWindow() {
+    if (notifyWindow && !notifyWindow.isDestroyed()) return;
+    notifyWindow = new BrowserWindow({
+        width: WINDOW_WIDTH, height: NOTIFY_ITEM_H,
+        frame: false, transparent: true, backgroundColor: "#00000000",
+        alwaysOnTop: true, resizable: false, skipTaskbar: true, hasShadow: false,
+        focusable: false, show: false,
+        webPreferences: { nodeIntegration: false, contextIsolation: true, backgroundThrottling: false }
+    });
+    notifyWindow.setAlwaysOnTop(true, "screen-saver");
+    notifyWindow.setVisibleOnAllWorkspaces(true);
+    applyNotifyClickThrough();
+    notifyWindow.loadFile(path.join(__dirname, "notify.html"));
+    notifyWindow.webContents.on("did-finish-load", () => {
+        try {
+            notifyWindow.webContents.executeJavaScript(
+                `document.body.classList.toggle("click-through", ${_clickThroughState});`).catch(() => {});
+        } catch (e) {}
+        if (notifications.length) { positionNotifyWindow(); try { notifyWindow.showInactive(); } catch (e) {} }
+    });
+    notifyWindow.on("closed", () => { notifyWindow = null; });
+}
+
+function positionNotifyWindow() {
+    if (!notifyWindow || notifyWindow.isDestroyed()) return;
+    const anchor = notifyAnchor();
+    const h = notifyContentH > 0 ? notifyContentH
+        : Math.max(1, notifications.length + (incomingCall ? 2 : 0)) * NOTIFY_ITEM_H;
+    try {
+        if (anchor) {
+            const [ax, ay] = anchor.getPosition();
+            const [aw, ah] = anchor.getSize();
+            notifyWindow.setBounds({ x: ax, y: ay + ah + 4, width: aw, height: h });
+        } else {
+            const [w] = notifyWindow.getSize();
+            const [x, y] = notifyWindow.getPosition();
+            notifyWindow.setBounds({ x, y, width: w, height: h });
+        }
+    } catch (e) {}
+}
+
+// Typing a reply needs keyboard focus; otherwise the window never takes focus
+// (so it can't pull the game out of fullscreen).
+function setNotifyTyping(on) {
+    notifyTyping = !!on;
+    if (!notifyWindow || notifyWindow.isDestroyed()) return;
+    try {
+        notifyWindow.setFocusable(notifyTyping);
+        if (notifyTyping) notifyWindow.focus();
+    } catch (e) {}
+    applyNotifyClickThrough();
+}
+
+// In a game (cursor hidden) the cards are display-only; with the cursor
+// visible they can be clicked (open chat / dismiss).
+function applyNotifyClickThrough() {
+    if (!notifyWindow || notifyWindow.isDestroyed()) return;
+    const ignore = _clickThroughState && !notifyTyping;
+    try { notifyWindow.setIgnoreMouseEvents(ignore, { forward: false }); } catch (e) {}
+    try {
+        notifyWindow.webContents.executeJavaScript(
+            `document.body.classList.toggle("click-through", ${_clickThroughState});`).catch(() => {});
+    } catch (e) {}
+}
+
+// =====================================================================
+// Right-click menu for a user card: a small window at the cursor (the
+// overlay itself is too narrow to hold it). Closes when it loses focus.
+// =====================================================================
+const MENU_WIDTH = 230;
+
+function openMenuWindow(userId, x, y) {
+    closeMenuWindow();
+    if (!userId) return;
+    const pt = Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : screen.getCursorScreenPoint();
+    menuWindow = new BrowserWindow({
+        width: MENU_WIDTH, height: 360, x: pt.x, y: pt.y,
+        frame: false, transparent: true, backgroundColor: "#00000000",
+        alwaysOnTop: true, resizable: false, skipTaskbar: true, hasShadow: false,
+        focusable: true, show: false,
+        webPreferences: { nodeIntegration: false, contextIsolation: true, backgroundThrottling: false }
+    });
+    menuWindow._vetAnchor = pt;
+    menuWindow.setAlwaysOnTop(true, "screen-saver");
+    menuWindow.loadFile(path.join(__dirname, "menu.html"), { query: { uid: userId } });
+    menuWindow.once("ready-to-show", () => {
+        if (!menuWindow || menuWindow.isDestroyed()) return;
+        menuWindow.show();
+        menuWindow.focus();
+    });
+    menuWindow.on("blur", () => closeMenuWindow());
+    menuWindow.on("closed", () => { menuWindow = null; });
+}
+
+// Fit the height to the content and keep the menu on the screen.
+function sizeMenuWindow(h) {
+    if (!menuWindow || menuWindow.isDestroyed() || !Number.isFinite(h) || h <= 0) return;
+    const pt = menuWindow._vetAnchor || menuWindow.getBounds();
+    const wa = screen.getDisplayNearestPoint(pt).workArea;
+    const height = Math.min(Math.ceil(h), wa.height);
+    let x = pt.x, y = pt.y;
+    if (x + MENU_WIDTH > wa.x + wa.width) x = Math.max(wa.x, pt.x - MENU_WIDTH);
+    if (y + height > wa.y + wa.height) y = Math.max(wa.y, wa.y + wa.height - height);
+    try { menuWindow.setBounds({ x, y, width: MENU_WIDTH, height }); } catch (e) {}
+}
+
+function closeMenuWindow() {
+    if (menuWindow && !menuWindow.isDestroyed()) { try { menuWindow.close(); } catch (e) {} }
+    menuWindow = null;
+}
+
+// =====================================================================
+// Hover tips that don't fit in the overlay (ping graph, my stream): a small
+// window that never takes focus or the mouse.
+// =====================================================================
+const pingHistory = [];      // { t, v } for the last 10 minutes
+let sessionNote = null;      // { channelId, text } — cleared when leaving that channel
+let noteEditing = false;
+
+function openTipWindow(mode, x, y) {
+    closeTipWindow();
+    const pt = Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : screen.getCursorScreenPoint();
+    tipWindow = new BrowserWindow({
+        width: 240, height: 80, x: pt.x, y: pt.y,
+        frame: false, transparent: true, backgroundColor: "#00000000",
+        alwaysOnTop: true, resizable: false, skipTaskbar: true, hasShadow: false,
+        focusable: false, show: false,
+        webPreferences: { nodeIntegration: false, contextIsolation: true, backgroundThrottling: false }
+    });
+    tipWindow._vetAnchor = pt;
+    tipWindow.setAlwaysOnTop(true, "screen-saver");
+    try { tipWindow.setIgnoreMouseEvents(true); } catch (e) {}
+    tipWindow.loadFile(path.join(__dirname, "tip.html"), { query: { mode } });
+    tipWindow.on("closed", () => { tipWindow = null; });
+}
+
+function sizeTipWindow(w, h) {
+    if (!tipWindow || tipWindow.isDestroyed() || !(w > 0) || !(h > 0)) return;
+    const pt = tipWindow._vetAnchor;
+    const wa = screen.getDisplayNearestPoint(pt).workArea;
+    let x = Math.min(pt.x, wa.x + wa.width - w), y = pt.y;
+    if (y + h > wa.y + wa.height) y = Math.max(wa.y, pt.y - h - 30);
+    try {
+        tipWindow.setBounds({ x: Math.max(wa.x, x), y, width: Math.ceil(w), height: Math.ceil(h) });
+        if (!tipWindow.isVisible()) tipWindow.showInactive();
+    } catch (e) {}
+}
+
+function closeTipWindow() {
+    if (tipWindow && !tipWindow.isDestroyed()) { try { tipWindow.close(); } catch (e) {} }
+    tipWindow = null;
+}
+
+// =====================================================================
+// Layout profiles per game: where the overlay windows sit is remembered per
+// foreground game (exe) and for the desktop ("default"). Switching between
+// them moves the windows. A profile is saved when you move a window while it
+// is the active one (alt-tabbing out of a game keeps the game's profile).
+// =====================================================================
+let _profileKey = "default";
+let _applyingProfile = false;
+const _exeByPid = new Map();
+let _exeLookupBusy = new Set();
+
+function exeForPid(pid) {
+    if (_exeByPid.has(pid)) return Promise.resolve(_exeByPid.get(pid));
+    if (_exeLookupBusy.has(pid)) return Promise.resolve(null);
+    _exeLookupBusy.add(pid);
+    return new Promise((resolve) => {
+        execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+            `(Get-Process -Id ${Number(pid)} -ErrorAction SilentlyContinue).ProcessName`],
+            { windowsHide: true, timeout: 4000 }, (err, out) => {
+                _exeLookupBusy.delete(pid);
+                const name = err ? null : String(out || "").trim().toLowerCase() || null;
+                if (name) _exeByPid.set(pid, name);
+                if (_exeByPid.size > 200) _exeByPid.clear();
+                resolve(name);
+            });
+    });
+}
+
+async function noteForegroundForProfiles(pid, gameLike) {
+    if (!pid) return;
+    let key = "default";
+    if (gameLike) {
+        const exe = await exeForPid(pid);
+        if (!exe) return;
+        key = exe;
+    }
+    if (key === _profileKey) return;
+    const prev = _profileKey;
+    _profileKey = key;
+    const profiles = layoutProfiles();
+    // First switch away from a context without a profile: keep where things
+    // were, so coming back restores it.
+    if (!profiles[prev]) saveLayoutProfile(prev);
+    if (profiles[key]) applyLayoutProfile(profiles[key]);
+    videoLog("[layout] profile", prev, "->", key, profiles[key] ? "(applied)" : "(none yet)");
+}
+
+function layoutProfiles() {
+    if (!settings.layoutProfiles || typeof settings.layoutProfiles !== "object") settings.layoutProfiles = {};
+    return settings.layoutProfiles;
+}
+
+function saveLayoutProfile(key) {
+    const p = { windows: {} };
+    for (const rec of windows.values()) {
+        if (!rec.win || rec.win.isDestroyed()) continue;
+        const [x, y] = rec.win.getPosition();
+        p.windows[rec.id] = { x, y };
+    }
+    if (!Object.keys(p.windows).length) return;
+    layoutProfiles()[key] = p;
+    saveSettingsSoon();
+}
+
+function applyLayoutProfile(p) {
+    _applyingProfile = true;
+    try {
+        for (const rec of windows.values()) {
+            const pos = p.windows?.[rec.id];
+            if (!pos || !rec.win || rec.win.isDestroyed()) continue;
+            if (!boundsOnScreen({ x: pos.x, y: pos.y, width: rec.width || WINDOW_WIDTH, height: rec.height || HEIGHT_IDLE })) continue;
+            rec.win.setPosition(pos.x, pos.y);
+            rec.x = pos.x; rec.y = pos.y;
+        }
+        scheduleSaveWindows();
+        positionNotifyWindow();
+    } catch (e) {}
+    setTimeout(() => { _applyingProfile = false; }, 300);
+}
+
 function closePopupWindow() {
     if (popupWindow && !popupWindow.isDestroyed()) { try { popupWindow.close(); } catch (e) {} }
     popupWindow = null;
@@ -1290,7 +1824,8 @@ function buildNetResponse() {
 }
 
 function buildStateResponse() {
-    return { ...state, pluginAlive: isPluginAlive(), net: buildNetResponse() };
+    if (sessionNote && sessionNote.channelId !== state.channelId) sessionNote = null;   // left / moved: note is gone
+    return { ...state, pluginAlive: isPluginAlive(), net: buildNetResponse(), note: sessionNote ? sessionNote.text : null };
 }
 
 function startNetTicker() {
@@ -1323,7 +1858,16 @@ function computeTargetHeight() {
         const visible = Math.min(count, 10);
         baseHeight = CHROME_HEIGHT + visible * ROW_HEIGHT;
     }
-    return Math.min(MAX_HEIGHT, baseHeight + netExtra);
+    // Cards under the list: "-> #channel" after someone moved (in voice) or
+    // "return to channel" (not in voice).
+    let cards = 0;
+    if (alive) {
+        if (state.channelId) cards = Array.isArray(state.departures) ? Math.min(state.departures.length, 3) : 0;
+        else if (state.returnTo) cards = 1;
+    }
+    const cardsExtra = cards ? cards * CARD_HEIGHT + 4 : 0;
+    const noteExtra = (alive && state.channelId && (noteEditing || (sessionNote && sessionNote.channelId === state.channelId))) ? NOTE_HEIGHT : 0;
+    return Math.min(MAX_HEIGHT, baseHeight + netExtra + cardsExtra + noteExtra);
 }
 
 function applyAutoResize(rec) {
@@ -1335,6 +1879,7 @@ function applyAutoResize(rec) {
     rec.win.setBounds({ x, y, width: w, height: target });
     rec.height = target;
     scheduleSaveWindows();
+    positionNotifyWindow();
 }
 
 function applyAutoResizeAll() {
@@ -1409,6 +1954,8 @@ function createWindowFromRecord(record) {
             const d = monitorForWindow(win);
             if (d) rec.monitor = displayToMonitorRecord(d);
             scheduleSaveWindows();
+            positionNotifyWindow();
+            if (!_applyingProfile) saveLayoutProfile(_profileKey);
         } catch (e) {}
     });
 
@@ -1830,6 +2377,8 @@ function openVideoWindow(params) {
             videoWindow.webContents.executeJavaScript(
                 `window.__vetStreamParams = ${JSON.stringify(_videoParams || {})};` +
                 (resume ? `if (window.__vetResumeReconnect) window.__vetResumeReconnect(${resume});` : "") +
+                `if (window.__vetSetPreview) window.__vetSetPreview(${_videoPreviewState});` +
+                `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((videoPrefs().zoom || {})[_videoUserId] || null)});` +
                 `if (window.vetWebRTC) window.vetWebRTC.setChannel(${JSON.stringify(ch)});`
             );
         } catch (e) {}
@@ -2014,6 +2563,12 @@ function toggleVideoPreview() {
     }
     p.preview = _videoPreviewState;
     saveSettings();
+    try {
+        videoWindow.webContents.executeJavaScript(
+            `if (window.__vetSetPreview) window.__vetSetPreview(${_videoPreviewState});` +
+            (_videoPreviewState ? "" : `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((p.zoom || {})[_videoUserId] || null)});`)
+        ).catch(() => {});
+    } catch (e) {}
 }
 
 function openSenderWindow() {

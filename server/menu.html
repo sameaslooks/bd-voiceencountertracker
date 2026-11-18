@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    html, body {
+        margin: 0; padding: 0; background: transparent; overflow: hidden;
+        font-family: "gg sans", "Noto Sans", "Segoe UI", sans-serif; user-select: none;
+    }
+    #menu {
+        background: #111214; color: #dbdee1;
+        border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;
+        padding: 6px; box-sizing: border-box; font-size: 13px;
+        box-shadow: 0 8px 16px rgba(0,0,0,0.4);
+    }
+    .head { display: flex; gap: 8px; align-items: center; padding: 2px 4px 6px; }
+    .head img { width: 28px; height: 28px; border-radius: 50%; background: #2b2d31; flex-shrink: 0; }
+    .head .n { display: flex; flex-direction: column; min-width: 0; }
+    .head .dn { color: #fff; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .head .un { color: #949ba4; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .act {
+        display: flex; gap: 6px; align-items: center;
+        margin: 0 4px 6px; padding: 5px 6px; border-radius: 4px;
+        background: rgba(255,255,255,0.04); font-size: 11px; color: #b5bac1;
+    }
+    .act img { width: 20px; height: 20px; border-radius: 4px; flex-shrink: 0; }
+    .act .t { min-width: 0; display: flex; flex-direction: column; }
+    .act .a1 { color: #dbdee1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .act .a2 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sep { height: 1px; background: rgba(255,255,255,0.06); margin: 4px 4px; }
+    .vol { padding: 4px 8px 6px; }
+    .vol .lbl { display: flex; justify-content: space-between; font-size: 11px; color: #b5bac1; margin-bottom: 4px; }
+    .vol .lbl b { color: #fff; font-weight: 600; }
+    .vol .lbl button {
+        background: none; border: none; color: #949ba4; font-size: 11px; cursor: pointer; padding: 0;
+    }
+    .vol .lbl button:hover { color: #fff; text-decoration: underline; }
+    input[type=range] { width: 100%; accent-color: #5865f2; margin: 0; }
+    .it {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 6px 8px; border-radius: 3px; cursor: pointer;
+    }
+    .it:hover { background: #5865f2; color: #fff; }
+    .it .chk {
+        width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid #80848e;
+        box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center;
+        font-size: 10px; line-height: 1;
+    }
+    .it .chk.on { background: #5865f2; border-color: #5865f2; color: #fff; }
+    .it:hover .chk { border-color: #fff; }
+    .it.fav .chk.on { background: #f0b232; border-color: #f0b232; }
+</style>
+</head>
+<body>
+<div id="menu"></div>
+<script>
+const API = "http://127.0.0.1:17842";
+const uid = new URLSearchParams(location.search).get("uid");
+const elMenu = document.getElementById("menu");
+let user = null;
+
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function avatarUrl(u) {
+    if (u.avatar) return `https://cdn.discordapp.com/avatars/${u.userId}/${u.avatar}.png?size=64`;
+    let i = 0; try { i = Number((BigInt(u.userId) >> 22n) % 6n); } catch (e) {}
+    return `https://cdn.discordapp.com/embed/avatars/${i}.png`;
+}
+function post(path, body) {
+    return fetch(API + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) }).catch(() => {});
+}
+function cmd(action, extra) { return post("/command", { action, userId: uid, ...(extra || {}) }); }
+function close() { post("/menu/close"); }
+
+const ACT_LABEL = { game: "Playing", spotify: "Listening to Spotify", listening: "Listening to", watching: "Watching", streaming: "Streaming", custom: "" };
+
+function render() {
+    const u = user;
+    const a = u.activity;
+    const actHtml = a ? `<div class="act">
+            ${a.icon ? `<img src="${esc(a.icon)}" onerror="this.remove()">` : ""}
+            <span class="t">
+                <span class="a1">${esc(a.type === "custom" ? a.name : (ACT_LABEL[a.type] ? ACT_LABEL[a.type] + " " : "") + (a.type === "spotify" ? "" : a.name))}</span>
+                ${a.details ? `<span class="a2">${esc(a.details)}</span>` : ""}
+            </span>
+        </div>` : "";
+    const chk = (on) => `<span class="chk ${on ? "on" : ""}">${on ? "✓" : ""}</span>`;
+    elMenu.innerHTML = `
+        <div class="head">
+            <img src="${avatarUrl(u)}">
+            <span class="n"><span class="dn">${esc(u.displayName || u.username)}</span><span class="un">@${esc(u.username)}${u.mobile ? " · 📱 phone" : ""}</span></span>
+        </div>
+        ${actHtml}
+        <div class="vol">
+            <div class="lbl"><span>User volume <b id="vv">${u.volume ?? 100}%</b></span><button id="vreset" type="button">reset</button></div>
+            <input id="vol" type="range" min="0" max="200" step="1" value="${u.volume ?? 100}">
+        </div>
+        <div class="sep"></div>
+        <div class="it" data-do="dm"><span>Message</span></div>
+        <div class="it" data-do="profile"><span>Profile</span></div>
+        ${a && a.canListen ? `<div class="it" data-do="listen"><span>Listen along</span></div>` : ""}
+        <div class="sep"></div>
+        <div class="it fav" data-do="fav"><span>Favorite</span>${chk(u.favorite)}</div>
+        ${u.favorite ? `<div class="it" data-do="favsound"><span>Sound on join/leave</span>${chk(u.favSound)}</div>` : ""}
+        ${u.kind === "known" && !u.manualKnown
+            ? `<div class="it" style="cursor:default;opacity:0.6"><span>Known (by time together)</span>${chk(true)}</div>`
+            : `<div class="it" data-do="known"><span>Known</span>${chk(u.manualKnown)}</div>`}
+        <div class="sep"></div>
+        <div class="it" data-do="copyname"><span>Copy username</span></div>
+        <div class="it" data-do="copyid"><span>Copy user ID</span></div>`;
+
+    const vol = document.getElementById("vol");
+    const vv = document.getElementById("vv");
+    let t = null;
+    const send = (v) => { clearTimeout(t); t = setTimeout(() => cmd("set-volume", { name: String(v) }), 60); };
+    vol.addEventListener("input", () => { vv.textContent = vol.value + "%"; send(vol.value); });
+    document.getElementById("vreset").addEventListener("click", () => { vol.value = 100; vv.textContent = "100%"; send(100); });
+
+    post("/menu/size", { height: Math.ceil(elMenu.getBoundingClientRect().height) });
+}
+
+elMenu.addEventListener("click", (e) => {
+    const it = e.target.closest("[data-do]");
+    if (!it || !user) return;
+    const d = it.getAttribute("data-do");
+    if (d === "dm") { cmd("open-dm"); return close(); }
+    if (d === "profile") { cmd("open-profile"); return close(); }
+    if (d === "listen") { cmd("listen-along"); return close(); }
+    if (d === "copyname") { post("/clipboard", { text: user.username }); return close(); }
+    if (d === "copyid") { post("/clipboard", { text: user.userId }); return close(); }
+    if (d === "fav") { user.favorite = !user.favorite; if (user.favorite && user.favSound == null) user.favSound = true; cmd("set-favorite", { sound: user.favorite }); return render(); }
+    if (d === "favsound") { user.favSound = !user.favSound; cmd("set-fav-sound", { sound: user.favSound }); return render(); }
+    if (d === "known") {
+        const on = !user.manualKnown;
+        user.manualKnown = on;
+        cmd("set-known", { sound: on }); return render();
+    }
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+
+fetch(API + "/state", { cache: "no-store" }).then(r => r.json()).then(st => {
+    user = (st.users || []).find(u => u.userId === uid);
+    if (!user) return close();
+    render();
+}).catch(close);
+</script>
+</body>
+</html>

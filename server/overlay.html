@@ -266,6 +266,28 @@
         height: 24px;
         flex-shrink: 0;
     }
+    /* Activity (game / Spotify / ...) and phone icons next to the name */
+    .user .act-ico {
+        width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; object-fit: cover;
+    }
+    .user .act-txt {
+        font-size: 10px; color: #949ba4; flex-shrink: 1; min-width: 0;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70px;
+    }
+    .user .mobile-ico { width: 10px; height: 13px; color: #949ba4; flex-shrink: 0; }
+    .vs-live.self-live { cursor: default; }
+    .vs-live.self-live .eye { font-weight: 600; opacity: 0.9; }
+    .vs-live.self-live.warn { background: #f0b232; color: #1e1f22; }
+    .cam-btn { cursor: pointer; display: inline-flex; }
+    .cam-btn:hover { filter: brightness(1.6); }
+    /* Unread DMs from this person */
+    .user .dm-badge {
+        position: absolute; right: -4px; bottom: -3px;
+        min-width: 14px; height: 14px; padding: 0 3px; box-sizing: border-box;
+        border-radius: 7px; background: #ed4245; color: #fff;
+        font-size: 9px; font-weight: 700; line-height: 14px; text-align: center;
+        border: 2px solid #1e1f22; pointer-events: none;
+    }
     .user .avatar-wrap img {
         width: 100%;
         height: 100%;
@@ -432,6 +454,88 @@
         0%   { background: rgba(88, 101, 242, 0.25); }
         100% { background: transparent; }
     }
+    /* Favorites flash yellow */
+    .user.fav.just-joined { animation: favFlash 1.6s ease-out; }
+    @keyframes favFlash {
+        0%   { background: rgba(250, 200, 40, 0.38); }
+        100% { background: transparent; }
+    }
+    .user.fav .name { color: #f5d06a; }
+
+    /* Leave voice (header, left of the stream button): hold, the ring closes, then we leave */
+    #leave-btn {
+        position: relative;
+        width: 17px; height: 17px;
+        background: transparent; border: none; padding: 0;
+        color: #a3a6aa; cursor: pointer;
+        display: inline-flex; align-items: center; justify-content: center;
+        -webkit-app-region: no-drag;
+        border-radius: 50%;
+    }
+    #leave-btn.hidden { display: none; }
+    #leave-btn:hover { color: #ed4245; background: rgba(237,66,69,0.12); }
+    #leave-btn .ico { width: 11px; height: 11px; }
+    #leave-btn .ring {
+        position: absolute; inset: 0; width: 17px; height: 17px;
+        transform: rotate(-90deg); pointer-events: none;
+    }
+    #leave-btn .ring circle {
+        fill: none; stroke: #ed4245; stroke-width: 2;
+        stroke-dasharray: 50.27; stroke-dashoffset: 50.27;
+        transition: stroke-dashoffset 0.18s ease-out;
+    }
+    #leave-btn.holding .ring circle {
+        stroke-dashoffset: 0;
+        transition: stroke-dashoffset 800ms linear;
+    }
+    #stream-source-btn.hidden { display: none; }
+
+    /* Session note: one line under the list, gone when you leave the channel */
+    #note {
+        display: none; margin: 0 4px 4px; padding: 4px 7px; min-height: 26px; box-sizing: border-box;
+        background: rgba(250,200,40,0.10); border: 1px solid rgba(250,200,40,0.30); border-radius: 5px;
+        color: #f2e6b8; font-size: 11px; line-height: 16px; cursor: text;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        -webkit-app-region: no-drag;
+    }
+    #note.show { display: block; }
+    #note input {
+        width: 100%; background: transparent; border: none; outline: none; color: #fff;
+        font: inherit; padding: 0;
+    }
+    /* Cards: "-> #channel" after someone moved, and "return to channel" */
+    #cards { display: flex; flex-direction: column; gap: 4px; padding: 0 4px 4px; }
+    #cards:empty { display: none; }
+    .vcard {
+        display: flex; align-items: center; gap: 6px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 6px; padding: 4px 6px;
+        cursor: pointer; font-size: 11px; color: #dbdee1;
+        min-height: 32px; box-sizing: border-box;
+        -webkit-app-region: no-drag;
+    }
+    .vcard:hover { background: rgba(88,101,242,0.18); border-color: rgba(88,101,242,0.5); }
+    .vcard .who { width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0; }
+    .vcard .txt { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+    .vcard .t1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .vcard .t1 b { color: #fff; font-weight: 600; }
+    .vcard .t2 { color: #a3a6aa; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .vcard .members { display: flex; flex-shrink: 0; }
+    .vcard .members img {
+        width: 16px; height: 16px; border-radius: 50%;
+        border: 1.5px solid #1e1f22; margin-left: -5px; background: #2b2d31;
+    }
+    .vcard .members img:first-child { margin-left: 0; }
+    .vcard .more { font-size: 10px; color: #a3a6aa; margin-left: 3px; align-self: center; }
+    .vcard .x {
+        background: transparent; border: none; color: #80848e; cursor: pointer;
+        font-size: 13px; line-height: 1; padding: 0 2px; flex-shrink: 0;
+    }
+    .vcard .x:hover { color: #fff; }
+    .vcard.ret { border-color: rgba(59,165,93,0.45); }
+    .vcard.ret:hover { background: rgba(59,165,93,0.18); border-color: rgba(59,165,93,0.8); }
+    .vcard .go { color: #3ba55d; font-weight: 600; flex-shrink: 0; }
 
     /* Click-through mode (game has focus, cursor hidden) */
     body.click-through {
@@ -453,6 +557,10 @@
             <span id="channel-name">Voice</span>
         </span>
         <span class="header-right">
+            <button id="leave-btn" class="hidden" type="button" title="Hold to leave voice">
+                <svg class="ring" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="8"/></svg>
+                <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M21.1 13.2c.6.6.6 1.5 0 2.1l-1.4 1.4c-.5.5-1.3.6-1.9.2l-2.3-1.6c-.4-.3-.7-.8-.7-1.3v-1.6a12.6 12.6 0 0 0-5.6 0V14c0 .5-.3 1-.7 1.3l-2.3 1.6c-.6.4-1.4.3-1.9-.2l-1.4-1.4c-.6-.6-.6-1.5 0-2.1C5.4 10.6 8.6 9.5 12 9.5s6.6 1.1 9.1 3.7Z"/></svg>
+            </button>
             <button id="stream-source-btn" type="button" title="Stream source">
                 <svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true">
                     <path fill="currentColor" d="M4 4a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h16a3 3 0 0 0 3-3V7a3 3 0 0 0-3-3H4Zm0 2h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z"/>
@@ -481,6 +589,8 @@
         <div id="users"></div>
         <div id="empty" class="idle">NOT IN VOICE</div>
     </div>
+    <div id="note" title="Session note — click to edit, clear it to remove. Right-click your own card to add one."></div>
+    <div id="cards"></div>
 </div>
 
 <script>
@@ -556,17 +666,19 @@ elSignal.addEventListener("mouseenter", () => {
     clearTimeout(signalTipTimer);
     signalTipTimer = setTimeout(showSignalTip, 400);
 });
-function showSignalTip() {
-    elSignalTip.textContent = signalTip;
-    const r = elSignal.getBoundingClientRect();
-    elSignalTip.style.display = "block";
-    const w = elSignalTip.offsetWidth;
-    elSignalTip.style.left = Math.max(4, Math.min(window.innerWidth - w - 4, r.right - w)) + "px";
-    elSignalTip.style.top = (r.bottom + 4) + "px";
+// Ping graph (last 10 min) opens in a separate tip window below the icon.
+function openTipAt(mode, el) {
+    const r = el.getBoundingClientRect();
+    fetch("http://127.0.0.1:17842/tip/open", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, x: window.screenX + Math.round(r.right) - 230, y: window.screenY + Math.round(r.bottom) + 4 })
+    }).catch(() => {});
 }
+function closeTip() { fetch("http://127.0.0.1:17842/tip/close", { method: "POST" }).catch(() => {}); }
+function showSignalTip() { openTipAt("ping", elSignal); }
 elSignal.addEventListener("mouseleave", () => {
     clearTimeout(signalTipTimer);
-    elSignalTip.style.display = "none";
+    closeTip();
 });
 
 let currentUsers   = [];
@@ -624,6 +736,10 @@ function showMessage(kind, text, channelLabel) {
     speakingSet.clear();
     pendingEdits.clear();
     renderNet(null, false);
+    renderCards([]);
+    elSrcBtn.classList.add("hidden");
+    elLeaveBtn.classList.add("hidden");
+    renderNote(null);
 }
 
 function iconSvg(kind, classes, title) {
@@ -643,6 +759,11 @@ function actionButton(action, title, active, svgPath, userId) {
 
 function liveBadgeHtml(u) {
     if (!u.streaming) return "";
+    if (u.isSelf) {
+        const v = Array.isArray(u.viewers) ? u.viewers : [];
+        const warn = v.some(x => x.stranger) ? " warn" : "";
+        return `<span class="vs-live self-live${warn}" data-mylive="1">LIVE${v.length ? ` <span class="eye">👁 ${v.length}</span>` : ""}</span>`;
+    }
     return `<span class="vs-live" data-act="watch-stream" data-uid="${esc(u.userId)}" ` +
            `title="Streaming — click to watch">LIVE</span>`;
 }
@@ -651,7 +772,8 @@ function voiceStatusHtml(u, now) {
     const parts = [];
 
     if (u.video) {
-        parts.push(iconSvg("video", ["video"], "Camera on"));
+        parts.push(u.isSelf ? iconSvg("video", ["video"], "Camera on")
+            : `<span class="cam-btn" data-act="watch-camera" data-uid="${esc(u.userId)}" title="Camera on — click to watch">${iconSvg("video", ["video"], "")}</span>`);
     }
 
     const computeFlash = (at) => {
@@ -698,6 +820,15 @@ function voiceStatusHtml(u, now) {
     return `<div class="vstatus">${parts.join("")}</div>`;
 }
 
+const ACT_VERB = { game: "Playing", spotify: "Spotify", listening: "Listening to", watching: "Watching", streaming: "Streaming" };
+function activityHtml(a) {
+    if (!a) return "";
+    const tip = esc(a.type === "custom" ? a.name : `${ACT_VERB[a.type] || ""} ${a.type === "spotify" ? "" : a.name}`.trim() + (a.details ? ` — ${a.details}` : ""));
+    if (a.icon) return `<img class="act-ico" src="${esc(a.icon)}" title="${tip}" onerror="this.remove()">`;
+    if (a.type === "custom") return "";
+    return `<span class="act-txt" title="${tip}">${esc(a.name)}</span>`;
+}
+
 function renderUsersList(now = Date.now()) {
     if (currentUsers.length === 0) {
         elUsers.innerHTML = "";
@@ -712,6 +843,7 @@ function renderUsersList(now = Date.now()) {
 
         const speakingCls = speakingSet.has(u.userId) ? " speaking" : "";
         const selfCls = u.isSelf ? " self" : "";
+        const favCls = u.favorite ? " fav" : "";
 
         const shownName = u.displayName || u.username || "(unknown)";
         const titleAttr = u.displayName && u.displayName !== u.username
@@ -749,11 +881,14 @@ function renderUsersList(now = Date.now()) {
                 `</div>`;
         }
 
-        return `<div class="user${justJoined}${speakingCls}${selfCls}" data-user-id="${u.userId}">
+        return `<div class="user${justJoined}${speakingCls}${selfCls}${favCls}" data-user-id="${u.userId}">
             <div class="avatar-wrap">
                 <img src="${avatarUrl(u)}" onerror="this.style.opacity='0.3'">
+                ${u.unreadDM > 0 ? `<span class="dm-badge" title="${u.unreadDM} unread in DM">${u.unreadDM > 9 ? "9+" : u.unreadDM}</span>` : ""}
             </div>
             <span class="name" title="${esc(titleAttr)}">${esc(shownName)}</span>
+            ${u.mobile ? `<svg class="mobile-ico" viewBox="0 0 10 14" aria-hidden="true"><title>On phone</title><rect x="1" y="0.8" width="8" height="12.4" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="5" cy="10.6" r="0.9" fill="currentColor"/></svg>` : ""}
+            ${activityHtml(u.activity)}
             ${voiceStatusHtml(u, now)}
             ${liveBadgeHtml(u)}
             <span class="spacer"></span>
@@ -854,8 +989,17 @@ function renderState(data) {
         renderNet(net, false);
         showMessage("idle", "NOT IN VOICE\nJoin a voice channel", "Voice");
         renderNet(net, false);
+        elSrcBtn.classList.add("hidden");
+        elLeaveBtn.classList.add("hidden");
+        favPresence = null;
+        renderCards(data.returnTo ? [{ kind: "return", ...data.returnTo }] : []);
         return;
     }
+    elSrcBtn.classList.remove("hidden");
+    elLeaveBtn.classList.remove("hidden");
+    renderNote(data.note || null);
+    playFavoriteTones(channelId, users);
+    renderCards((data.departures || []).map(d => ({ kind: "departure", ...d })));
 
     renderNet(net, true);
 
@@ -908,7 +1052,8 @@ function renderState(data) {
     const sig = users.map(u =>
         `${u.userId}:${u.kind}:${u.blocked?1:0}:${u.ignored?1:0}:${u.muted?1:0}:${u.isSelf?1:0}` +
         `:${u.selfMute?1:0}:${u.selfDeaf?1:0}:${u.serverMute?1:0}:${u.serverDeaf?1:0}` +
-        `:${u.streaming?1:0}:${u.video?1:0}:${u.suppress?1:0}` +
+        `:${u.streaming?1:0}:${u.video?1:0}:${u.suppress?1:0}:${u.favorite?1:0}:${u.unreadDM||0}` +
+        `:${u.mobile?1:0}:${Array.isArray(u.viewers) ? u.viewers.map(v => v.userId + (v.stranger ? "!" : "")).join(",") : ""}:${u.activity ? u.activity.type + "/" + u.activity.name + "/" + (u.activity.icon || "") + "/" + (u.activity.details || "") : ""}` +
         `:${bucket(u.selfMuteAt)}:${bucket(u.selfDeafAt)}` +
         `:${bucket(u.selfUnmuteAt)}:${bucket(u.selfUndeafAt)}`
     ).join("|") +
@@ -1034,6 +1179,7 @@ elUsers.addEventListener("click", (e) => {
     const userId = btn.getAttribute("data-uid");
     if (!action) return;
 
+    if (action === "watch-camera") { postCommand({ action: "watch-camera", userId }); return; }
     if (action === "watch-stream") {
         fetch(API_COMMAND, {
             method: "POST",
@@ -1050,6 +1196,203 @@ elUsers.addEventListener("click", (e) => {
     else if (action === "self-stream") optimisticToggle(userId, "streaming");
 
     sendCommand(action, userId);
+});
+
+// ─── Favorites: a short tone when they join or leave (only favorites with
+// sound on; everyone else stays silent). Tones are generated, no files. ───
+let favPresence = null;      // { channelId, ids: Set } of favorites with sound
+let audioCtx = null;
+
+function tone(notes) {
+    try {
+        audioCtx = audioCtx || new AudioContext();
+        const t0 = audioCtx.currentTime + 0.01;
+        notes.forEach((f, i) => {
+            const o = audioCtx.createOscillator();
+            const g = audioCtx.createGain();
+            o.type = "sine";
+            o.frequency.value = f;
+            const st = t0 + i * 0.11;
+            g.gain.setValueAtTime(0, st);
+            g.gain.linearRampToValueAtTime(0.16, st + 0.015);
+            g.gain.exponentialRampToValueAtTime(0.0001, st + 0.22);
+            o.connect(g).connect(audioCtx.destination);
+            o.start(st);
+            o.stop(st + 0.25);
+        });
+    } catch (e) {}
+}
+
+function playFavoriteTones(channelId, users) {
+    const ids = new Set(users.filter(u => u.favorite && u.favSound).map(u => u.userId));
+    // First look at a channel (joined it, overlay just opened): no sounds.
+    if (!favPresence || favPresence.channelId !== channelId) {
+        favPresence = { channelId, ids };
+        return;
+    }
+    let joined = false, left = false;
+    for (const id of ids) if (!favPresence.ids.has(id)) joined = true;
+    for (const id of favPresence.ids) if (!ids.has(id)) {
+        // Only a favorite with sound who actually left, not one whose sound got turned off.
+        if (!users.some(u => u.userId === id)) left = true;
+    }
+    favPresence = { channelId, ids };
+    if (joined) tone([660, 880]);          // up: came in
+    else if (left) tone([880, 587]);       // down: went out
+}
+
+// ─── Cards under the list ───
+const elCards = document.getElementById("cards");
+let lastCardsSig = "";
+
+function memberRow(c) {
+    const imgs = (c.members || []).map(m =>
+        `<img src="${avatarUrl({ userId: m.userId, avatar: m.avatar })}" title="${esc(m.name)}" onerror="this.style.opacity='0.3'">`
+    ).join("");
+    const more = c.count > (c.members || []).length ? `<span class="more">+${c.count - c.members.length}</span>` : "";
+    return imgs ? `<span class="members">${imgs}</span>${more}` : "";
+}
+
+function renderCards(cards) {
+    const sig = JSON.stringify(cards);
+    if (sig === lastCardsSig) return;
+    lastCardsSig = sig;
+    elCards.innerHTML = cards.map(c => {
+        if (c.kind === "return") {
+            const where = c.guildName ? ` · ${esc(c.guildName)}` : "";
+            const who = c.count ? `${c.count} in channel` : "nobody there now";
+            return `<div class="vcard ret" data-card="return" data-cid="${esc(c.channelId)}" title="Rejoin #${esc(c.channelName || "")}">
+                <span class="txt">
+                    <span class="t1">Return to <b>#${esc(c.channelName || "channel")}</b>${where}</span>
+                    <span class="t2">${who}</span>
+                </span>
+                ${memberRow(c)}
+                <span class="go">↩</span>
+                <button class="x" data-dismiss="return" title="Dismiss">×</button>
+            </div>`;
+        }
+        return `<div class="vcard" data-card="departure" data-cid="${esc(c.channelId)}" data-uid="${esc(c.userId)}" title="Join #${esc(c.channelName || "")}">
+            <img class="who" src="${avatarUrl({ userId: c.userId, avatar: c.avatar })}" onerror="this.style.opacity='0.3'">
+            <span class="txt">
+                <span class="t1"><b>${esc(c.name)}</b> → #${esc(c.channelName || "channel")}</span>
+                <span class="t2">${c.count} in channel</span>
+            </span>
+            ${memberRow(c)}
+            <button class="x" data-dismiss="departure" data-uid="${esc(c.userId)}" title="Dismiss">×</button>
+        </div>`;
+    }).join("");
+}
+
+function postCommand(body) {
+    fetch(API_COMMAND, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+    }).catch(() => {});
+}
+
+elCards.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const x = e.target.closest("[data-dismiss]");
+    if (x) {
+        const kind = x.getAttribute("data-dismiss");
+        if (kind === "return") postCommand({ action: "dismiss-return" });
+        else postCommand({ action: "dismiss-departure", userId: x.getAttribute("data-uid") });
+        x.closest(".vcard")?.remove();
+        return;
+    }
+    const card = e.target.closest(".vcard");
+    if (!card) return;
+    postCommand({ action: "join-channel", channelId: card.getAttribute("data-cid") });
+    card.style.opacity = "0.5";
+});
+
+// ─── Leave voice: hold until the ring closes ───
+const elLeaveBtn = document.getElementById("leave-btn");
+const LEAVE_HOLD_MS = 800;
+let leaveTimer = null;
+
+function cancelLeave() {
+    if (leaveTimer) { clearTimeout(leaveTimer); leaveTimer = null; }
+    elLeaveBtn.classList.remove("holding");
+}
+elLeaveBtn.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try { elLeaveBtn.setPointerCapture(e.pointerId); } catch (err) {}
+    elLeaveBtn.classList.add("holding");
+    leaveTimer = setTimeout(() => {
+        leaveTimer = null;
+        elLeaveBtn.classList.remove("holding");
+        postCommand({ action: "leave-voice" });
+    }, LEAVE_HOLD_MS);
+});
+for (const ev of ["pointerup", "pointercancel", "lostpointercapture"]) elLeaveBtn.addEventListener(ev, cancelLeave);
+elLeaveBtn.addEventListener("click", (e) => e.stopPropagation());
+
+// ─── My LIVE badge: hover shows a preview of what I stream + who watches ───
+let tipTimer = null;
+elUsers.addEventListener("mouseover", (e) => {
+    const b = e.target.closest("[data-mylive]");
+    if (!b) return;
+    clearTimeout(tipTimer);
+    tipTimer = setTimeout(() => openTipAt("mylive", b), 250);
+});
+elUsers.addEventListener("mouseout", (e) => {
+    if (!e.target.closest("[data-mylive]")) return;
+    clearTimeout(tipTimer);
+    closeTip();
+});
+
+// ─── Session note ───
+const elNote = document.getElementById("note");
+let noteText = null;
+let noteEditing = false;
+function renderNote(text) {
+    noteText = text;
+    if (noteEditing) return;
+    elNote.classList.toggle("show", !!text);
+    elNote.textContent = text || "";
+}
+function editNote() {
+    if (noteEditing) return;
+    noteEditing = true;
+    fetch("http://127.0.0.1:17842/note/editing", { method: "POST", body: JSON.stringify({ on: true }) }).catch(() => {});
+    elNote.classList.add("show");
+    elNote.innerHTML = `<input type="text" maxlength="300" placeholder="Note for this session (Enter to save)">`;
+    const inp = elNote.querySelector("input");
+    inp.value = noteText || "";
+    const finish = (save) => {
+        if (!noteEditing) return;
+        noteEditing = false;
+        fetch("http://127.0.0.1:17842/note/editing", { method: "POST", body: JSON.stringify({ on: false }) }).catch(() => {});
+        if (save) {
+            const t = inp.value.trim();
+            fetch("http://127.0.0.1:17842/note", { method: "POST", body: JSON.stringify({ text: t }) }).catch(() => {});
+            renderNote(t || null);
+        } else renderNote(noteText);
+    };
+    inp.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); finish(true); }
+        else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+    });
+    inp.addEventListener("blur", () => finish(true));
+    setTimeout(() => inp.focus(), 20);
+}
+elNote.addEventListener("click", (e) => { e.stopPropagation(); editNote(); });
+
+// ─── Right-click a person: quick-action menu (opens at the cursor) ───
+elUsers.addEventListener("contextmenu", (e) => {
+    const row = e.target.closest(".user");
+    if (!row) return;
+    e.preventDefault();
+    // Right-click your own card: session note
+    if (row.classList.contains("self")) { editNote(); return; }
+    fetch("http://127.0.0.1:17842/menu/open", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId: row.getAttribute("data-user-id"), x: e.screenX, y: e.screenY })
+    }).catch(() => {});
 });
 
 // ─── Stream source picker button ───

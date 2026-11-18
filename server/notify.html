@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    html, body {
+        margin: 0; padding: 0;
+        background: transparent;
+        overflow: hidden;
+        font-family: "gg sans", "Noto Sans", "Segoe UI", sans-serif;
+        user-select: none;
+    }
+    #list { display: flex; flex-direction: column; gap: 4px; padding: 0; }
+    .n {
+        display: flex; gap: 8px; align-items: flex-start;
+        background: rgba(30, 31, 34, 0.94);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-left: 3px solid #5865f2;
+        border-radius: 6px;
+        padding: 6px 8px;
+        height: 50px; box-sizing: border-box;
+        color: #dbdee1; font-size: 12px;
+        cursor: pointer;
+        animation: in 0.18s ease-out;
+        position: relative;
+    }
+    .n.mention { border-left-color: #faa61a; }
+    .n.device { border-left-color: #80848e; }
+    .n.device .ico { width: 28px; height: 28px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+    .n:hover { background: rgba(43, 45, 49, 0.97); }
+    @keyframes in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+    .n img { width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0; background: #2b2d31; margin-top: 2px; }
+    .body { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; }
+    .head { display: flex; gap: 6px; align-items: baseline; white-space: nowrap; overflow: hidden; }
+    .name { color: #fff; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+    .where { color: #949ba4; font-size: 10px; overflow: hidden; text-overflow: ellipsis; }
+    .text {
+        color: #c4c9ce; line-height: 1.3;
+        display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+        overflow: hidden; word-break: break-word;
+    }
+    .x {
+        position: absolute; top: 2px; right: 4px;
+        background: transparent; border: none; color: #80848e;
+        font-size: 13px; line-height: 1; cursor: pointer; padding: 0 2px;
+        display: none;
+    }
+    .n:hover .x { display: block; }
+    .x:hover { color: #fff; }
+    /* Cursor hidden (in game): pure display, nothing reacts */
+    body.click-through .n { cursor: default; }
+    body.click-through .x { display: none !important; }
+
+    /* Incoming call */
+    #call:empty { display: none; }
+    #call { margin-bottom: 4px; }
+    .call {
+        background: rgba(30, 31, 34, 0.96);
+        border: 1px solid rgba(59,165,93,0.6); border-left: 3px solid #3ba55d;
+        border-radius: 6px; padding: 7px 8px; color: #dbdee1; font-size: 12px;
+        animation: ring 1.6s ease-in-out infinite;
+    }
+    @keyframes ring { 0%,100% { box-shadow: 0 0 0 0 rgba(59,165,93,0.0); } 50% { box-shadow: 0 0 0 3px rgba(59,165,93,0.35); } }
+    .call .top { display: flex; gap: 8px; align-items: center; }
+    .call img { width: 30px; height: 30px; border-radius: 50%; background: #2b2d31; flex-shrink: 0; }
+    .call .who { min-width: 0; display: flex; flex-direction: column; }
+    .call .who b { color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .call .who span { color: #949ba4; font-size: 10px; }
+    .call .btns { display: flex; gap: 4px; margin-top: 6px; }
+    .call .btns button {
+        flex: 1 1 0; border: none; border-radius: 4px; padding: 4px 0; font-size: 11px; font-weight: 600;
+        color: #fff; cursor: pointer;
+    }
+    .call .acc { background: #248046; } .call .acc:hover { background: #1a6334; }
+    .call .dec { background: #da373c; } .call .dec:hover { background: #a12828; }
+    .call .msg { background: #4e5058; } .call .msg:hover { background: #6d6f78; }
+    .call textarea {
+        display: block; width: 100%; box-sizing: border-box; margin-top: 6px;
+        resize: none; overflow: hidden; min-height: 26px; max-height: 120px;
+        background: #383a40; color: #dbdee1; border: none; border-radius: 4px;
+        padding: 5px 7px; font: inherit; font-size: 12px; line-height: 16px; outline: none;
+    }
+    .call .hint { color: #80848e; font-size: 10px; margin-top: 3px; }
+    body.click-through .call .btns, body.click-through .call textarea { pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="call"></div>
+<div id="list"></div>
+<script>
+const API = "http://127.0.0.1:17842";
+const elList = document.getElementById("list");
+
+function esc(s) {
+    return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function avatarUrl(id, avatar) {
+    if (avatar) return `https://cdn.discordapp.com/avatars/${id}/${avatar}.png?size=64`;
+    let idx = 0;
+    try { idx = Number((BigInt(id) >> 22n) % 6n); } catch (e) {}
+    return `https://cdn.discordapp.com/embed/avatars/${idx}.png`;
+}
+
+const elCall = document.getElementById("call");
+let call = null;
+let replying = false;
+
+function reportSize() {
+    requestAnimationFrame(() => {
+        const h = (call ? elCall.offsetHeight + 4 : 0) + elList.offsetHeight;
+        if (h > 0) post("/notify/size", { height: Math.ceil(h) });
+    });
+}
+
+function renderCall() {
+    if (!call) { elCall.innerHTML = ""; replying = false; reportSize(); return; }
+    // Don't wipe a reply that's being typed.
+    if (replying && elCall.querySelector("textarea")) return;
+    elCall.innerHTML = `<div class="call">
+        <div class="top">
+            <img src="${avatarUrl(call.callerId || "0", call.avatar)}" onerror="this.style.opacity='0.3'">
+            <span class="who"><b>${esc(call.name)}</b><span>${call.group ? "Group call · " + esc(call.group) : "Incoming call"}</span></span>
+        </div>
+        <div class="btns">
+            <button class="acc" data-c="accept">Accept</button>
+            <button class="dec" data-c="decline">Decline</button>
+            <button class="msg" data-c="reply">Message</button>
+        </div>
+        ${replying ? `<textarea rows="1" placeholder="Reply and decline…"></textarea><div class="hint">Enter — send · Esc — cancel</div>` : ""}
+    </div>`;
+    const ta = elCall.querySelector("textarea");
+    if (ta) {
+        const grow = () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 120) + "px"; reportSize(); };
+        ta.addEventListener("input", grow);
+        ta.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                const text = ta.value.trim();
+                if (text) post("/command", { action: "call-reply", channelId: call.channelId, name: text });
+                stopReply();
+            } else if (e.key === "Escape") { e.preventDefault(); stopReply(); }
+        });
+        setTimeout(() => ta.focus(), 30);
+        grow();
+    }
+    reportSize();
+}
+
+function stopReply() {
+    replying = false;
+    post("/notify/typing", { on: false });
+    renderCall();
+}
+
+elCall.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-c]");
+    if (!b || !call) return;
+    const c = b.getAttribute("data-c");
+    if (c === "accept") post("/command", { action: "call-accept", channelId: call.channelId });
+    else if (c === "decline") post("/command", { action: "call-decline", channelId: call.channelId });
+    else if (c === "reply") {
+        replying = true;
+        post("/notify/typing", { on: true });
+        renderCall();
+    }
+});
+
+function render(items) {
+    elList.innerHTML = (items || []).map(n => `
+        <div class="n ${n.kind}" data-id="${esc(n.id)}" data-cid="${esc(n.channelId)}" data-gid="${esc(n.guildId || "")}" data-kind="${esc(n.kind)}">
+            ${n.kind === "device" ? `<span class="ico">🔊</span>` : `<img src="${avatarUrl(n.authorId || "0", n.avatar)}" onerror="this.style.opacity='0.3'">`}
+            <div class="body">
+                <div class="head">
+                    <span class="name">${esc(n.name)}</span>
+                    ${n.where ? `<span class="where">${esc(n.where)}</span>` : ""}
+                </div>
+                <div class="text">${esc(n.text)}</div>
+            </div>
+            <button class="x" title="Dismiss">×</button>
+        </div>`).join("");
+    reportSize();
+}
+
+function apply(d) {
+    const prev = call ? call.channelId : null;
+    call = d.call || null;
+    if ((call ? call.channelId : null) !== prev) { if (replying) post("/notify/typing", { on: false }); replying = false; elCall.innerHTML = ""; }
+    renderCall();
+    render(d.items);
+}
+
+function post(path, body) {
+    return fetch(API + path, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {})
+    }).catch(() => {});
+}
+
+elList.addEventListener("click", (e) => {
+    const n = e.target.closest(".n");
+    if (!n) return;
+    const id = n.getAttribute("data-id");
+    const kind = n.getAttribute("data-kind");
+    if (!e.target.closest(".x") && kind !== "device" && !String(n.getAttribute("data-cid")).startsWith("viewer-")) {
+        post("/command", { action: "open-channel", channelId: n.getAttribute("data-cid"), name: n.getAttribute("data-gid") || "" });
+    }
+    post("/notify/dismiss", { id });
+    n.remove();
+});
+
+const es = new EventSource(API + "/events");
+es.addEventListener("notify", (e) => { try { apply(JSON.parse(e.data)); } catch (err) {} });
+fetch(API + "/notify").then(r => r.json()).then(apply).catch(() => {});
+</script>
+</body>
+</html>

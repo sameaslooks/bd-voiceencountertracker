@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.1.8
+ * @version 1.2.0
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -78,6 +78,8 @@ module.exports = class VoiceEncounterTracker {
         this.SPEAKING_MS         = 2000;
         this.FULL_PUSH_MS        = 5_000;
         this.PING_PUSH_MS        = 1000;
+        this.DEPARTURE_SHOW_MS   = 20_000;          // "-> #channel" card after someone moves
+        this.RETURN_MAX_AGE_MS   = 30 * 60_000;     // offer to rejoin only this soon after
         this.COMMAND_POLL_MS     = 1_000;
         this.MAX_SESSIONS        = 500;
         this.MAX_EVENTS_PER_SESSION = 300;
@@ -201,6 +203,17 @@ module.exports = class VoiceEncounterTracker {
         }, this.SPEAKING_MS));
 
         this.startCommandLoop();
+
+        this._loadFavorites();
+        this._audioDevices = null;
+        this._addTimer(setInterval(() => { try { this._checkAudioDevices(); } catch (e) {} }, 3000));
+        this._departures = new Map();
+        this._returnTo = null;
+        // Give Discord a moment to restore voice state before deciding whether
+        // we were thrown out of a channel by a restart.
+        this._addTimer(setTimeout(() => {
+            try { this._checkReturnToChannel(); } catch (e) { vetLog("warn", "return-to-channel:", e); }
+        }, 5000));
 
         try { this.pushStateToOverlay(); } catch (e) {}
         try { this.pushSpeakingToOverlay(); } catch (e) {}
@@ -404,6 +417,25 @@ module.exports = class VoiceEncounterTracker {
                             });
                         }
 
+                        const fav = this._favorites?.get(String(userId));
+                        items.push({
+                            type: "item",
+                            label: fav ? "Remove from Favorites" : "Add to Favorites",
+                            action: () => {
+                                try { BdApi.ContextMenu.close?.(); } catch (e) {}
+                                this.setFavorite(userId, !fav);
+                                BdApi.UI.showToast(fav ? "Removed from Favorites" : "Added to Favorites", { type: "success" });
+                            }
+                        });
+                        if (fav) {
+                            items.push({
+                                type: "toggle",
+                                label: "Sound When They Join/Leave",
+                                checked: !!fav.sound,
+                                action: () => this.setFavoriteSound(userId, !fav.sound)
+                            });
+                        }
+
                         items.push({
                             type: "item",
                             label: "Clear Voice Logs With This User",
@@ -515,6 +547,16 @@ module.exports = class VoiceEncounterTracker {
         return { ok: true };
     }
 
+    // Drop only the manual "Known" mark; voice history stays untouched.
+    unmarkKnown(userId) {
+        const rec = this.encounters.get(userId);
+        if (!rec || !rec.manual) return false;
+        rec.manual = false;
+        this.scheduleSave();
+        this.scheduleOverlayPush();
+        return true;
+    }
+
     clearUserVoiceLogs(userId, { keepFlags = true, forceRemoveManual = false } = {}) {
         if (!userId) return false;
         const rec = this.encounters.get(userId);
@@ -564,6 +606,10 @@ module.exports = class VoiceEncounterTracker {
                 ChannelStore:      BdApi.Webpack.getStore("ChannelStore"),
                 GuildStore:        BdApi.Webpack.getStore("GuildStore"),
                 RelationshipStore: BdApi.Webpack.getStore("RelationshipStore"),
+                ReadStateStore:    BdApi.Webpack.getStore("ReadStateStore"),
+                SelectedChannelStore: BdApi.Webpack.getStore("SelectedChannelStore"),
+                PresenceStore:     BdApi.Webpack.getStore("PresenceStore"),
+                ApplicationStore:  BdApi.Webpack.getStore("ApplicationStore"),
             };
         } catch (e) { this._sc = {}; }
     }
@@ -595,13 +641,28 @@ module.exports = class VoiceEncounterTracker {
             try {
                 if (action.type === "VOICE_STATE_UPDATES") {
                     for (const vs of (action.voiceStates ?? [])) {
+                        try { self._noteDeparture(vs); } catch (e) {}
                         try { self.handleVoiceState(vs); } catch (e) {}
                     }
+                    try { self._rememberOwnChannel(); } catch (e) {}
                     if (self._injectDebounce) clearTimeout(self._injectDebounce);
                     self._injectDebounce = self._addTimer(setTimeout(() => {
                         try { self.injectBadges(); } catch (e) {}
                         try { self.pushStateToOverlay(); } catch (e) {}
                     }, self.INJECT_THROTTLE_MS));
+                } else if (action.type === "PRESENCE_UPDATES" || action.type === "PRESENCES_REPLACE") {
+                    try { self.scheduleOverlayPush(); } catch (e) {}
+                } else if (action.type === "CALL_CREATE" || action.type === "CALL_UPDATE" || action.type === "CALL_DELETE") {
+                    try { self._onCall(action); } catch (e) {}
+                } else if (action.type === "MESSAGE_CREATE") {
+                    try { self._onMessageCreate(action); } catch (e) {}
+                } else if (action.type === "MESSAGE_ACK" || action.type === "CHANNEL_ACK" || action.type === "BULK_ACK") {
+                    try { self._onMessageAck(action); } catch (e) {}
+                } else if (action.type === "VOICE_CHANNEL_SELECT") {
+                    // Only a real user action (Disconnect / picking a channel)
+                    // dispatches this. A Discord restart or crash does not, so a
+                    // channel left that way stays "not left by me".
+                    try { self._onOwnChannelSelect(action); } catch (e) {}
                 } else if (
                     action.type === "RELATIONSHIP_ADD" ||
                     action.type === "RELATIONSHIP_REMOVE" ||
@@ -1781,10 +1842,12 @@ module.exports = class VoiceEncounterTracker {
                 this._postJSON("/state", {
                     guildId: null, channelId: null, channelName: null, users: [],
                     prefs: this._prefsPayload(),
-                    streamSound: null
+                    streamSound: null,
+                    returnTo: this._returnCard()
                 });
                 return;
             }
+            if (this._returnTo) this._returnTo = null;
 
             const guildId = mySession.guildId;
             const users = [];
@@ -1795,6 +1858,7 @@ module.exports = class VoiceEncounterTracker {
                 const kind = isSelf ? "known" : this.getBadgeKind(userId);
                 const user = (this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore"))?.getUser?.(userId);
                 const rec = this.encounters.get(userId);
+                if (isSelf && !s.streaming) { this._knownViewers = null; this._streamStartedAt = 0; }
 
                 users.push({
                     userId,
@@ -1818,7 +1882,16 @@ module.exports = class VoiceEncounterTracker {
                     selfUnmuteAt: s.selfUnmuteAt || 0,
                     selfUndeafAt: s.selfUndeafAt || 0,
                     serverMuteAt: s.serverMuteAt || 0,
-                    serverDeafAt: s.serverDeafAt || 0
+                    serverDeafAt: s.serverDeafAt || 0,
+                    unreadDM: isSelf ? 0 : this._unreadDMCount(userId),
+                    activity: this._activityFor(userId),
+                    mobile: this._isOnMobile(userId),
+                    volume: isSelf ? null : this._localVolume(userId),
+                    manualKnown: !!rec?.manual,
+                    viewers: isSelf && s.streaming ? this._myStreamViewers(mySession) : null,
+                    streamSourceId: isSelf && s.streaming ? this._myStreamSourceId() : null,
+                    favorite: !isSelf && !!this._favorites?.has(userId),
+                    favSound: !isSelf && !!this._favorites?.get(userId)?.sound
                 });
             }
 
@@ -1829,6 +1902,7 @@ module.exports = class VoiceEncounterTracker {
                 guildName: this.getGuildName(mySession.guildId, mySession.channelId),
                 isDM: !mySession.guildId,
                 users,
+                departures: this._departureCards(mySession),
                 prefs: this._prefsPayload(),
                 streamSound: this._getLiveStreamSound()
             });
@@ -1990,6 +2064,49 @@ module.exports = class VoiceEncounterTracker {
             return;
         }
 
+        if (action === "open-channel") {
+            if (cmd.channelId) this._openChannel(String(cmd.channelId), cmd.name || null);
+            return;
+        }
+        if (action === "call-accept") {
+            if (cmd.channelId) { this._selectVoiceChannel(String(cmd.channelId)); this._clearCall(String(cmd.channelId)); }
+            return;
+        }
+        if (action === "call-decline") {
+            if (cmd.channelId) this._declineCall(String(cmd.channelId));
+            return;
+        }
+        if (action === "call-reply") {
+            if (cmd.channelId) {
+                this._sendMessage(String(cmd.channelId), String(cmd.name || ""));
+                this._declineCall(String(cmd.channelId));
+            }
+            return;
+        }
+        if (action === "watch-camera") {
+            if (userId) this._watchCamera(String(userId));
+            return;
+        }
+        if (action === "leave-voice") {
+            this._selectVoiceChannel(null);
+            return;
+        }
+        if (action === "join-channel") {
+            if (cmd.channelId) this._selectVoiceChannel(String(cmd.channelId));
+            return;
+        }
+        if (action === "dismiss-return") {
+            this._returnTo = null;
+            this._saveLastVoice({ ...(this._loadLastVoice() || {}), selfLeft: true });
+            this.scheduleOverlayPush();
+            return;
+        }
+        if (action === "dismiss-departure") {
+            if (userId) this._departures?.delete(String(userId));
+            this.scheduleOverlayPush();
+            return;
+        }
+
         if (!userId) return;
 
         const rel = BdApi.Webpack.getByKeys("blockUser", "unblockUser", { searchExports: true });
@@ -1998,6 +2115,16 @@ module.exports = class VoiceEncounterTracker {
         else if (action === "unblock" && rel?.unblockUser) rel.unblockUser(userId);
         else if (action === "ignore" && rel?.ignoreUser) rel.ignoreUser(userId);
         else if (action === "unignore" && rel?.unignoreUser) rel.unignoreUser(userId);
+        else if (action === "set-volume")   this._setLocalVolume(userId, Number(cmd.name));
+        else if (action === "open-dm")      this._openDM(userId);
+        else if (action === "open-profile") this._openProfile(userId);
+        else if (action === "set-favorite") this.setFavorite(userId, cmd.sound === true);
+        else if (action === "set-fav-sound") this.setFavoriteSound(userId, cmd.sound === true);
+        else if (action === "set-known") {
+            if (cmd.sound === true) this.markUserAsKnown(userId);
+            else this.unmarkKnown(userId);
+        }
+        else if (action === "listen-along") this._listenAlong(userId);
         else if (action === "mute") this.applyLocalMute(userId, true);
         else if (action === "unmute") this.applyLocalMute(userId, false);
         else if (action === "self-mute")   this.toggleSelfMute();
@@ -2740,6 +2867,697 @@ module.exports = class VoiceEncounterTracker {
         box.querySelector("[data-r='ok']").focus();
     }
 
+    // =====================================================================
+    // Favorites, departures, return to channel
+    // =====================================================================
+
+    // Favorites live apart from encounter history, so clearing logs keeps them.
+    // userId -> { sound: bool }
+    _loadFavorites() {
+        this._favorites = new Map();
+        try {
+            const raw = BdApi.Data.load(this.meta.name, "favorites");
+            if (raw && typeof raw === "object") {
+                for (const [id, v] of Object.entries(raw)) this._favorites.set(id, { sound: !!v?.sound });
+            }
+        } catch (e) {}
+    }
+
+    _saveFavorites() {
+        try { BdApi.Data.save(this.meta.name, "favorites", Object.fromEntries(this._favorites)); } catch (e) {}
+    }
+
+    setFavorite(userId, on) {
+        userId = String(userId);
+        if (on) this._favorites.set(userId, { sound: this._favorites.get(userId)?.sound ?? true });
+        else this._favorites.delete(userId);
+        this._saveFavorites();
+        this.scheduleOverlayPush();
+    }
+
+    setFavoriteSound(userId, on) {
+        userId = String(userId);
+        if (!this._favorites.has(userId)) return;
+        this._favorites.set(userId, { sound: !!on });
+        this._saveFavorites();
+        this.scheduleOverlayPush();
+    }
+
+    _voiceStore() {
+        return this._sc?.VoiceStateStore ?? BdApi.Webpack.getStore("VoiceStateStore");
+    }
+
+    // Members of a voice channel for a small avatar row: [{userId, name, avatar}]
+    _channelMembers(channelId, guildId, limit = 8) {
+        const out = [];
+        try {
+            const states = this._voiceStore()?.getVoiceStatesForChannel?.(channelId) || {};
+            const us = this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore");
+            for (const id of Object.keys(states)) {
+                const u = us?.getUser?.(id);
+                out.push({ userId: id, name: this.getDisplayName(id, guildId) || u?.username || id, avatar: u?.avatar ?? null });
+            }
+        } catch (e) {}
+        return { count: out.length, members: out.slice(0, limit) };
+    }
+
+    // Someone left my channel for another channel of the same server.
+    _noteDeparture(vs) {
+        const me = this.getCurrentUserId();
+        const uid = vs?.userId != null ? String(vs.userId) : null;
+        if (!me || !uid || uid === me) return;
+        const mine = this.active.get(me);
+        const prev = this.active.get(uid);
+        if (!mine || !prev || prev.channelId !== mine.channelId) return;
+        const to = vs.channelId ? String(vs.channelId) : null;
+        if (to && to !== mine.channelId && mine.guildId && this.getChannelGuildId(to) === mine.guildId) {
+            this._departures.set(uid, { channelId: to, at: Date.now() });
+            this._addTimer(setTimeout(() => this.scheduleOverlayPush(), this.DEPARTURE_SHOW_MS + 100));
+        }
+    }
+
+    _departureCards(mySession) {
+        const cards = [];
+        if (!this._departures?.size) return cards;
+        const now = Date.now();
+        const us = this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore");
+        for (const [uid, d] of [...this._departures]) {
+            const cur = this._voiceStore()?.getVoiceStateForUser?.(uid)?.channelId ?? null;
+            // Expired, came back, went elsewhere or left voice: drop the card.
+            if (now - d.at > this.DEPARTURE_SHOW_MS || !cur || String(cur) !== d.channelId || d.channelId === mySession.channelId) {
+                this._departures.delete(uid);
+                continue;
+            }
+            const u = us?.getUser?.(uid);
+            cards.push({
+                userId: uid,
+                name: this.getDisplayName(uid, mySession.guildId) || u?.username || uid,
+                avatar: u?.avatar ?? null,
+                channelId: d.channelId,
+                channelName: this.getChannelName(d.channelId),
+                at: d.at,
+                ...this._channelMembers(d.channelId, mySession.guildId)
+            });
+        }
+        return cards.sort((a, b) => b.at - a.at).slice(0, 3);
+    }
+
+    _loadLastVoice() {
+        try { return BdApi.Data.load(this.meta.name, "lastVoice") || null; } catch (e) { return null; }
+    }
+
+    _saveLastVoice(v) {
+        try { BdApi.Data.save(this.meta.name, "lastVoice", v); } catch (e) {}
+    }
+
+    // While in voice, keep the last channel (and a fresh "seen" time, at most
+    // once a minute) so a restart knows where we were.
+    _rememberOwnChannel() {
+        const me = this.getCurrentUserId();
+        const mine = me ? this.active.get(me) : null;
+        if (!mine?.channelId) return;
+        const lv = this._loadLastVoice();
+        const now = Date.now();
+        if (lv && lv.channelId === mine.channelId && !lv.selfLeft && now - (lv.seenAt || 0) < 60000) return;
+        this._saveLastVoice({ channelId: mine.channelId, guildId: mine.guildId ?? null, seenAt: now, selfLeft: false });
+    }
+
+    _onOwnChannelSelect(action) {
+        if (action.channelId) {
+            this._saveLastVoice({ channelId: String(action.channelId), guildId: action.guildId ?? null, seenAt: Date.now(), selfLeft: false });
+            this._returnTo = null;
+        } else {
+            const lv = this._loadLastVoice();
+            if (lv) this._saveLastVoice({ ...lv, selfLeft: true });
+            this._returnTo = null;
+        }
+        this.scheduleOverlayPush();
+    }
+
+    _checkReturnToChannel() {
+        const inVoice = this._voiceStore()?.getVoiceChannelId?.();
+        if (inVoice) return;
+        const lv = this._loadLastVoice();
+        if (!lv || lv.selfLeft || !lv.channelId) return;
+        if (Date.now() - (lv.seenAt || 0) > this.RETURN_MAX_AGE_MS) return;
+        if (!this.getChannelName(lv.channelId)) return;   // channel gone or no access
+        this._returnTo = { channelId: lv.channelId, guildId: lv.guildId ?? null };
+        vetLog("info", "return-to-channel offered:", lv.channelId);
+        this.scheduleOverlayPush();
+    }
+
+    _returnCard() {
+        if (!this._returnTo) return null;
+        const { channelId, guildId } = this._returnTo;
+        return {
+            channelId,
+            channelName: this.getChannelName(channelId),
+            guildName: this.getGuildName(guildId, channelId),
+            ...this._channelMembers(channelId, guildId)
+        };
+    }
+
+    _selectVoiceChannel(channelId) {
+        try {
+            const actions = BdApi.Webpack.getByKeys("selectVoiceChannel", { searchExports: true });
+            if (!actions?.selectVoiceChannel) { vetLog("warn", "selectVoiceChannel not found"); return; }
+            if (channelId == null && typeof actions.disconnect === "function") actions.disconnect();
+            else actions.selectVoiceChannel(channelId);
+            vetLog("info", channelId ? "joined channel " + channelId : "left voice");
+        } catch (e) { vetLog("error", "_selectVoiceChannel:", e); }
+    }
+
+    // =====================================================================
+    // Messages: unread DM badge, notifications for the overlay
+    // =====================================================================
+
+    _dmChannelId(userId) {
+        try {
+            const cs = this._sc?.ChannelStore ?? BdApi.Webpack.getStore("ChannelStore");
+            return cs?.getDMFromUserId?.(String(userId)) ?? null;
+        } catch (e) { return null; }
+    }
+
+    // Unread messages in my DM with this user (in a DM every message counts
+    // as a mention, so the mention count is the unread count).
+    _unreadDMCount(userId) {
+        try {
+            const cid = this._dmChannelId(userId);
+            if (!cid) return 0;
+            const rs = this._sc?.ReadStateStore ?? BdApi.Webpack.getStore("ReadStateStore");
+            return Number(rs?.getMentionCount?.(cid)) || 0;
+        } catch (e) { return 0; }
+    }
+
+    _isDMChannel(ch) {
+        return !!ch && !ch.guild_id && (ch.type === 1 || ch.type === 3);
+    }
+
+    _onMessageCreate(action) {
+        const msg = action?.message;
+        if (!msg || action.optimistic) return;
+        const me = this.getCurrentUserId();
+        const authorId = msg.author?.id != null ? String(msg.author.id) : null;
+        if (!me || !authorId || authorId === me) return;
+        const ch = this._getChannel(msg.channel_id);
+        const isDM = this._isDMChannel(ch);
+        const mentioned = Array.isArray(msg.mentions) && msg.mentions.some(m => String(m?.id ?? m) === me);
+        if (!isDM && !mentioned) return;
+
+        const rel = this._sc?.RelationshipStore ?? BdApi.Webpack.getStore("RelationshipStore");
+        try { if (rel?.isBlocked?.(authorId)) return; } catch (e) {}
+
+        // Badges change whenever a DM arrives.
+        this.scheduleOverlayPush();
+
+        // Already reading this chat in a focused Discord: no popup.
+        try {
+            const sel = (this._sc?.SelectedChannelStore ?? BdApi.Webpack.getStore("SelectedChannelStore"))?.getChannelId?.();
+            if (document.hasFocus() && sel === msg.channel_id) return;
+        } catch (e) {}
+
+        let text = String(msg.content || "").replace(/<@!?(\d+)>/g, (_, id) => "@" + (this.getDisplayName(id, ch?.guild_id ?? null) || "user"))
+            .replace(/<#(\d+)>/g, (_, id) => "#" + (this.getChannelName(id) || "channel"))
+            .replace(/<a?:(\w+):\d+>/g, ":$1:")
+            .replace(/\s+/g, " ").trim();
+        if (!text && msg.attachments?.length) text = "📎 " + (msg.attachments[0]?.filename || "attachment");
+        if (!text && msg.embeds?.length) text = "🔗 link";
+        if (!text && msg.sticker_items?.length) text = "🏷 sticker";
+        if (text.length > 160) text = text.slice(0, 157) + "…";
+
+        const where = isDM
+            ? (ch?.type === 3 ? (this.getChannelName(msg.channel_id) || "Group") : null)
+            : "#" + (this.getChannelName(msg.channel_id) || "channel") +
+              (ch?.guild_id ? " · " + (this.getGuildName(ch.guild_id, msg.channel_id) || "") : "");
+
+        this._postJSON("/notify", {
+            id: String(msg.id),
+            kind: isDM ? "dm" : "mention",
+            authorId,
+            name: this.getDisplayName(authorId, ch?.guild_id ?? null) || msg.author?.global_name || msg.author?.username || "user",
+            avatar: msg.author?.avatar ?? null,
+            channelId: String(msg.channel_id),
+            guildId: ch?.guild_id ?? null,
+            where,
+            text,
+            at: Date.now()
+        });
+    }
+
+    // Read in Discord: drop its popups and refresh badges.
+    _onMessageAck(action) {
+        const ids = action.type === "BULK_ACK"
+            ? (action.channels || []).map(c => c?.channelId ?? c?.channel_id).filter(Boolean)
+            : [action.channelId ?? action.channel_id].filter(Boolean);
+        if (ids.length) this._postJSON("/notify/clear", { channelIds: ids.map(String) });
+        this.scheduleOverlayPush();
+    }
+
+    _openChannel(channelId, guildId) {
+        try {
+            const ch = this._getChannel(channelId);
+            const g = ch?.guild_id ?? guildId ?? "@me";
+            const nav = BdApi.Webpack.getByKeys("transitionTo", { searchExports: true });
+            if (typeof nav?.transitionTo === "function") nav.transitionTo(`/channels/${g}/${channelId}`);
+            else vetLog("warn", "transitionTo not found");
+            try { window.DiscordNative?.window?.focus?.(); } catch (e) {}
+            try { window.focus(); } catch (e) {}
+        } catch (e) { vetLog("error", "_openChannel:", e); }
+    }
+
+    // =====================================================================
+    // Person card: activity, mobile, volume, quick actions
+    // =====================================================================
+
+    // What the person is doing, for a small icon on the card.
+    // { type: "game"|"spotify"|"listening"|"watching"|"streaming"|"custom", name, details, icon, canListen }
+    _activityFor(userId) {
+        try {
+            const ps = this._sc?.PresenceStore ?? BdApi.Webpack.getStore("PresenceStore");
+            const acts = ps?.getActivities?.(String(userId)) || [];
+            if (!acts.length) return null;
+            const pick = acts.find(a => a.type === 0) || acts.find(a => a.type === 2) ||
+                         acts.find(a => a.type === 3) || acts.find(a => a.type === 1) ||
+                         acts.find(a => a.type === 4);
+            if (!pick) return null;
+            const asset = (img, appId) => {
+                if (!img) return null;
+                if (img.startsWith("spotify:")) return "https://i.scdn.co/image/" + img.slice(8);
+                if (img.startsWith("mp:")) return "https://media.discordapp.net/" + img.slice(3);
+                if (appId && /^\d+$/.test(img)) return `https://cdn.discordapp.com/app-assets/${appId}/${img}.png`;
+                return null;
+            };
+            const appIcon = (appId) => {
+                try {
+                    const app = (this._sc?.ApplicationStore ?? BdApi.Webpack.getStore("ApplicationStore"))?.getApplication?.(appId);
+                    if (app?.icon) return `https://cdn.discordapp.com/app-icons/${appId}/${app.icon}.png?size=32`;
+                } catch (e) {}
+                return null;
+            };
+            const isSpotify = pick.type === 2 && (pick.name === "Spotify" || String(pick.id || "").startsWith("spotify"));
+            if (pick.type === 4) {
+                const text = pick.state || "";
+                if (!text && !pick.emoji) return null;
+                return { type: "custom", name: (pick.emoji?.name ? pick.emoji.name + " " : "") + text, details: null, icon: null };
+            }
+            return {
+                type: isSpotify ? "spotify" : pick.type === 0 ? "game" : pick.type === 2 ? "listening"
+                    : pick.type === 3 ? "watching" : "streaming",
+                name: pick.name || "",
+                details: isSpotify ? [pick.details, pick.state].filter(Boolean).join(" — ")
+                    : [pick.details, pick.state].filter(Boolean).join(" · ") || null,
+                icon: (pick.application_id && appIcon(pick.application_id))
+                    || asset(pick.assets?.large_image, pick.application_id)
+                    || asset(pick.assets?.small_image, pick.application_id),
+                canListen: isSpotify && !!pick.sync_id
+            };
+        } catch (e) { return null; }
+    }
+
+    _isOnMobile(userId) {
+        try {
+            const ps = this._sc?.PresenceStore ?? BdApi.Webpack.getStore("PresenceStore");
+            if (typeof ps?.isMobileOnline === "function") return !!ps.isMobileOnline(String(userId));
+            const cs = ps?.getState?.()?.clientStatuses?.[String(userId)];
+            return !!cs && !!cs.mobile && !cs.desktop && !cs.web;
+        } catch (e) { return false; }
+    }
+
+    // 0..200 (100 = default), like Discord's own slider
+    _localVolume(userId) {
+        try {
+            const mes = this._sc?.MediaEngineStore ?? BdApi.Webpack.getStore("MediaEngineStore");
+            const v = mes?.getLocalVolume?.(String(userId));
+            return Number.isFinite(v) ? Math.round(v) : 100;
+        } catch (e) { return 100; }
+    }
+
+    _setLocalVolume(userId, v) {
+        if (!Number.isFinite(v)) return;
+        v = Math.max(0, Math.min(200, v));
+        try {
+            const mod = BdApi.Webpack.getByKeys("setLocalVolume", { searchExports: true });
+            if (typeof mod?.setLocalVolume !== "function") { vetLog("warn", "setLocalVolume not found"); return; }
+            mod.setLocalVolume(String(userId), v);
+            this.scheduleOverlayPush();
+        } catch (e) { vetLog("error", "_setLocalVolume:", e); }
+    }
+
+    _focusDiscord() {
+        try { window.DiscordNative?.window?.focus?.(); } catch (e) {}
+        try { window.focus(); } catch (e) {}
+    }
+
+    _openDM(userId) {
+        try {
+            const cid = this._dmChannelId(userId);
+            if (cid) { this._openChannel(cid, "@me"); return; }
+            const mod = BdApi.Webpack.getByKeys("openPrivateChannel", { searchExports: true });
+            if (typeof mod?.openPrivateChannel === "function") mod.openPrivateChannel(String(userId));
+            else vetLog("warn", "openPrivateChannel not found");
+            this._focusDiscord();
+        } catch (e) { vetLog("error", "_openDM:", e); }
+    }
+
+    _openProfile(userId) {
+        try {
+            const me = this.getCurrentUserId();
+            const guildId = me ? (this.active.get(me)?.guildId ?? null) : null;
+            const mod = BdApi.Webpack.getByKeys("openUserProfileModal", { searchExports: true });
+            if (typeof mod?.openUserProfileModal === "function") {
+                mod.openUserProfileModal({ userId: String(userId), guildId, analyticsLocation: {} });
+            } else vetLog("warn", "openUserProfileModal not found");
+            this._focusDiscord();
+        } catch (e) { vetLog("error", "_openProfile:", e); }
+    }
+
+    // Spotify "Listen Along". Needs Spotify connected; Discord shows its own
+    // prompt if something is missing.
+    _listenAlong(userId) {
+        try {
+            const ps = this._sc?.PresenceStore ?? BdApi.Webpack.getStore("PresenceStore");
+            const act = (ps?.getActivities?.(String(userId)) || []).find(a => a.type === 2 && a.sync_id);
+            if (!act) { vetLog("warn", "listen-along: no Spotify activity"); return; }
+            const mod = BdApi.Webpack.getByKeys("sync", "play", { searchExports: true })
+                     || BdApi.Webpack.getByKeys("sync", { searchExports: true });
+            if (typeof mod?.sync === "function") { mod.sync(act, String(userId)); vetLog("info", "listen-along started"); }
+            else vetLog("warn", "Spotify sync not found");
+        } catch (e) { vetLog("error", "_listenAlong:", e); }
+    }
+
+    // =====================================================================
+    // Incoming calls (DM / group): accept, decline, answer with a message
+    // =====================================================================
+
+    _onCall(action) {
+        const me = this.getCurrentUserId();
+        const cid = action.channelId != null ? String(action.channelId) : null;
+        if (!me || !cid) return;
+        if (action.type === "CALL_DELETE") { this._clearCall(cid); return; }
+        const ringing = (action.ringing || []).map(String);
+        const inThisCall = this._voiceStore()?.getVoiceChannelId?.() === cid;
+        if (!ringing.includes(me) || inThisCall) { this._clearCall(cid); return; }
+        if (this._ringingCall === cid) return;
+        this._ringingCall = cid;
+
+        const ch = this._getChannel(cid);
+        const others = (Array.isArray(ch?.recipients) ? ch.recipients : [])
+            .map(x => String(typeof x === "string" ? x : x?.id)).filter(id => id && id !== me);
+        // The caller is whoever is already in the call; else the DM partner.
+        let callerId = null;
+        try {
+            const states = this._voiceStore()?.getVoiceStatesForChannel?.(cid) || {};
+            callerId = Object.keys(states).find(id => id !== me) || null;
+        } catch (e) {}
+        callerId = callerId || others[0] || null;
+        const us = this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore");
+        const u = callerId ? us?.getUser?.(callerId) : null;
+        this._postJSON("/call", {
+            channelId: cid,
+            callerId,
+            name: callerId ? (this.getDisplayName(callerId, null) || u?.username || "Someone") : "Someone",
+            avatar: u?.avatar ?? null,
+            group: ch?.type === 3 ? (this.getChannelName(cid) || "Group call") : null
+        });
+        vetLog("info", "incoming call in", cid, "from", callerId);
+    }
+
+    _clearCall(cid) {
+        if (this._ringingCall !== cid) return;
+        this._ringingCall = null;
+        this._postJSON("/call/clear", { channelId: cid });
+    }
+
+    _declineCall(cid) {
+        try {
+            const mod = BdApi.Webpack.getByKeys("stopRinging", { searchExports: true });
+            if (typeof mod?.stopRinging === "function") mod.stopRinging(cid);
+            else vetLog("warn", "stopRinging not found");
+        } catch (e) { vetLog("error", "_declineCall:", e); }
+        this._clearCall(cid);
+    }
+
+    _sendMessage(channelId, text) {
+        text = String(text || "").trim();
+        if (!text) return;
+        try {
+            const mod = BdApi.Webpack.getByKeys("sendMessage", "editMessage", { searchExports: true });
+            if (typeof mod?.sendMessage !== "function") { vetLog("warn", "sendMessage not found"); return; }
+            mod.sendMessage(channelId, { content: text, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] }, undefined, {});
+            vetLog("info", "message sent to", channelId);
+        } catch (e) { vetLog("error", "_sendMessage:", e); }
+    }
+
+    // =====================================================================
+    // My own stream: who watches it, and a heads-up about unexpected viewers
+    // =====================================================================
+
+    _myStreamViewers(mySession) {
+        try {
+            const ass = BdApi.Webpack.getStore("ApplicationStreamingStore");
+            const me = this.getCurrentUserId();
+            const st = ass?.getCurrentUserActiveStream?.() || ass?.getActiveStreamForUser?.(me, mySession?.guildId);
+            if (!st) { this._knownViewers = null; this._streamStartedAt = 0; return []; }
+            let ids = [];
+            try { ids = ass.getViewerIds?.(st) || []; } catch (e) {}
+            if (!ids.length) { try { ids = ass.getViewerIds?.(st.streamKey || this._streamKeyOf(st)) || []; } catch (e) {} }
+            ids = ids.map(String).filter(id => id !== me);
+            const us = this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore");
+            const now = Date.now();
+            this._knownViewers ||= new Set();
+            this._streamStartedAt ||= now;
+            const out = ids.map(id => {
+                const u = us?.getUser?.(id);
+                // "Stranger": not known/favorite, or only just came into the channel.
+                const sess = this.active.get(id);
+                const fresh = sess && sess.channelId === mySession?.channelId && sess.startedAt && now - sess.startedAt < 2 * 60_000;
+                const stranger = !this._favorites?.has(id) && (this.getBadgeKind(id) === "stranger" || !!fresh);
+                return { userId: id, name: this.getDisplayName(id, mySession?.guildId) || u?.username || id, avatar: u?.avatar ?? null, stranger };
+            });
+            // Warn once per viewer when someone unexpected starts watching after
+            // the stream has been running for a while (an established audience).
+            for (const v of out) {
+                if (this._knownViewers.has(v.userId)) continue;
+                this._knownViewers.add(v.userId);
+                if (v.stranger && now - this._streamStartedAt > 60_000) {
+                    this._postJSON("/notify", {
+                        id: "viewer-" + v.userId + "-" + now, kind: "mention",
+                        authorId: v.userId, name: v.name, avatar: v.avatar,
+                        channelId: "viewer-" + v.userId, guildId: null,
+                        where: "your stream", text: "👁 started watching your stream", at: now
+                    });
+                }
+            }
+            return out;
+        } catch (e) { return []; }
+    }
+
+    _streamKeyOf(st) {
+        if (!st) return null;
+        return st.guildId ? `guild:${st.guildId}:${st.channelId}:${st.ownerId}` : `call:${st.channelId}:${st.ownerId}`;
+    }
+
+    // Which window/screen I'm streaming, as the overlay's source id (for a preview).
+    _myStreamSourceId() {
+        try {
+            const mes = BdApi.Webpack.getByKeys("getGoLiveSource", { searchExports: true });
+            const id = mes?.getGoLiveSource?.()?.desktopSource?.id;
+            if (!id) return null;
+            const m = /^window-handle:(\d+)/.exec(id);
+            if (m) return `window:${m[1]}:0`;
+            const sm = /^screen-handle:(\d+)/.exec(id);
+            if (sm) return "screen-handle:" + sm[1];
+            return String(id);
+        } catch (e) { return null; }
+    }
+
+    // A camera goes through the same viewer window as streams. Discord only
+    // receives someone's camera while its call view subscribes to it.
+    async _watchCamera(userId) {
+        try {
+            const vss = BdApi.Webpack.getStore("VideoStreamStore");
+            const sid = vss?.getStreamId?.(userId, "video") ?? vss?.getStreamId?.(userId);
+            const nz = this._findNzFunction();
+            const handle = sid && typeof nz === "function" ? nz(String(sid)) : null;
+            const t = handle?.stream?.getVideoTracks?.()[0];
+            if (!t) {
+                vetLog("warn", "watch-camera: no camera track for", userId, "sid", sid);
+                BdApi.UI.showToast("Camera isn't loaded in Discord — open the call view once", { type: "warning" });
+                try { handle?.release?.(); } catch (e) {}
+                return;
+            }
+            this._watchToken = (this._watchToken || 0) + 1;
+            const run = async () => {
+                this._stopFramePump();
+                this._postJSON("/video/open", { userId, camera: true });
+                this._nativeStreamHandle = handle;
+                this._sourceSid = String(sid);
+                this._watchedUserId = userId;
+                await this._startWatchStreamPeer(new MediaStream([t]));
+            };
+            this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
+        } catch (e) { vetLog("error", "_watchCamera:", e); }
+    }
+
+    // =====================================================================
+    // Tracker: who was there, together, invites
+    // =====================================================================
+
+    // Everyone whose sessions with me overlap [from, to] (a single moment when
+    // from == to). One row per person: total overlap, first..last overlapping
+    // time, and the session to jump to.
+    whoWasThere(from, to) {
+        const out = [];
+        for (const rec of this.encounters.values()) {
+            let overlap = 0, first = Infinity, last = 0, best = null;
+            (rec.sessions || []).forEach((sn, idx) => {
+                const a = Math.max(sn.startedAt, from), b = Math.min(sn.endedAt, to);
+                if (b < a || (b === a && !(sn.startedAt <= from && sn.endedAt >= to))) return;
+                overlap += b - a;
+                first = Math.min(first, a); last = Math.max(last, b);
+                if (!best || b - a > best.len) best = { len: b - a, idx, sn };
+            });
+            if (!best) continue;
+            out.push({
+                userId: rec.userId, overlapMs: overlap, start: first, end: last, idx: best.idx,
+                channelName: best.sn.channelName, guildName: best.sn.guildName
+            });
+        }
+        return out.sort((a, b) => b.overlapMs - a.overlapMs || a.start - b.start);
+    }
+
+    // Stretches of time when ALL of these people were in voice with me.
+    togetherSpans(userIds, from = null, to = null) {
+        const lists = userIds.map(id => {
+            const rec = this.encounters.get(id);
+            return (rec?.sessions || []).map((sn, idx) => ({ a: sn.startedAt, b: sn.endedAt, idx, sn, userId: id }))
+                .filter(x => x.b > x.a).sort((x, y) => x.a - y.a);
+        });
+        if (lists.some(l => !l.length)) return [];
+        let cur = lists[0].map(x => ({ start: x.a, end: x.b, ref: x }));
+        for (const l of lists.slice(1)) {
+            const next = [];
+            let i = 0, j = 0;
+            while (i < cur.length && j < l.length) {
+                const a = Math.max(cur[i].start, l[j].a), b = Math.min(cur[i].end, l[j].b);
+                if (b > a) next.push({ start: a, end: b, ref: cur[i].ref });
+                if (cur[i].end < l[j].b) i++; else j++;
+            }
+            cur = next;
+            if (!cur.length) return [];
+        }
+        if (from != null && to != null) {
+            cur = cur.map(x => ({ ...x, start: Math.max(x.start, from), end: Math.min(x.end, to) })).filter(x => x.end > x.start);
+        }
+        return cur.sort((x, y) => y.start - x.start).map(x => ({
+            start: x.start, end: x.end, userId: x.ref.userId, idx: x.ref.idx,
+            channelName: x.ref.sn.channelName, guildName: x.ref.sn.guildName
+        }));
+    }
+
+    _inviteDialog(host, userId) {
+        const me = this.getCurrentUserId();
+        const mine = me ? this.active.get(me) : null;
+        if (!mine?.channelId || !mine.guildId) {
+            BdApi.UI.showToast("Join a server voice channel first", { type: "warning" });
+            return;
+        }
+        const channelName = this.getChannelName(mine.channelId) || "voice";
+        const link = `https://discord.com/channels/${mine.guildId}/${mine.channelId}`;
+        const name = this.getStoredDisplayName(userId) || this.getUserName(userId);
+        const back = document.createElement("div");
+        back.style.cssText = "position:absolute;inset:0;z-index:10;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;";
+        const btn = "border:none;border-radius:4px;padding:8px 14px;font-size:14px;font-weight:500;cursor:pointer;color:#fff;";
+        back.innerHTML = `<div style="background:#313338;color:#dbdee1;border-radius:8px;width:min(460px,90vw);box-shadow:0 8px 24px rgba(0,0,0,.5);overflow:hidden">
+            <div style="padding:16px 16px 6px;font-size:18px;font-weight:600;color:#f2f3f5">Invite ${this._escape(name)} to #${this._escape(channelName)}</div>
+            <div style="padding:0 16px 16px;font-size:13px;line-height:1.45;opacity:.85">
+                <b>Server invite</b> — a real Discord invite (works even if they aren't on the server; some servers don't allow creating invites).<br>
+                <b>Channel link</b> — opens the channel; works only for members of the server.</div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;background:#2b2d31">
+                <button data-r="cancel" style="${btn}background:transparent;color:#dbdee1">Cancel</button>
+                <button data-r="link" style="${btn}background:#4e5058">Send channel link</button>
+                <button data-r="invite" style="${btn}background:#5865f2">Send server invite</button>
+            </div></div>`;
+        const done = () => { document.removeEventListener("keydown", onKey, true); back.remove(); };
+        const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); done(); } };
+        document.addEventListener("keydown", onKey, true);
+        back.addEventListener("click", async (e) => {
+            e.stopPropagation();
+            if (e.target === back) return done();
+            const r = e.target.closest("[data-r]")?.getAttribute("data-r");
+            if (!r) return;
+            done();
+            if (r === "cancel") return;
+            let text = link;
+            if (r === "invite") {
+                const code = await this._createInvite(mine.channelId);
+                if (code) text = `https://discord.gg/${code}`;
+                else BdApi.UI.showToast("Couldn't create an invite here — sending the channel link instead", { type: "warning" });
+            }
+            const ok = await this._sendDM(userId, text);
+            BdApi.UI.showToast(ok ? `Sent to ${name}` : "Couldn't open a DM", { type: ok ? "success" : "error" });
+        });
+        host.appendChild(back);
+    }
+
+    async _createInvite(channelId) {
+        try {
+            const mod = BdApi.Webpack.getByKeys("createInvite", { searchExports: true });
+            if (typeof mod?.createInvite !== "function") { vetLog("warn", "createInvite not found"); return null; }
+            const inv = await mod.createInvite(channelId, { max_age: 86400, max_uses: 0, temporary: false }, "Voice Encounter Tracker");
+            return inv?.code || null;
+        } catch (e) { vetLog("warn", "createInvite failed:", e?.message || e); return null; }
+    }
+
+    async _sendDM(userId, text) {
+        try {
+            let cid = this._dmChannelId(userId);
+            if (!cid) {
+                const mod = BdApi.Webpack.getByKeys("getOrEnsurePrivateChannel", { searchExports: true })
+                         || BdApi.Webpack.getByKeys("ensurePrivateChannel", { searchExports: true });
+                const fn = mod?.getOrEnsurePrivateChannel || mod?.ensurePrivateChannel;
+                if (typeof fn === "function") cid = await fn.call(mod, String(userId));
+            }
+            if (!cid) return false;
+            this._sendMessage(String(cid), text);
+            return true;
+        } catch (e) { vetLog("error", "_sendDM:", e); return false; }
+    }
+
+    // A short heads-up when the microphone or output device changes (plugged
+    // in a headset, Windows switched the default, ...). The first look only
+    // records the current devices.
+    _checkAudioDevices() {
+        const mes = this._sc?.MediaEngineStore ?? BdApi.Webpack.getStore("MediaEngineStore");
+        if (!mes) return;
+        const name = (list, id) => {
+            try {
+                const all = Object.values(list || {});
+                const d = all.find(x => x?.id === id) || (id === "default" ? all.find(x => x?.id === "default") : null);
+                return d?.name || (id === "default" ? "System default" : id || "—");
+            } catch (e) { return id || "—"; }
+        };
+        const cur = {
+            input: mes.getInputDeviceId?.() ?? null,
+            output: mes.getOutputDeviceId?.() ?? null,
+            inputs: mes.getInputDevices?.(), outputs: mes.getOutputDevices?.()
+        };
+        const sig = (o) => `${o.input}|${o.output}|${name(o.inputs, o.input)}|${name(o.outputs, o.output)}`;
+        const prev = this._audioDevices;
+        this._audioDevices = cur;
+        if (!prev || sig(prev) === sig(cur)) return;
+        const lines = [];
+        if (prev.input !== cur.input || name(prev.inputs, prev.input) !== name(cur.inputs, cur.input)) lines.push("🎙 " + name(cur.inputs, cur.input));
+        if (prev.output !== cur.output || name(prev.outputs, prev.output) !== name(cur.outputs, cur.output)) lines.push("🎧 " + name(cur.outputs, cur.output));
+        if (!lines.length) return;
+        vetLog("info", "audio device changed:", lines.join(" · "));
+        this._postJSON("/notify", {
+            id: "device-" + Date.now(), kind: "device", authorId: "", name: "Audio device changed",
+            avatar: null, channelId: "device", guildId: null, where: null,
+            text: lines.join(" · "), ttlMs: 30000, at: Date.now()
+        });
+    }
+
     _stopFramePump() {
         if (this._framePump) {
             this._framePump.stop();
@@ -3067,6 +3885,33 @@ module.exports = class VoiceEncounterTracker {
                     display: flex; gap: 6px;
                     margin-bottom: 14px;
                 }
+                .vet-time {
+                    margin-bottom: 14px; padding: 10px 12px;
+                    border: 1px solid var(--background-modifier-accent, #3f4147);
+                    border-radius: 4px; background: var(--background-secondary, #2b2d31);
+                }
+                .vet-time-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+                .vet-time-row input[type=datetime-local] {
+                    background: var(--background-tertiary, #1e1f22); color: inherit;
+                    border: 1px solid var(--background-modifier-accent, #444); border-radius: 4px;
+                    padding: 4px 6px; color-scheme: dark;
+                }
+                .vet-time-res { margin-top: 8px; display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow: auto; }
+                .vet-time-res .r {
+                    display: flex; gap: 10px; align-items: baseline; padding: 4px 6px; border-radius: 3px;
+                    cursor: pointer; font-size: 13px;
+                }
+                .vet-time-res .r:hover { background: rgba(255,255,255,0.05); }
+                .vet-time-res .r b { min-width: 160px; }
+                .vet-time-res .r .m { opacity: .65; font-size: 12px; }
+                .vet-time-res .empty { opacity: .6; font-size: 12px; padding: 4px 6px; }
+                .vet-chip {
+                    display: inline-flex; gap: 4px; align-items: center; padding: 2px 8px; border-radius: 10px;
+                    background: rgba(88,101,242,0.25); font-size: 12px;
+                }
+                .vet-chip button { background: none; border: none; color: inherit; cursor: pointer; padding: 0; opacity: .7; }
+                .vet-pick { cursor: pointer; accent-color: #5865f2; }
+                tr.vet-jump > td { background: rgba(250,166,26,0.18) !important; }
 
                 .vet-manual {
                     margin-bottom: 14px; padding: 10px 12px;
@@ -3352,6 +4197,21 @@ module.exports = class VoiceEncounterTracker {
                         <button type="button" class="vet-btn" data-action="search-clear">Clear</button>
                     </div>
 
+                    <div class="vet-time">
+                        <div class="vet-manual-title">Who was in voice with me</div>
+                        <div class="vet-time-row">
+                            <span style="opacity:.7">From</span>
+                            <input type="datetime-local" data-role="t-from">
+                            <span style="opacity:.7">to</span>
+                            <input type="datetime-local" data-role="t-to" title="Leave empty to look at one moment">
+                            <button type="button" class="vet-btn primary" data-action="t-find">Find</button>
+                            <button type="button" class="vet-btn" data-action="t-together"
+                                title="Tick 2-3 people in the table, then see when you were all together">Together…</button>
+                            <span data-role="t-chips" style="display:flex;gap:4px;flex-wrap:wrap"></span>
+                        </div>
+                        <div class="vet-time-res" data-role="t-res"></div>
+                    </div>
+
                     <div class="vet-manual">
                         <div class="vet-manual-title">Add user manually</div>
                         <div class="vet-manual-row">
@@ -3532,13 +4392,95 @@ module.exports = class VoiceEncounterTracker {
             );
         });
 
+        // ── "Who was in voice with me" / "Together" ──
+        const tFrom = overlay.querySelector("[data-role='t-from']");
+        const tTo = overlay.querySelector("[data-role='t-to']");
+        const tRes = overlay.querySelector("[data-role='t-res']");
+        const tChips = overlay.querySelector("[data-role='t-chips']");
+        const tTogetherBtn = overlay.querySelector("[data-action='t-together']");
+        const esc = (x) => this._escape(String(x ?? ""));
+        const nameOf = (id) => this.getStoredDisplayName(id) || this.getUserName(id);
+        const fmtSpan = (a, b) => {
+            const d = (t) => new Date(t);
+            const hm = (t) => `${String(d(t).getHours()).padStart(2, "0")}:${String(d(t).getMinutes()).padStart(2, "0")}`;
+            const day = (t) => d(t).toLocaleDateString();
+            return day(a) === day(b) ? `${day(a)} ${hm(a)}–${hm(b)}` : `${day(a)} ${hm(a)} – ${day(b)} ${hm(b)}`;
+        };
+        const readRange = () => {
+            const a = tFrom.value ? new Date(tFrom.value).getTime() : NaN;
+            const b = tTo.value ? new Date(tTo.value).getTime() : NaN;
+            if (!Number.isFinite(a) && !Number.isFinite(b)) return null;
+            const from = Number.isFinite(a) ? a : b, to = Number.isFinite(b) ? b : a;
+            return { from: Math.min(from, to), to: Math.max(from, to) };
+        };
+        const jumpTo = (userId, idx) => {
+            this._vetSearchQuery = "";
+            const si = overlay.querySelector("[data-role='search-input']");
+            if (si) si.value = "";
+            this._vetExpandedUser = userId;
+            this._vetExpandedSession = idx != null ? { userId, sessionIndex: idx } : null;
+            this._vetJump = { userId, idx };
+            rerender();
+            setTimeout(() => overlay.querySelector(`tr.vet-main-row[data-user-id="${userId}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" }), 30);
+        };
+        const renderTimeChips = () => {
+            const set = this._vetTogether;
+            tTogetherBtn.textContent = set ? (set.size >= 2 ? "Show together" : "Pick 2+ in the table…") : "Together…";
+            tChips.innerHTML = set ? [...set].map(id =>
+                `<span class="vet-chip">${esc(nameOf(id))}<button type="button" data-unpick="${id}">×</button></span>`).join("") +
+                `<button type="button" class="vet-btn" data-action="t-cancel">Cancel</button>` : "";
+        };
+
+        overlay.querySelector("[data-action='t-find']").addEventListener("click", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const rg = readRange();
+            if (!rg) { tRes.innerHTML = `<div class="empty">Pick a date and time first.</div>`; return; }
+            const rows = this.whoWasThere(rg.from, rg.to);
+            tRes.innerHTML = rows.length ? rows.map(x => `<div class="r" data-jump="${x.userId}" data-idx="${x.idx}">
+                    <b>${esc(nameOf(x.userId))}</b>
+                    <span>${this.formatDuration(x.overlapMs)}</span>
+                    <span class="m">${fmtSpan(x.start, x.end)}${x.channelName ? " · #" + esc(x.channelName) : ""}${x.guildName ? " · " + esc(x.guildName) : ""}</span>
+                </div>`).join("")
+                : `<div class="empty">Nobody was in voice with you then.</div>`;
+        });
+        tTogetherBtn.addEventListener("click", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            if (!this._vetTogether) { this._vetTogether = new Set(); renderTimeChips(); rerender(); return; }
+            if (this._vetTogether.size < 2) return;
+            const rg = readRange();
+            const spans = this.togetherSpans([...this._vetTogether], rg?.from, rg?.to);
+            const total = spans.reduce((a, x) => a + (x.end - x.start), 0);
+            tRes.innerHTML = spans.length
+                ? `<div class="empty">All of them with you: ${this.formatDuration(total)} in ${spans.length} stretch(es)</div>` +
+                  spans.slice(0, 100).map(x => `<div class="r" data-jump="${x.userId}" data-idx="${x.idx}">
+                    <b>${fmtSpan(x.start, x.end)}</b><span>${this.formatDuration(x.end - x.start)}</span>
+                    <span class="m">${x.channelName ? "#" + esc(x.channelName) : ""}${x.guildName ? " · " + esc(x.guildName) : ""}</span>
+                  </div>`).join("")
+                : `<div class="empty">Never all together with you${rg ? " in that period" : ""}.</div>`;
+        });
+        tChips.addEventListener("click", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const un = e.target.closest("[data-unpick]");
+            if (un) { this._vetTogether?.delete(un.getAttribute("data-unpick")); renderTimeChips(); rerender(); return; }
+            if (e.target.closest("[data-action='t-cancel']")) { this._vetTogether = null; tRes.innerHTML = ""; renderTimeChips(); rerender(); }
+        });
+        tRes.addEventListener("click", (e) => {
+            const row = e.target.closest("[data-jump]");
+            if (!row) return;
+            e.preventDefault(); e.stopPropagation();
+            const idx = row.getAttribute("data-idx");
+            jumpTo(row.getAttribute("data-jump"), idx === "" || idx == null ? null : Number(idx));
+        });
+        renderTimeChips();
+
         overlay.querySelector("[data-role='tbody']").addEventListener("click", (e) => {
             const btn = e.target.closest("[data-action]");
             if (btn) {
                 const action = btn.getAttribute("data-action");
                 const userId = btn.getAttribute("data-user-id");
                 if (!action || !userId) return;
-                e.preventDefault(); e.stopPropagation();
+                if (action !== "t-pick") e.preventDefault();
+                e.stopPropagation();
 
                 const rel = BdApi.Webpack.getByKeys("blockUser", "unblockUser", { searchExports: true });
                 const rec = this.encounters.get(userId);
@@ -3591,6 +4533,14 @@ module.exports = class VoiceEncounterTracker {
                     this._waitForRelationshipState(userId, willBeIgnored, () => rerender(), "ignored");
                 } else if (action === "remove") {
                     this.removeUser(userId);
+                    rerender();
+                } else if (action === "invite") {
+                    this._inviteDialog(overlay, userId);
+                } else if (action === "t-pick") {
+                    if (!this._vetTogether) return;
+                    if (this._vetTogether.has(userId)) this._vetTogether.delete(userId);
+                    else if (this._vetTogether.size < 5) this._vetTogether.add(userId);
+                    renderTimeChips();
                     rerender();
                 }
                 return;
@@ -3761,8 +4711,13 @@ module.exports = class VoiceEncounterTracker {
             const isExpanded = expandedId === rec.userId;
             const arrow = isExpanded ? "▼" : "▶";
 
-            const mainRow = `<tr class="vet-main-row${isExpanded ? " expanded" : ""}" data-user-id="${rec.userId}">
-                <td class="vet-num">${i + 1}</td>
+            const picking = !!this._vetTogether;
+            const picked = picking && this._vetTogether.has(rec.userId);
+            const jumpCls = this._vetJump?.userId === rec.userId ? " vet-jump" : "";
+            const mainRow = `<tr class="vet-main-row${isExpanded ? " expanded" : ""}${jumpCls}" data-user-id="${rec.userId}">
+                <td class="vet-num">${picking
+                    ? `<input type="checkbox" class="vet-pick" data-action="t-pick" data-user-id="${rec.userId}" ${picked ? "checked" : ""}>`
+                    : i + 1}</td>
                 <td class="vet-name" title="${nameTitle}">
                     <span class="vet-expand-arrow">${arrow}</span>${displayName && rawDisplay !== rawUsername
                         ? `${displayName} <span style="opacity:.55">${username}</span>`
@@ -3787,6 +4742,9 @@ module.exports = class VoiceEncounterTracker {
                         data-action="toggle-ignore" data-user-id="${rec.userId}">
                         ${rec.ignored ? "Unignore" : "Ignore"}
                     </button>
+                    <button type="button" class="vet-btn"
+                        data-action="invite" data-user-id="${rec.userId}"
+                        title="Invite to the voice channel you're in">Invite</button>
                     <button type="button" class="vet-btn remove"
                         data-action="remove" data-user-id="${rec.userId}"
                         title="Remove from history">Remove</button>
@@ -3796,10 +4754,14 @@ module.exports = class VoiceEncounterTracker {
             if (!isExpanded) return mainRow;
 
             const allSessions = Array.isArray(rec.sessions) ? rec.sessions : [];
-            const shownSessions = allSessions
-                .map((s, idx) => ({ s, idx }))
-                .reverse()
-                .slice(0, 20);
+            const reversed = allSessions.map((s, idx) => ({ s, idx })).reverse();
+            let from = 0;
+            const jumpIdx = this._vetJump?.userId === rec.userId ? this._vetJump.idx : null;
+            if (jumpIdx != null) {
+                const pos = reversed.findIndex(x => x.idx === jumpIdx);
+                if (pos >= 20) from = Math.max(0, pos - 10);
+            }
+            const shownSessions = reversed.slice(from, from + 20);
 
             const hiddenCount = allSessions.length - shownSessions.length;
             const mergeSel = this._vetMergeSel;

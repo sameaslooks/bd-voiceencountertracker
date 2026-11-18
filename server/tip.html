@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    html, body {
+        margin: 0; padding: 0; background: transparent; overflow: hidden;
+        font-family: "gg sans", "Noto Sans", "Segoe UI", sans-serif; user-select: none;
+    }
+    #tip {
+        display: inline-block; box-sizing: border-box;
+        background: rgba(17,18,20,0.97); color: #dbdee1;
+        border: 1px solid rgba(255,255,255,0.1); border-radius: 6px;
+        padding: 6px 8px; font-size: 11px; max-width: 240px;
+    }
+    .row { display: flex; justify-content: space-between; gap: 10px; white-space: nowrap; }
+    .row b { color: #fff; }
+    .muted { color: #949ba4; }
+    svg { display: block; margin-top: 5px; }
+    img.prev { width: 220px; border-radius: 4px; display: block; margin-bottom: 5px; background: #000; }
+    .v { display: flex; align-items: center; gap: 5px; padding: 1px 0; white-space: nowrap; }
+    .v img { width: 14px; height: 14px; border-radius: 50%; }
+    .v.s { color: #f0b232; }
+</style>
+</head>
+<body>
+<div id="tip"></div>
+<script>
+const API = "http://127.0.0.1:17842";
+const mode = new URLSearchParams(location.search).get("mode");
+const el = document.getElementById("tip");
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const avatarUrl = (id, a) => {
+    if (a) return `https://cdn.discordapp.com/avatars/${id}/${a}.png?size=32`;
+    let i = 0; try { i = Number((BigInt(id) >> 22n) % 6n); } catch (e) {}
+    return `https://cdn.discordapp.com/embed/avatars/${i}.png`;
+};
+function report() {
+    requestAnimationFrame(() => {
+        const r = el.getBoundingClientRect();
+        fetch(API + "/tip/size", { method: "POST", body: JSON.stringify({ w: Math.ceil(r.width), h: Math.ceil(r.height) }) }).catch(() => {});
+    });
+}
+
+// Ping: now / avg / worst over the last 10 minutes + a sparkline
+async function renderPing() {
+    let d = {};
+    try { d = await (await fetch(API + "/ping/history", { cache: "no-store" })).json(); } catch (e) {}
+    const pts = (d.points || []).filter(p => p.v > 0);
+    if (!pts.length) { el.innerHTML = `<span class="muted">No ping data</span>`; return report(); }
+    const vals = pts.map(p => p.v);
+    const max = Math.max(...vals), avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const W = 220, H = 46, t0 = d.now - 10 * 60_000;
+    const top = Math.max(100, max * 1.1);
+    const x = (t) => Math.max(0, (t - t0) / (10 * 60_000) * W);
+    const y = (v) => H - Math.min(H, v / top * H);
+    let path = "";
+    pts.forEach((p, i) => { path += (i ? "L" : "M") + x(p.t).toFixed(1) + " " + y(p.v).toFixed(1); });
+    const l200 = y(200);
+    el.innerHTML = `
+        <div class="row"><span>Now <b>${Math.round(vals[vals.length - 1])} ms</b></span><span>avg <b>${Math.round(avg)}</b> · max <b>${Math.round(max)}</b></span></div>
+        <svg width="${W}" height="${H}">
+            <rect width="${W}" height="${H}" fill="rgba(255,255,255,0.03)" rx="3"/>
+            ${l200 > 0 ? `<line x1="0" x2="${W}" y1="${l200}" y2="${l200}" stroke="#faa61a" stroke-opacity="0.35" stroke-dasharray="3 3"/>` : ""}
+            <path d="${path}" fill="none" stroke="#3ba55d" stroke-width="1.5"/>
+        </svg>
+        <div class="row muted"><span>10 min ago</span><span>now</span></div>`;
+    report();
+}
+
+// My stream: what I'm streaming + who watches
+async function renderMyLive() {
+    let st = {}, thumbs = {};
+    try { st = await (await fetch(API + "/state", { cache: "no-store" })).json(); } catch (e) {}
+    const me = (st.users || []).find(u => u.isSelf);
+    try { thumbs = (await (await fetch(API + "/sources/thumbs", { cache: "no-store" })).json()).thumbs || {}; } catch (e) {}
+    const src = me?.streamSourceId || "";
+    let url = thumbs[src];
+    if (!url && src.startsWith("screen-handle:")) url = Object.entries(thumbs).find(([k]) => k.startsWith("screen:"))?.[1];
+    const v = Array.isArray(me?.viewers) ? me.viewers : [];
+    el.innerHTML = (url ? `<img class="prev" src="${url}">` : "") +
+        (v.length ? v.map(x => `<div class="v${x.stranger ? " s" : ""}"><img src="${avatarUrl(x.userId, x.avatar)}">${esc(x.name)}${x.stranger ? " ⚠" : ""}</div>`).join("")
+                  : `<div class="v muted">No viewers</div>`);
+    report();
+}
+
+const run = mode === "mylive" ? renderMyLive : renderPing;
+run();
+setInterval(run, mode === "mylive" ? 2000 : 1000);
+</script>
+</body>
+</html>

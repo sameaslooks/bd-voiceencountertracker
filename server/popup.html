@@ -52,6 +52,15 @@
         position: relative;
         transition: background 0.1s;
     }
+    .sp-item.thumb {
+        display: flex; align-items: center; gap: 8px; padding: 4px 10px 4px 24px;
+    }
+    .sp-item .th {
+        width: 64px; height: 36px; flex-shrink: 0; border-radius: 3px; object-fit: cover;
+        background: #1e1f22; display: flex; align-items: center; justify-content: center;
+        font-size: 9px; color: #80848e;
+    }
+    .sp-item .lb { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
     .sp-item:hover {
         background: rgba(255, 255, 255, 0.06);
     }
@@ -145,7 +154,10 @@ function render() {
 
     const itemHtml = (s, label) => {
         const active = s.id === preferredId ? " active" : "";
-        return `<div class="sp-item${active}" data-id="${esc(s.id)}" title="${esc(label)}">${esc(label)}</div>`;
+        const t = thumbs[s.id];
+        const th = t ? `<img class="th" src="${t}">`
+            : `<span class="th">${s.minimized ? "minimized" : ""}</span>`;
+        return `<div class="sp-item thumb${active}" data-id="${esc(s.id)}" title="${esc(label)}">${th}<span class="lb">${esc(label)}</span></div>`;
     };
 
     const screensHtml = screens.length
@@ -184,6 +196,18 @@ function render() {
 }
 
 let soundLive = false;
+let thumbs = {};
+
+// Live previews: refreshed while the picker is open.
+async function loadThumbs() {
+    try {
+        const r = await fetch(API_SOURCES + "/thumbs", { cache: "no-store" });
+        thumbs = (await r.json()).thumbs || {};
+        render();
+    } catch (e) {}
+}
+setTimeout(loadThumbs, 50);
+setInterval(loadThumbs, 2000);
 
 async function loadAndRender() {
     try {

@@ -25,6 +25,15 @@
         background: #000;
         display: block;
     }
+    #view.zoomable { cursor: zoom-in; }
+    #view.zoomed { cursor: zoom-out; }
+    #view.panning { cursor: grabbing; }
+    #zoom-badge {
+        position: absolute; left: 6px; bottom: 6px; z-index: 7;
+        background: rgba(0,0,0,0.6); color: #fff; font-size: 10px; font-weight: 600;
+        padding: 2px 5px; border-radius: 3px; pointer-events: none; display: none;
+    }
+    #zoom-badge.show { display: block; }
     #controls {
         position: absolute; top: 0; left: 0; right: 0; height: 28px;
         display: flex; align-items: center; justify-content: flex-end; gap: 4px;
@@ -118,6 +127,7 @@
 <body>
 <div id="root">
     <canvas id="view"></canvas>
+    <div id="zoom-badge"></div>
     <img id="last-frame" alt="">
     <div id="controls">
         <button class="btn" id="btn-alpha" title="Opacity">
@@ -299,6 +309,95 @@ function probeCrop(frame, vw, vh) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Magnifier. Only in the big viewer (not preview) and only when the mouse can
+// reach the window at all (cursor visible; in a game the window is
+// click-through). Click = 2x at that point / back to 1x; wheel = 1x..4x
+// keeping the point under the cursor; drag = pan. Remembered per streamer.
+// ---------------------------------------------------------------------
+const zoom = { z: 1, cx: 0.5, cy: 0.5 };   // centre in 0..1 of the shown frame
+const ZOOM_MAX = 4;
+const elZoomBadge = document.getElementById("zoom-badge");
+
+function zoomAllowed() { return !window.__vetPreview; }
+
+// canvas pixel -> 0..1 position in the shown (cropped) frame at zoom 1
+function frameFraction(clientX, clientY) {
+    const r = elView.getBoundingClientRect();
+    const px = (clientX - r.left) / r.width, py = (clientY - r.top) / r.height;
+    // current visible window in 0..1 frame space
+    const w = 1 / zoom.z, h = 1 / zoom.z;
+    const left = Math.max(0, Math.min(1 - w, zoom.cx - w / 2));
+    const top  = Math.max(0, Math.min(1 - h, zoom.cy - h / 2));
+    return { fx: left + px * w, fy: top + py * h, px, py };
+}
+
+function setZoom(z, cx, cy, save = true) {
+    zoom.z = Math.max(1, Math.min(ZOOM_MAX, z));
+    if (zoom.z <= 1.001) { zoom.z = 1; }
+    const half = 0.5 / zoom.z;
+    zoom.cx = Math.max(half, Math.min(1 - half, cx));
+    zoom.cy = Math.max(half, Math.min(1 - half, cy));
+    elView.classList.toggle("zoomed", zoom.z > 1);
+    elZoomBadge.textContent = zoom.z.toFixed(1).replace(/\.0$/, "") + "×";
+    elZoomBadge.classList.toggle("show", zoom.z > 1);
+    if (save) saveZoomSoon();
+}
+
+let zoomSaveTimer = null;
+function saveZoomSoon() {
+    clearTimeout(zoomSaveTimer);
+    zoomSaveTimer = setTimeout(() => {
+        fetch(API_BASE + "/video/zoom", { method: "POST", body: JSON.stringify({ z: zoom.z, cx: zoom.cx, cy: zoom.cy }) }).catch(() => {});
+    }, 400);
+}
+
+function refreshZoomable() {
+    const ok = zoomAllowed();
+    elView.classList.toggle("zoomable", ok);
+    if (!ok && zoom.z > 1) setZoom(1, 0.5, 0.5, false);
+}
+
+// Called by the overlay: preview on/off, and the saved zoom for this streamer.
+window.__vetSetPreview = (on) => { window.__vetPreview = !!on; refreshZoomable(); };
+window.__vetSetZoom = (zs) => {
+    if (zs && zoomAllowed()) setZoom(Number(zs.z) || 1, Number(zs.cx) || 0.5, Number(zs.cy) || 0.5, false);
+};
+
+let dragStart = null;
+elView.addEventListener("mousedown", (e) => {
+    if (e.button !== 0 || !zoomAllowed()) return;
+    dragStart = { x: e.clientX, y: e.clientY, cx: zoom.cx, cy: zoom.cy, moved: false };
+});
+window.addEventListener("mousemove", (e) => {
+    if (!dragStart || zoom.z <= 1) return;
+    const dx = e.clientX - dragStart.x, dy = e.clientY - dragStart.y;
+    if (!dragStart.moved && Math.hypot(dx, dy) < 4) return;
+    dragStart.moved = true;
+    elView.classList.add("panning");
+    const r = elView.getBoundingClientRect();
+    setZoom(zoom.z, dragStart.cx - dx / r.width / zoom.z, dragStart.cy - dy / r.height / zoom.z);
+});
+window.addEventListener("mouseup", (e) => {
+    const d = dragStart;
+    dragStart = null;
+    elView.classList.remove("panning");
+    if (!d || d.moved || e.button !== 0 || !zoomAllowed()) return;
+    if (e.target !== elView) return;
+    if (zoom.z > 1) { setZoom(1, 0.5, 0.5); return; }
+    const { fx, fy } = frameFraction(e.clientX, e.clientY);
+    setZoom(2, fx, fy);
+});
+elView.addEventListener("wheel", (e) => {
+    if (!zoomAllowed()) return;
+    e.preventDefault();
+    const { fx, fy, px, py } = frameFraction(e.clientX, e.clientY);
+    const z = Math.max(1, Math.min(ZOOM_MAX, zoom.z * (e.deltaY < 0 ? 1.2 : 1 / 1.2)));
+    // keep the point under the cursor where it is
+    const w = 1 / z;
+    setZoom(z, fx - (px - 0.5) * w, fy - (py - 0.5) * w);
+}, { passive: false });
+
 function drawOne(frame) {
     const vw = frame.displayWidth || frame.codedWidth || frame.width;
     const vh = frame.displayHeight || frame.codedHeight || frame.height;
@@ -310,9 +409,15 @@ function drawOne(frame) {
         try { probeCrop(frame, vw, vh); } catch (e) {}
     }
 
-    const sx = crop ? crop.x : 0, sy = crop ? crop.y : 0;
-    const sw = crop ? crop.w : vw, sh = crop ? crop.h : vh;
+    let sx = crop ? crop.x : 0, sy = crop ? crop.y : 0;
+    let sw = crop ? crop.w : vw, sh = crop ? crop.h : vh;
     reportAspect(sw, sh);
+    if (zoom.z > 1) {
+        const zw = sw / zoom.z, zh = sh / zoom.z;
+        sx += Math.max(0, Math.min(sw - zw, zoom.cx * sw - zw / 2));
+        sy += Math.max(0, Math.min(sh - zh, zoom.cy * sh - zh / 2));
+        sw = zw; sh = zh;
+    }
     const cw = elView.width;
     const ch = elView.height;
     const scale = Math.min(cw / sw, ch / sh);
