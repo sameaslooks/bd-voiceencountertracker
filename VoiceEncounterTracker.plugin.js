@@ -1963,8 +1963,14 @@ module.exports = class VoiceEncounterTracker {
 
         if (action === "watch-stream") {
             if (!userId) return;
-            BdApi.Logger.info(this.meta.name, "watch-stream requested for", userId);
-            this._watchStream(userId);
+            vetLog("info", "watch-stream requested for", userId);
+            this._watchStream(userId, { reconnect: cmd.name === "reconnect" });
+            return;
+        }
+
+        if (action === "stop-stream") {
+            vetLog("info", "stop-stream requested (viewer closed)");
+            this._stopFramePump();
             return;
         }
 
@@ -2173,7 +2179,7 @@ module.exports = class VoiceEncounterTracker {
         }
     }
 
-    async _watchStream(userId) {
+    async _watchStream(userId, { reconnect = false } = {}) {
         try {
             const me = this.getCurrentUserId();
             const mySession = this.active.get(me);
@@ -2185,13 +2191,17 @@ module.exports = class VoiceEncounterTracker {
             const streamKey = mySession.guildId
                 ? `guild:${mySession.guildId}:${mySession.channelId}:${userId}`
                 : `call:${mySession.channelId}:${userId}`;
-            BdApi.Logger.info(this.meta.name, "_watchStream: key =", streamKey);
+            vetLog("info", "_watchStream: key =", streamKey);
 
-            this._postJSON("/video/open", { userId, streamKey });
+            if (!reconnect) this._postJSON("/video/open", { userId, streamKey });
 
-            if (this._watchedUserId === userId && this._framePump) {
-                BdApi.Logger.info(this.meta.name, "_watchStream: already watching, reusing");
+            if (!reconnect && this._watchedUserId === userId && this._framePump) {
+                vetLog("info", "_watchStream: already watching, reusing");
                 return true;
+            }
+            if (reconnect) {
+                vetLog("info", "_watchStream: reconnect for", userId);
+                this._stopFramePump();
             }
 
             const stream = await this._watchStreamByUserId(userId);
@@ -2227,6 +2237,9 @@ module.exports = class VoiceEncounterTracker {
             }
         }
 
+        const reused = await this._reuseDiscordWatch(userId);
+        if (reused) return reused;
+
         const before = new Set(document.querySelectorAll("video"));
 
         const streamWatch = BdApi.Webpack.getByStrings("STREAM_WATCH", "allowMultiple", { searchExports: true });
@@ -2255,7 +2268,8 @@ module.exports = class VoiceEncounterTracker {
 
         const streamId = this._extractStreamId(video);
         if (streamId) {
-            BdApi.Logger.info(this.meta.name, "streamId =", streamId);
+            vetLog("info", "streamId =", streamId);
+            (this._streamIdByUser ||= {})[userId] = streamId;
 
             const nz = this._findNzFunction();
             if (typeof nz === "function") {
@@ -2302,9 +2316,57 @@ module.exports = class VoiceEncounterTracker {
         }
     }
 
+    // If Discord already watches this user's stream, take its video without
+    // dispatching STREAM_WATCH again (that makes Discord drop and rejoin the stream).
+    async _reuseDiscordWatch(userId) {
+        let active = [];
+        try {
+            const ass = BdApi.Webpack.getStore("ApplicationStreamingStore");
+            active = (ass?.getAllActiveStreams?.() || []).filter(x => x && x.state !== "ENDED");
+        } catch (e) {}
+        const mine = active.find(x => String(x.ownerId) === String(userId));
+        vetLog("info", "_reuseDiscordWatch: active streams =",
+            active.map(x => `${x.ownerId}:${x.state}`).join(","), "match:", !!mine);
+        if (!mine) return null;
+
+        // 1) Native track via Discord's stream id
+        let sid = null;
+        try {
+            const vss = BdApi.Webpack.getStore("VideoStreamStore");
+            sid = vss?.getStreamId?.(userId, "stream") ?? null;
+        } catch (e) {}
+        if (!sid && active.length === 1 && this._streamIdByUser?.[userId]) sid = this._streamIdByUser[userId];
+        if (sid) {
+            const nz = this._findNzFunction();
+            if (typeof nz === "function") {
+                try {
+                    const handle = nz(String(sid));
+                    const t = handle?.stream?.getVideoTracks?.()[0];
+                    if (t) {
+                        this._nativeStreamHandle = handle;
+                        vetLog("info", "_reuseDiscordWatch: native track via streamId", sid);
+                        return new MediaStream([t]);
+                    }
+                } catch (e) { vetLog("warn", "_reuseDiscordWatch nz failed:", e); }
+            }
+        }
+
+        // 2) Discord's own <video> element (only safe when exactly one stream is watched)
+        if (active.length === 1) {
+            const v = this._findLiveVideoForStream() || await this._waitForLiveVideo(3000);
+            const t = v?.srcObject?.getVideoTracks?.()[0];
+            if (t) {
+                vetLog("info", "_reuseDiscordWatch: cloned track from Discord video element");
+                try { return new MediaStream([t.clone()]); } catch (e) { return new MediaStream([t]); }
+            }
+        }
+        vetLog("warn", "_reuseDiscordWatch: watched in Discord but no track found, will dispatch");
+        return null;
+    }
+
     _extractStreamId(video) {
         if (this._lastDiscordStreamId) {
-            BdApi.Logger.info(this.meta.name, "_extractStreamId: using nz-patched streamId:",
+            vetLog("info", "_extractStreamId: using nz-patched streamId:",
                 this._lastDiscordStreamId);
             return String(this._lastDiscordStreamId);
         }
@@ -2390,16 +2452,21 @@ module.exports = class VoiceEncounterTracker {
 
         const pc = new RTCPeerConnection({ iceServers: [] });
         this._watchPeer = pc;
+        let statsTimer = null;
+        let statsPrevPackets = 0;
 
         pc.onconnectionstatechange = () => {
-            BdApi.Logger.info(this.meta.name, "watch peer state:", pc.connectionState);
+            vetLog("info", "watch peer state:", pc.connectionState);
             if (pc.connectionState === "failed") {
-                BdApi.Logger.warn(this.meta.name, "watch peer failed");
+                vetLog("warn", "watch peer failed");
             }
         };
 
         for (const track of stream.getTracks()) {
             pc.addTrack(track, stream);
+            track.addEventListener("ended", () => vetLog("warn", "watch source track ENDED", track.kind));
+            track.addEventListener("mute", () => vetLog("warn", "watch source track MUTED", track.kind));
+            track.addEventListener("unmute", () => vetLog("info", "watch source track unmuted", track.kind));
         }
 
         try {
@@ -2409,17 +2476,31 @@ module.exports = class VoiceEncounterTracker {
                 if (!params.encodings || params.encodings.length === 0) {
                     params.encodings = [{}];
                 }
-                params.encodings[0].maxBitrate = 20_000_000;
+                params.encodings[0].maxBitrate = 8_000_000;
+                params.encodings[0].scaleResolutionDownBy = 1;
                 params.encodings[0].networkPriority = "high";
                 params.encodings[0].priority = "high";
-                params.encodings[0].degradationPreference = "maintain-framerate";
+                params.encodings[0].degradationPreference = "maintain-resolution";
                 await sender.setParameters(params);
-                BdApi.Logger.info(this.meta.name, "sender tuned (pre-offer):",
+                vetLog("info", "sender tuned (pre-offer):",
                     JSON.stringify(params.encodings[0]));
             }
         } catch (e) {
-            BdApi.Logger.warn(this.meta.name, "pre-offer setParameters failed:", e.message);
+            vetLog("warn", "pre-offer setParameters failed:", e.message);
         }
+
+        try {
+            const caps = RTCRtpSender.getCapabilities?.("video");
+            if (caps?.codecs) {
+                const h264 = caps.codecs.filter(c => c.mimeType === "video/H264");
+                const rest = caps.codecs.filter(c => c.mimeType !== "video/H264");
+                const tr = pc.getTransceivers().find(t => t.sender.track?.kind === "video");
+                if (tr && h264.length) {
+                    tr.setCodecPreferences([...h264, ...rest]);
+                    vetLog("info", "watch peer: preferring H264");
+                }
+            }
+        } catch (e) { vetLog("warn", "setCodecPreferences failed:", e.message); }
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
@@ -2476,24 +2557,36 @@ module.exports = class VoiceEncounterTracker {
                 if (!params.encodings || params.encodings.length === 0) {
                     params.encodings = [{}];
                 }
-                params.encodings[0].maxBitrate = 20_000_000;
-                params.encodings[0].degradationPreference = "maintain-framerate";
+                params.encodings[0].maxBitrate = 8_000_000;
+                params.encodings[0].scaleResolutionDownBy = 1;
+                params.encodings[0].degradationPreference = "maintain-resolution";
                 params.encodings[0].networkPriority = "high";
                 params.encodings[0].priority = "high";
                 await sender.setParameters(params);
-                setInterval(async () => {
+                statsTimer = setInterval(async () => {
+                    if (pc.connectionState === "closed" || this._watchPeer !== pc) {
+                        clearInterval(statsTimer); statsTimer = null; return;
+                    }
                     try {
                         const stats = await pc.getStats();
                         stats.forEach(r => {
                             if (r.type === "outbound-rtp" && r.kind === "video") {
-                                console.log("[sender]", {
+                                const pktPerSec = r.packetsSent - (statsPrevPackets || r.packetsSent);
+                                statsPrevPackets = r.packetsSent;
+                                vetLog("info", "[sender]", {
                                     fps: r.framesPerSecond,
                                     bitrate: r.targetBitrate,
                                     dropped: r.framesDropped,
                                     encoded: r.framesEncoded,
                                     packetsSent: r.packetsSent,
+                                    pktPerSec,
+                                    pacerDelayMs: r.packetsSent ? Math.round((r.totalPacketSendDelay || 0) / r.packetsSent * 1000) : null,
                                     retransmits: r.retransmittedPacketsSent,
                                     nackCount: r.nackCount,
+                                    res: `${r.frameWidth}x${r.frameHeight}`,
+                                    limit: r.qualityLimitationReason,
+                                    encoder: r.encoderImplementation,
+                                    encMsPerFrame: r.framesEncoded ? Math.round(r.totalEncodeTime / r.framesEncoded * 1000) : null,
                                 });
                             }
                         });
@@ -2509,6 +2602,7 @@ module.exports = class VoiceEncounterTracker {
 
         this._framePump = {
             stop: () => {
+                if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
                 try { pc.close(); } catch (e) {}
                 this._watchPeer = null;
                 this._framePump = null;

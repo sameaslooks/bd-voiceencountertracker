@@ -65,6 +65,42 @@
     #alpha-range { width: 120px; accent-color: #5865f2; }
     #alpha-val { width: 32px; text-align: right; font-variant-numeric: tabular-nums; opacity: 0.8; }
 
+    #reconnect {
+        position: absolute; inset: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: rgba(0,0,0,0.55);
+        backdrop-filter: blur(6px) grayscale(0.6) brightness(0.6);
+        -webkit-backdrop-filter: blur(6px) grayscale(0.6) brightness(0.6);
+        pointer-events: none; z-index: 6;
+        opacity: 0; transition: opacity 0.25s ease;
+    }
+    #reconnect.show { opacity: 1; }
+    #reconnect .card {
+        display: flex; align-items: center; gap: 10px;
+        padding: 8px 14px 8px 10px;
+        background: rgba(18,19,22,0.78);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 8px;
+        box-shadow: 0 4px 18px rgba(0,0,0,0.45);
+        max-width: calc(100% - 24px);
+    }
+    #reconnect .spinner {
+        flex: none;
+        width: 18px; height: 18px;
+        border: 2px solid rgba(255,255,255,0.15);
+        border-top-color: #5865f2;
+        border-radius: 50%;
+        animation: vet-spin 0.8s linear infinite;
+    }
+    #reconnect .text { display: flex; flex-direction: column; min-width: 0; }
+    #reconnect .title { font-size: 12px; font-weight: 600; color: #f2f3f5; white-space: nowrap; }
+    #reconnect .sub {
+        font-size: 11px; color: #949ba4; margin-top: 1px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #reconnect .sub:empty { display: none; }
+    @keyframes vet-spin { to { transform: rotate(360deg); } }
+
     #status {
         position: absolute; inset: 0;
         display: flex; align-items: center; justify-content: center;
@@ -96,6 +132,15 @@
         <span id="alpha-val">100%</span>
     </div>
     <div id="status">Waiting for stream…</div>
+    <div id="reconnect">
+        <div class="card">
+            <div class="spinner"></div>
+            <div class="text">
+                <div class="title" id="reconnect-text">Reconnecting…</div>
+                <div class="sub" id="reconnect-sub"></div>
+            </div>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -107,13 +152,19 @@ const ctx = elView.getContext("2d", { alpha: false });
 let pc = null;
 let readerLoopRunning = false;
 
-const FRAME_HOLD = 1000 / 65;
-const MAX_HOLD = 2;
-const FRAME_BUFFER = [];
-let lastShownFrame = null;
-let lastFrameWall = 0;
+// Smooth playout. The source delivers frames in bursts (gaps of 200-350 ms
+// about once a second, with matching timestamps, so WebRTC's own jitter buffer
+// can't fix it). We copy every decoded frame into an ImageBitmap right away
+// (and close the VideoFrame so the decoder pool is never starved), queue the
+// bitmaps and show them at an even pace, keeping ~BUFFER_MS of frames in stock.
+const BUFFER_MS = 500;          // target stock; must exceed the largest burst gap (seen up to ~375 ms)
+const MAX_BUFFER_MS = 900;      // above this, drop old frames to catch up
+const queue = [];               // ImageBitmap[]
+let srcFps = 60;                // measured input rate (EMA)
+const arrivals = [];
+let nextDue = 0;
+let playing = false;
 let raf = 0;
-
 function log(...args) { console.log("[video]", ...args); }
 function setStatus(txt) {
     if (!elStatus) return;
@@ -132,53 +183,200 @@ function fitCanvas() {
 window.addEventListener("resize", fitCanvas);
 fitCanvas();
 
+// Tell the overlay the stream's aspect ratio so the window keeps it (no black bars).
+let reportedAspect = 0;
+function reportAspect(w, h) {
+    const a = w / h;
+    if (Math.abs(a - reportedAspect) < 0.01) return;
+    reportedAspect = a;
+    fetch(API_BASE + "/video/aspect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ width: w, height: h })
+    }).catch(() => {});
+}
+
+// ── Black-bar detection ──
+// Discord often pads the picture (e.g. 16:9 content inside a 16:10 frame).
+// To avoid cropping dark scenes, a crop is accepted only when:
+//   - the bars are symmetric (top≈bottom or left≈right), and
+//   - what remains has a standard aspect ratio (16:9, 21:9, 4:3, ...), and
+//   - the same result is seen 3 probes in a row (~4.5 s).
+// Once set, the crop is NOT dropped in dark scenes; it is dropped only when
+// picture content shows up inside the bar area, or the resolution changes.
+const probe = document.createElement("canvas");
+const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+let crop = null;            // { x, y, w, h, vw, vh } in source pixels
+let cropCandidate = null;
+let cropHits = 0;
+let barContentHits = 0;
+let lastProbeAt = 0;
+const STD_ASPECTS = [16/9, 21/9, 64/27, 32/9, 4/3, 16/10];
+
+function isDarkLine(data, w, idx, horizontal, from, to) {
+    let bright = 0;
+    const n = to - from;
+    for (let i = from; i < to; i += 2) {
+        const p = horizontal ? (idx * w + i) * 4 : (i * w + idx) * 4;
+        if (data[p] + data[p + 1] + data[p + 2] > 3 * 24) { if (++bright > n * 0.02) return false; }
+    }
+    return true;
+}
+
+function readProbe(frame, vw, vh) {
+    const pw = 192, ph = Math.max(1, Math.round(pw * vh / vw));
+    if (probe.width !== pw || probe.height !== ph) { probe.width = pw; probe.height = ph; }
+    probeCtx.drawImage(frame, 0, 0, pw, ph);
+    return { data: probeCtx.getImageData(0, 0, pw, ph).data, pw, ph };
+}
+
+function detectBars(data, pw, ph, vw, vh) {
+    let top = 0, bottom = 0, left = 0, right = 0;
+    while (top < ph / 3 && isDarkLine(data, pw, top, true, 0, pw)) top++;
+    while (bottom < ph / 3 && isDarkLine(data, pw, ph - 1 - bottom, true, 0, pw)) bottom++;
+    while (left < pw / 3 && isDarkLine(data, pw, left, false, 0, ph)) left++;
+    while (right < pw / 3 && isDarkLine(data, pw, pw - 1 - right, false, 0, ph)) right++;
+    if (top >= ph / 3 || left >= pw / 3) return undefined;          // too dark to tell
+
+    const sym = (a, b, n) => a > 1 && b > 1 && Math.abs(a - b) <= Math.max(2, n * 0.02);
+    const vert = sym(top, bottom, ph), horiz = sym(left, right, pw);
+    if (!vert && !horiz) return null;
+
+    const sx = vw / pw, sy = vh / ph;
+    const t = vert ? (top + 1) * sy : 0, b = vert ? (bottom + 1) * sy : 0;
+    const l = horiz ? (left + 1) * sx : 0, r = horiz ? (right + 1) * sx : 0;
+    const c = { x: Math.round(l), y: Math.round(t), w: Math.round(vw - l - r), h: Math.round(vh - t - b), vw, vh };
+    const aspect = c.w / c.h;
+    if (!STD_ASPECTS.some(a => Math.abs(aspect - a) / a < 0.04)) return null;
+    // Snap height/width to the exact standard ratio (centred) to avoid a dark fringe.
+    const std = STD_ASPECTS.find(a => Math.abs(aspect - a) / a < 0.04);
+    if (vert) { const h = Math.round(c.w / std); c.y += Math.round((c.h - h) / 2); c.h = h; }
+    else { const w = Math.round(c.h * std); c.x += Math.round((c.w - w) / 2); c.w = w; }
+    return c;
+}
+
+// Is there picture content inside the currently cropped-off area?
+function barsHaveContent(data, pw, ph) {
+    const ty = Math.floor(crop.y * ph / crop.vh) - 1;
+    const by = Math.ceil((crop.y + crop.h) * ph / crop.vh) + 1;
+    const lx = Math.floor(crop.x * pw / crop.vw) - 1;
+    const rx = Math.ceil((crop.x + crop.w) * pw / crop.vw) + 1;
+    for (let y = 0; y < ty; y++) if (!isDarkLine(data, pw, y, true, 0, pw)) return true;
+    for (let y = by; y < ph; y++) if (!isDarkLine(data, pw, y, true, 0, pw)) return true;
+    for (let x = 0; x < lx; x++) if (!isDarkLine(data, pw, x, false, 0, ph)) return true;
+    for (let x = rx; x < pw; x++) if (!isDarkLine(data, pw, x, false, 0, ph)) return true;
+    return false;
+}
+
+function sameCrop(a, b) {
+    if (!a || !b) return a === b;
+    return Math.abs(a.x - b.x) < 4 && Math.abs(a.y - b.y) < 4 && Math.abs(a.w - b.w) < 6 && Math.abs(a.h - b.h) < 6;
+}
+
+function probeCrop(frame, vw, vh) {
+    if (crop && (crop.vw !== vw || crop.vh !== vh)) { crop = null; log("crop reset: resolution changed"); }
+    const { data, pw, ph } = readProbe(frame, vw, vh);
+    if (crop) {
+        // Keep the crop through dark scenes; drop it only if the bars show picture.
+        if (barsHaveContent(data, pw, ph)) {
+            if (++barContentHits >= 2) { crop = null; barContentHits = 0; log("crop removed: content in bar area"); }
+        } else barContentHits = 0;
+        return;
+    }
+    const c = detectBars(data, pw, ph, vw, vh);
+    if (!c) { cropCandidate = null; cropHits = 0; return; }
+    if (sameCrop(c, cropCandidate)) cropHits++; else { cropCandidate = c; cropHits = 1; }
+    if (cropHits >= 3) {
+        crop = c; cropHits = 0;
+        log("crop", `${c.w}x${c.h}+${c.x}+${c.y}`, "of", `${vw}x${vh}`);
+    }
+}
+
 function drawOne(frame) {
-    const vw = frame.displayWidth || frame.codedWidth;
-    const vh = frame.displayHeight || frame.codedHeight;
+    const vw = frame.displayWidth || frame.codedWidth || frame.width;
+    const vh = frame.displayHeight || frame.codedHeight || frame.height;
     if (!vw || !vh) return;
+
+    const now = performance.now();
+    if (now - lastProbeAt > 1500) {
+        lastProbeAt = now;
+        try { probeCrop(frame, vw, vh); } catch (e) {}
+    }
+
+    const sx = crop ? crop.x : 0, sy = crop ? crop.y : 0;
+    const sw = crop ? crop.w : vw, sh = crop ? crop.h : vh;
+    reportAspect(sw, sh);
     const cw = elView.width;
     const ch = elView.height;
-    const scale = Math.min(cw / vw, ch / vh);
-    const dw = vw * scale, dh = vh * scale;
+    const scale = Math.min(cw / sw, ch / sh);
+    const dw = sw * scale, dh = sh * scale;
     const dx = (cw - dw) / 2, dy = (ch - dh) / 2;
-    if (dw < cw || dh < ch) {
+    if (dw < cw - 1 || dh < ch - 1) {
         ctx.fillStyle = "#000";
         ctx.fillRect(0, 0, cw, ch);
     }
-    ctx.drawImage(frame, dx, dy, dw, dh);
+    ctx.drawImage(frame, sx, sy, sw, sh, dx, dy, dw, dh);
 }
 
-function tick() {
-    raf = 0;
-    if (FRAME_BUFFER.length === 0) return;
+function targetFrames() { return Math.max(4, Math.round(BUFFER_MS * srcFps / 1000)); }
 
+function tick(now) {
+    raf = requestAnimationFrame(tick);
+    bump("raf");
+    const target = targetFrames();
+    const maxFrames = Math.round(MAX_BUFFER_MS * srcFps / 1000);
+
+    while (queue.length > maxFrames) { try { queue.shift().close(); } catch (e) {} gap.dropped++; }
+
+    if (!playing) {
+        if (queue.length < target) return;
+        playing = true;
+        nextDue = now;
+    }
+    if (queue.length === 0) { playing = false; gap.underruns++; return; }
+    if (now < nextDue) return;
+
+    // Base step from the source rate, nudged by how far the stock is from target
+    // so the buffer neither drains nor grows over time.
+    const base = 1000 / srcFps;
+    const k = Math.max(-0.15, Math.min(0.15, (queue.length - target) / target * 0.15));
+    const step = base * (1 - k);
+    nextDue += step;
+    if (now - nextDue > 100) nextDue = now + step;   // fell far behind (tab hidden etc.)
+
+    const bmp = queue.shift();
+    const t0 = performance.now();
+    try { drawOne(bmp); } catch (e) { log("draw error:", e.message); }
+    gap.slowDraw = Math.max(gap.slowDraw, performance.now() - t0);
+    bump("draw");
+    try { bmp.close(); } catch (e) {}
+}
+
+function startPlayout() { if (!raf) raf = requestAnimationFrame(tick); }
+
+function clearQueue() {
+    while (queue.length) { try { queue.shift().close(); } catch (e) {} }
+    playing = false;
+}
+
+async function enqueueFrame(frame) {
     const now = performance.now();
-    if (now - lastFrameWall < FRAME_HOLD) {
-        raf = requestAnimationFrame(tick);
-        return;
+    // Input rate = frames that arrived in the last 2 s (bursts average out).
+    arrivals.push(now);
+    while (arrivals.length && now - arrivals[0] > 2000) arrivals.shift();
+    if (arrivals.length > 10 && now - arrivals[0] > 500) {
+        const measured = (arrivals.length - 1) * 1000 / (now - arrivals[0]);
+        srcFps = Math.max(10, Math.min(120, measured));
     }
-    lastFrameWall = now;
-
-    let newest = null;
-    while (FRAME_BUFFER.length > 0) {
-        const f = FRAME_BUFFER.shift();
-        if (newest) { try { newest.frame.close(); } catch(e){} }
-        newest = f;
-    }
-    if (newest) {
-        if (lastShownFrame) { try { lastShownFrame.close(); } catch(e){} }
-        lastShownFrame = newest.frame;
-        drawOne(lastShownFrame);
-    }
-}
-
-function enqueueFrame(frame) {
-    while (FRAME_BUFFER.length >= MAX_HOLD) {
-        const dropped = FRAME_BUFFER.shift();
-        try { dropped.frame.close(); } catch(e){}
-    }
-    FRAME_BUFFER.push({ frame });
-    if (!raf) raf = requestAnimationFrame(tick);
+    let bmp = null;
+    try { bmp = await createImageBitmap(frame); }
+    catch (e) { log("createImageBitmap:", e.message); }
+    finally { try { frame.close(); } catch (e) {} }
+    if (!bmp) return;
+    queue.push(bmp);
+    lastFrameAt = performance.now();
+    if (reconnecting) endReconnect();
+    startPlayout();
 }
 
 async function startReader(track) {
@@ -189,7 +387,7 @@ async function startReader(track) {
     }
     if (readerLoopRunning) return;
     readerLoopRunning = true;
-    const processor = new MediaStreamTrackProcessor({ track });
+    const processor = new MediaStreamTrackProcessor({ track, maxBufferSize: 1 });
     const reader = processor.readable.getReader();
     log("reader started");
     setStatus("");
@@ -197,6 +395,8 @@ async function startReader(track) {
         while (true) {
             const { done, value: frame } = await reader.read();
             if (done) { log("reader done"); break; }
+            framesFromReader++;
+            bump("reader");
             enqueueFrame(frame);
         }
     } catch (e) {
@@ -206,16 +406,115 @@ async function startReader(track) {
     }
 }
 
+// Diagnostics: once a second log what the receiver got/decoded/froze.
+let statsTimer = null;
+let framesFromReader = 0;
+// Largest gap (ms) between consecutive frames per second, at each stage:
+// reader = frame came out of the decoder, draw = frame painted, raf = rAF ticks.
+const gap = { dropped: 0, underruns: 0, reader: 0, draw: 0, raf: 0, lastReader: 0, lastDraw: 0, lastRaf: 0, slowDraw: 0 };
+function bump(kind) {
+    const now = performance.now();
+    const k = "last" + kind[0].toUpperCase() + kind.slice(1);
+    if (gap[k]) gap[kind] = Math.max(gap[kind], now - gap[k]);
+    gap[k] = now;
+}
+
+function startStatsLog() {
+    if (statsTimer) clearInterval(statsTimer);
+    let prev = null;
+    statsTimer = setInterval(async () => {
+        if (!pc) return;
+        try {
+            const st = await pc.getStats();
+            st.forEach(r => {
+                if (r.type !== "inbound-rtp" || r.kind !== "video") return;
+                const d = (k) => prev ? (r[k] || 0) - (prev[k] || 0) : 0;
+                log("stats", JSON.stringify({
+                    recv: d("framesReceived"), dec: d("framesDecoded"),
+                    drop: d("framesDropped"), reader: framesFromReader,
+                    lost: d("packetsLost"), nack: d("nackCount"),
+                    pli: d("pliCount"), fir: d("firCount"),
+                    freezes: r.freezeCount, keyframes: r.keyFramesDecoded,
+                    jitterMs: Math.round((r.jitter || 0) * 1000),
+                    decoder: r.decoderImplementation,
+                    res: `${r.frameWidth}x${r.frameHeight}`,
+                    fpsIn: r.framesPerSecond,
+                    maxGapReader: Math.round(gap.reader),
+                    maxGapDraw: Math.round(gap.draw),
+                    maxGapRaf: Math.round(gap.raf),
+                    slowDrawMs: Math.round(gap.slowDraw),
+                    queue: queue.length, target: targetFrames(), srcFps: Math.round(srcFps),
+                    underruns: gap.underruns, dropped: gap.dropped,
+                    jbDelayMs: r.jitterBufferEmittedCount ? Math.round(r.jitterBufferDelay / r.jitterBufferEmittedCount * 1000) : null
+                }));
+                prev = r;
+            });
+            framesFromReader = 0;
+            gap.reader = gap.draw = gap.raf = gap.slowDraw = gap.underruns = gap.dropped = 0;
+        } catch (e) {}
+    }, 1000);
+}
+
+// ---------------------------------------------------------------------
+// Stall watchdog: no frames for STALL_MS (or connection lost) -> dim the
+// last frame, show a spinner, and ask the overlay to reconnect. The overlay
+// only forwards it to the plugin while the stream is still live; otherwise
+// it closes this window on its own.
+// ---------------------------------------------------------------------
+const STALL_MS = 3000;
+const RECONNECT_EVERY_MS = 8000;
+let lastFrameAt = 0;
+let reconnecting = false;
+let reconnectSince = 0;
+let lastReconnectReq = 0;
+let reconnectAttempts = 0;
+const elReconnect = document.getElementById("reconnect");
+const elReconnectSub = document.getElementById("reconnect-sub");
+
+function startReconnect(reason) {
+    if (!reconnecting) {
+        reconnecting = true;
+        reconnectSince = performance.now();
+        reconnectAttempts = 0;
+        log("stall detected:", reason);
+        elReconnect.classList.add("show");
+    }
+}
+
+function endReconnect() {
+    reconnecting = false;
+    elReconnect.classList.remove("show");
+    log("stream resumed after", Math.round(performance.now() - reconnectSince), "ms,", reconnectAttempts, "attempt(s)");
+}
+
+async function requestReconnect() {
+    lastReconnectReq = performance.now();
+    reconnectAttempts++;
+    elReconnectSub.textContent = reconnectAttempts > 1 ? "Attempt " + reconnectAttempts : "";
+    try {
+        const r = await fetch(API_BASE + "/video/reconnect", { method: "POST" });
+        const d = await r.json();
+        log("reconnect request #" + reconnectAttempts, JSON.stringify(d));
+        if (d && d.pluginAlive === false) elReconnectSub.textContent = "Discord plugin not responding";
+        else if (d && d.live === false) elReconnectSub.textContent = "Stream not found";
+    } catch (e) {
+        log("reconnect request failed:", e.message);
+    }
+}
+
+setInterval(() => {
+    if (!lastFrameAt) return;           // never started yet
+    const now = performance.now();
+    if (!reconnecting && now - lastFrameAt > STALL_MS) startReconnect("no frames for " + Math.round(now - lastFrameAt) + " ms");
+    if (reconnecting && now - lastReconnectReq > RECONNECT_EVERY_MS) requestReconnect();
+}, 500);
+
 async function handleOffer({ sdp, candidates }) {
     if (!sdp) return;
     log("offer received");
     if (pc) { try { pc.close(); } catch(e){} pc = null; }
     if (raf) { try { cancelAnimationFrame(raf); } catch(e){} raf = 0; }
-    while (FRAME_BUFFER.length) {
-        try { FRAME_BUFFER.shift().frame.close(); } catch(e){}
-    }
-    if (lastShownFrame) { try { lastShownFrame.close(); } catch(e){} lastShownFrame = null; }
-    lastFrameWall = 0;
+    clearQueue();
 
     pc = new RTCPeerConnection({ iceServers: [] });
 
@@ -223,12 +522,8 @@ async function handleOffer({ sdp, candidates }) {
         log("ontrack", event.track.kind);
         if (event.track.kind !== "video") return;
 
-        pc.getReceivers().forEach(r => {
-            try { r.jitterBufferTarget = 0; } catch (e) {}
-            try { r.playoutDelayHint = 0; } catch (e) {}
-        });
-
         setStatus("");
+        startStatsLog();
 
         // WebCodecs pipeline — читаем кадры напрямую с трека.
         // <video> не нужен — рисуем через <canvas> в drawOne().
@@ -237,15 +532,12 @@ async function handleOffer({ sdp, candidates }) {
 
     pc.onconnectionstatechange = () => {
         log("conn state:", pc.connectionState);
+        if ((pc.connectionState === "failed" || pc.connectionState === "disconnected") && lastFrameAt) {
+            startReconnect("connection " + pc.connectionState);
+        }
         if (pc.connectionState === "connected") {
             setStatus("");
-            pc.getReceivers().forEach(r => {
-                try { r.jitterBufferTarget = 0; } catch (e) {}
-                try { r.playoutDelayHint = 0; } catch (e) {}
-            });
         }
-        else if (pc.connectionState === "failed") setStatus("Connection failed");
-        else if (pc.connectionState === "disconnected") setStatus("Connection lost");
     };
 
     try { await pc.setRemoteDescription(sdp); }

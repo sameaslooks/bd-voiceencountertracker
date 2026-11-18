@@ -807,6 +807,10 @@ function startServer() {
                 const parsed = JSON.parse(body);
                 _webrtcOffer = parsed.offer || null;
                 _webrtcOfferCandidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
+                // A new offer invalidates the previous answer; otherwise the plugin
+                // picks up the stale one and the new connection never comes up.
+                _webrtcAnswer = null;
+                _webrtcAnswerCandidates = [];
 
                 if (videoWindow && !videoWindow.isDestroyed()) {
                     try {
@@ -884,6 +888,23 @@ function startServer() {
             jsonReply(res, 200, { ok: true });
             return;
         }
+        if (req.method === "POST" && url === "/video/aspect") {
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                applyVideoAspect(Number(d.width), Number(d.height));
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/video/reconnect") {
+            const live = isVideoStreamLive(_videoUserId);
+            if (live) {
+                videoLog("reconnect requested by viewer for", _videoUserId);
+                queuePluginCommand("watch-stream", _videoUserId, "reconnect");
+            }
+            jsonReply(res, 200, { ok: true, live, pluginAlive: isPluginAlive() });
+            return;
+        }
         if (req.method === "POST" && url === "/video/preview") {
             toggleVideoPreview();
             jsonReply(res, 200, { ok: true });
@@ -942,6 +963,7 @@ function startServer() {
                 jsonReply(res, 200, { ok: true });
                 broadcastState();
                 applyAutoResizeAll();
+                checkVideoAutoClose();
                 if (state.streamSound !== prevSound) {
                     try { rebuildTrayMenu(); } catch (e) {}
                 }
@@ -1670,6 +1692,8 @@ function wireVideoWindowIpc(win) {
         if (Number.isFinite(v)) {
             _videoAlpha = v;
             try { win.setOpacity(v); } catch (e) {}
+            videoPrefs().alpha = v;
+            saveSettingsSoon();
         }
     });
 
@@ -1677,14 +1701,22 @@ function wireVideoWindowIpc(win) {
 }
 
 function openVideoWindow(params) {
+    if (params && params.userId) { _videoUserId = String(params.userId); _videoNotLiveSince = 0; }
     if (videoWindow && !videoWindow.isDestroyed()) {
-        videoWindow.focus();
+        if (!videoWindow.isVisible()) videoWindow.showInactive();
         return;
     }
+    const vp = videoPrefs();
+    if (typeof vp.alpha === "number") _videoAlpha = Math.max(0.2, Math.min(1, vp.alpha));
+    _videoPreviewState = !!vp.preview && boundsOnScreen(vp.previewBounds);
+    const startBounds = _videoPreviewState ? vp.previewBounds
+        : (boundsOnScreen(vp.bounds) ? vp.bounds : null);
+    _videoSavedBounds = boundsOnScreen(vp.bounds) ? vp.bounds : null;
     videoWindow = new BrowserWindow({
-        width: 640, height: 380, minWidth: 320, minHeight: 200,
+        width: 640, height: 380, minWidth: 160, minHeight: 90,
+        ...(startBounds || {}),
         frame: false, transparent: true, backgroundColor: "#00000000",
-        alwaysOnTop: true, resizable: true, skipTaskbar: false, hasShadow: true,
+        alwaysOnTop: true, resizable: true, skipTaskbar: true, hasShadow: true,
         show: false,
         webPreferences: {
             nodeIntegration: false,
@@ -1699,6 +1731,9 @@ function openVideoWindow(params) {
     videoWindow.loadFile(path.join(__dirname, "video.html"));
 
     wireVideoWindowIpc(videoWindow);
+    wireVideoWindowLogging(videoWindow);
+    videoWindow.on("move", saveVideoBoundsSoon);
+    videoWindow.on("resize", saveVideoBoundsSoon);
 
     videoWindow.webContents.once("did-finish-load", () => {
         try {
@@ -1710,13 +1745,18 @@ function openVideoWindow(params) {
         } catch (e) {}
     });
 
+    // Don't steal focus from the game: a focused viewer stops the overlay's
+    // fullscreen click-through/transparency.
     videoWindow.once("ready-to-show", () => {
-        videoWindow.show();
-        videoWindow.focus();
+        videoWindow.showInactive();
     });
 
     videoWindow.on("closed", () => {
         videoWindow = null;
+        if (_videoUserId) queuePluginCommand("stop-stream", _videoUserId);
+        _videoUserId = null;
+        _videoNotLiveSince = 0;
+        _videoAspect = 0;
         _videoFullscreenState = false;
         _videoPreviewState = false;
         _videoSavedBounds = null;
@@ -1784,18 +1824,106 @@ function closeVideoWindow() {
     videoWindow = null;
 }
 
+function queuePluginCommand(action, userId, name) {
+    commandQueue.push({
+        id: nextCommandId++, action, userId: String(userId || ""),
+        sourceId: "", name: name || "", sound: null, createdAt: Date.now()
+    });
+    flushCommandWaiters();
+}
+
+// -- Which stream the viewer shows, and whether it is still live --
+let _videoUserId = null;
+let _videoNotLiveSince = 0;
+const VIDEO_AUTOCLOSE_MS = 3000;
+
+function isVideoStreamLive(userId) {
+    if (!userId || !state.channelId) return false;
+    const users = Array.isArray(state.users) ? state.users : [];
+    const u = users.find(x => String(x.userId) === String(userId));
+    return !!(u && u.streaming);
+}
+
+function checkVideoAutoClose() {
+    if (!videoWindow || videoWindow.isDestroyed() || !_videoUserId) { _videoNotLiveSince = 0; return; }
+    if (!isPluginAlive()) return;   // no fresh info: don't guess
+    if (isVideoStreamLive(_videoUserId)) { _videoNotLiveSince = 0; return; }
+    if (!_videoNotLiveSince) { _videoNotLiveSince = Date.now(); return; }
+    if (Date.now() - _videoNotLiveSince >= VIDEO_AUTOCLOSE_MS) {
+        videoLog("auto-close: stream ended or left voice", _videoUserId);
+        closeVideoWindow();
+    }
+}
+
+// -- Saved opacity / position (normal and preview modes) --
+function videoPrefs() {
+    if (!settings.video || typeof settings.video !== "object") settings.video = {};
+    return settings.video;
+}
+
+function boundsOnScreen(b) {
+    if (!b || ![b.x, b.y, b.width, b.height].every(Number.isFinite)) return false;
+    return screen.getAllDisplays().some(d => {
+        const a = d.workArea;
+        const ix = Math.min(b.x + b.width, a.x + a.width) - Math.max(b.x, a.x);
+        const iy = Math.min(b.y + b.height, a.y + a.height) - Math.max(b.y, a.y);
+        return ix >= 80 && iy >= 40;
+    });
+}
+
+let _videoSaveTimer = null;
+function saveVideoBoundsSoon() {
+    if (_videoSaveTimer) clearTimeout(_videoSaveTimer);
+    _videoSaveTimer = setTimeout(() => {
+        _videoSaveTimer = null;
+        if (!videoWindow || videoWindow.isDestroyed()) return;
+        const p = videoPrefs();
+        const b = videoWindow.getBounds();
+        if (_videoPreviewState) p.previewBounds = b; else p.bounds = b;
+        p.preview = _videoPreviewState;
+        saveSettings();
+    }, 500);
+}
+
+// Lock the window to the stream's aspect ratio and fit the current size to it:
+// keep the width, adjust the height (so no black bars).
+let _videoAspect = 0;
+function fitToAspect(b, aspect) {
+    if (!aspect) return b;
+    return { x: b.x, y: b.y, width: b.width, height: Math.max(90, Math.round(b.width / aspect)) };
+}
+function applyVideoAspect(w, h) {
+    if (!videoWindow || videoWindow.isDestroyed() || !(w > 0) || !(h > 0)) return;
+    const aspect = w / h;
+    if (Math.abs(aspect - _videoAspect) < 0.01) return;
+    _videoAspect = aspect;
+    try {
+        videoWindow.setAspectRatio(aspect);
+        videoWindow.setBounds(fitToAspect(videoWindow.getBounds(), aspect));
+    } catch (e) {}
+    videoLog("aspect locked", w + "x" + h);
+}
+
 function toggleVideoPreview() {
     if (!videoWindow || videoWindow.isDestroyed()) return;
+    const p = videoPrefs();
+    const cur = videoWindow.getBounds();
     if (!_videoPreviewState) {
-        _videoSavedBounds = videoWindow.getBounds();
-        const [x, y] = videoWindow.getPosition();
-        const [w] = videoWindow.getSize();
-        videoWindow.setBounds({ x: x + w - 320, y, width: 320, height: 180 });
+        p.bounds = cur;
+        _videoSavedBounds = cur;
+        const target = boundsOnScreen(p.previewBounds) ? p.previewBounds
+            : { x: cur.x + cur.width - 320, y: cur.y, width: 320, height: 180 };
+        // keep the stream's proportions in preview too
         _videoPreviewState = true;
+        videoWindow.setBounds(fitToAspect(target, _videoAspect));
     } else {
-        if (_videoSavedBounds) videoWindow.setBounds(_videoSavedBounds);
+        p.previewBounds = cur;
+        const target = boundsOnScreen(p.bounds) ? p.bounds : _videoSavedBounds;
         _videoPreviewState = false;
+        if (target) videoWindow.setBounds(fitToAspect(target, _videoAspect));
     }
+    p.preview = _videoPreviewState;
+    saveSettings();
 }
 
 function openSenderWindow() {
@@ -1831,6 +1959,7 @@ app.whenReady().then(async () => {
     restoreWindowsOnStartup();
     createTray();
     startLivenessWatchdog();
+    setInterval(checkVideoAutoClose, 1000);
     startMonitorRetryTimer();
     startNetTicker();
     startCursorWatchdog();
