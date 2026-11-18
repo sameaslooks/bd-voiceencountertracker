@@ -17,8 +17,15 @@ Discord doesn't tell you who you've crossed paths with before. VoiceEncounterTra
 - **Auto-mute on block.** Optional checkbox: whenever you block someone, they are muted in voice automatically.
 - **Hide Discord's native mute icon** for blocked / ignored users, so you don't see two mute indicators at once.
 - **Manual add.** Add any user to your history by ID or username, right from the plugin settings.
-- **Desktop overlay (optional).** A separate frameless, translucent, always-on-top window that shows the current channel, the current participants, their badges, and a live speaking indicator. Includes quick-action buttons (block / ignore / mute) for every participant.
-- **Persistent.** Everything is stored locally through `BdApi.Data` — survives Discord restarts and plugin reloads.
+- **Desktop overlay (optional).** A separate frameless, translucent, always-on-top window that shows the current channel, the current participants, their badges, and a live speaking indicator. Includes quick-action buttons (block / ignore / mute) for every participant. On top of that it can:
+  - show **favorites**, who just **moved to another channel**, and offer to **return to your channel** after Discord restarts;
+  - show **DMs, mentions and incoming calls** without leaving the game, and an **unread-DM badge** on people in voice;
+  - give every person a **right-click menu** (volume, DM, profile, favorite, …) and show what they're **playing / listening to**;
+  - **watch streams** — several at once, your own included — in separate windows with a magnifier;
+  - remember **window layouts per game** and go **click-through** whenever a game owns the mouse.
+- **Your own voice time.** A log of the time *you* spend in voice (alone or not), per server and channel, with a 30-day chart.
+- **Time search.** Who was in voice with you at a given moment or period, and when a group of people were all together with you.
+- **Persistent.** Everything is stored locally through `BdApi.Data` — survives Discord restarts and plugin reloads; the history is mirrored into rolling backups.
 - **No API requests.** All data is read from Discord's in-memory stores. Nothing leaves your machine.
 
 ## Installation
@@ -84,7 +91,7 @@ Click **Clear Encounters**. This wipes the local history and re-imports blocked 
 When the overlay is running, it shows:
 
 - channel name and participant count in the top bar,
-- every participant in the current channel — including yourself — with their badge,
+- every participant in the current channel — including yourself — in Discord's order (alphabetical), with their badge,
 - a live green ring around the avatar of whoever is speaking.
 
 Buttons appear when the cursor enters the overlay window:
@@ -94,6 +101,66 @@ Buttons appear when the cursor enters the overlay window:
 - `○` (mute / unmute in voice).
 
 Each action is executed inside Discord within ~1 second.
+
+**Click-through in games.** While a game owns the mouse (the cursor is hidden and the game is fullscreen or locks the cursor), every overlay window dims and lets clicks pass through. Alt-Tab out (or open the game's menu) to use it.
+
+#### Header
+
+- **Hold-to-leave** (phone icon, only in voice): hold until the ring around it closes to disconnect.
+- **Stream source** (screen icon, only in voice): pick what you stream — screens and windows with live thumbnails, minimized and borderless games included; only windows that have a taskbar button are listed.
+- **Signal**: hover for the current / average / worst ping and a 10-minute graph.
+
+#### People in voice
+
+- **Right-click a person** for a quick menu: their activity, **user volume** (same scale as Discord's slider), **Message** (opens your DM), **Profile**, **Listen along** (Spotify), **Favorite** and its **join / leave sound**, **Known** (only a manual mark can be removed), copy username / ID.
+- **Favorites** (also from Discord's own user menu → *Add to Favorites*) flash yellow when they join; with the sound on you hear a short tone when they come or go — nobody else makes a sound.
+- **Activity**: a game icon or the music platform's icon next to the name; hover it for the art and the full status.
+- **Phone icon** = in voice from mobile. **Red number** on the avatar = unread DMs from them.
+- **Right-click your own card** to write a one-line **session note** under the list (click it to edit, clear it to remove; it's gone when you leave the channel).
+
+#### Cards under the list
+
+- **"Name → #channel"** for 20 s when someone moves to another channel of the same server — click to follow.
+- **"Return to #channel"** when Discord restarted or crashed while you were in voice (offered for 30 min) — click to rejoin. Leaving voice yourself never shows it.
+- **Session stats** for 90 s after you leave voice: this session and *today* for you, and the people you spent the most time with. "Today" starts after your last pause in voice of 8 h or more.
+
+### Messages and calls
+
+A separate block docked under the overlay appears only when there's something to show:
+
+- **DMs and mentions** — one card per chat, gone after 12 s or as soon as you read it in Discord. With the cursor visible, click a card to open the chat in Discord.
+- **Incoming calls** — *Accept*, *Decline*, or *Message*: type a reply (the box grows as you type), press Enter, and the call is declined with your message sent.
+- **Audio device changed** — a short notice with the new input / output device.
+- **Someone unexpected started watching your stream** — see below.
+
+### Streams
+
+- **Watch**: click **LIVE** on someone's card. Every stream (and **camera** — click the camera icon) opens in its own window, so you can watch several at once. Hover **LIVE** for Discord's preview of the stream.
+- **Your own stream**: click your own **LIVE**. It comes from Discord's own pipeline (what it captured to send) at a light 360p / 25 fps, or, if Discord doesn't have it, from a local capture of the streamed window that follows source switches.
+- **Viewers**: the number next to your LIVE is how many people watch; hover it to see who. A small yellow dot marks someone who came into the channel while you were streaming and opened it within 3 minutes (cleared after 3 minutes).
+- **In the stream window**: drag to move, resize from the edges (the aspect ratio stays), the pin button switches between full and preview size, the half-moon button sets opacity. **Magnifier** (windows at least 300 px wide, cursor visible): click to zoom 2× there and click again to go back, wheel to zoom 1–4×, drag to pan; remembered per streamer.
+- **Paused**: when the streamer minimizes their window, Discord pauses the stream — the window shows the last frame blurred with *Stream paused* instead of reconnecting.
+- **Closing** a stream window also stops watching that stream in Discord.
+- Windows open in order: #1 in the main place, #2, #3… in the places set up for them (see layouts); if one in the middle closes, the later ones move up.
+
+### Window layouts
+
+Tray icon → **Window layouts…** lists *Desktop* and every game you've played with the overlay running. A layout is where the overlay, the stream windows (#1, its preview size, #2, #3…) and the message block go; it's applied automatically when that game is in front (*Desktop* everywhere else).
+
+- **Setup** — for 30 s the overlay stays clickable even inside the game, turns translucent, and numbered frames appear for the stream windows and the message block. Switch to the game and drag them; **+ Stream window** adds a place for one more stream. It's saved 5 s after your last move (the timer holds while you're dragging), or press **Done**.
+- **Save** stores where the windows are right now; **Apply** moves them there now.
+- Dragging a window by hand also updates the layout that's active at that moment.
+- A game whose cursor is locked (shooters) can only be set up while it shows a cursor — in its menu, paused, or windowed.
+
+### Tracker window
+
+Open it from the plugin settings or from a user's context menu → *Open Encounter Tracker*.
+
+- **My voice time** — your own time in voice for 7 / 30 days / all: total, a 30-day chart, and time per server and channel.
+- **Who was in voice with me** — pick a moment or a period and get everyone whose sessions overlap it; click a row to jump to that session in the table.
+- **Together…** — tick 2–5 people in the table to see when they were all in voice with you.
+- **Invite** (per row) — send the person a server invite or a link to the voice channel you're in, by DM.
+- **History → merge** — tick sessions of one person and merge them into one.
 
 ## How it works
 
@@ -145,6 +212,14 @@ The overlay is optional. When running, the plugin pushes the current state to `h
 - Discord does not expose the local user's speaking state through any store. The plugin detects your own speaking by reading the `box-shadow` of your avatar in Discord's DOM. This requires the voice channel to be visible in the Discord window — if Discord is minimised or you've scrolled the channel out of view, your own speaking ring may not update.
 - For other users this works regardless, because their speaking state is available through `SpeakingStore`.
 
+**Something in the overlay does nothing (Message, volume, calls, stop watching…)**
+
+- These use Discord's internal functions, whose names change between Discord versions. Look in `server/logs/plugin.log` for a line ending in `not found` and report it.
+
+**A stream window shows "Reconnecting" for a long time**
+
+- Check `server/logs/plugin.log` around `watch-stream`. A stream the streamer minimized shows *Stream paused* instead and comes back by itself.
+
 **Block / ignore / mute buttons in the overlay do nothing**
 
 - The plugin polls the overlay's command queue once per second. Wait a moment after clicking.
@@ -160,8 +235,13 @@ The overlay is optional. When running, the plugin pushes the current state to `h
 
 All data is stored locally by BetterDiscord under the plugin's data folder:
 
-- `encounters` — per-user encounter records, including the session log.
+- `encounters` — per-user encounter records, including the session log. Mirrored into `backup-last` and three daily backups; a damaged or emptied store is restored from them automatically.
 - `prefs` — plugin preferences (auto-mute, native-icon hiding).
+- `favorites` — your favorites and their sound setting (kept apart from the history).
+- `myVoice` — your own voice sessions for the last year.
+- `lastVoice` — the last channel you were in (for *Return to channel*).
+
+The overlay keeps its settings (window places, layouts, stream window prefs) in Electron's user-data folder, and logs in `server/logs/` — `plugin.log` (the plugin's log) and `video.log` (stream windows and click-through).
 
 Deleting the plugin file from BetterDiscord's plugin folder does **not** erase this data. To reset, use the **Clear Encounters** button in the plugin settings.
 
@@ -171,8 +251,13 @@ Deleting the plugin file from BetterDiscord's plugin folder does **not** erase t
 .
 ├── VoiceEncounterTracker.plugin.js   # the BetterDiscord plugin
 ├── server/                           # the optional overlay (Electron)
-│   ├── overlay-app.js
-│   ├── overlay.html
+│   ├── overlay-app.js                # main process: HTTP bridge, windows, click-through, layouts
+│   ├── overlay.html                  # the voice overlay
+│   ├── notify.html                   # messages / calls block
+│   ├── video.html                    # stream viewer
+│   ├── menu.html, tip.html           # right-click menu, hover tooltips
+│   ├── popup.html                    # stream source picker
+│   ├── layouts.html, placeholder.html# window layouts and setup frames
 │   ├── package.json
 │   └── start.bat
 ├── README.md
