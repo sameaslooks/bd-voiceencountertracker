@@ -173,8 +173,7 @@ function windowsFile() {
 
 function loadWindowsConfig() {
     try {
-        const raw = fs.readFileSync(windowsFile(), "utf8");
-        const parsed = JSON.parse(raw);
+        const parsed = readJsonSafe(windowsFile());
         if (parsed && Array.isArray(parsed.windows)) return parsed.windows;
     } catch (e) {}
     return [];
@@ -183,7 +182,7 @@ function loadWindowsConfig() {
 function saveWindowsConfig(list) {
     try {
         const data = { version: 1, windows: list };
-        fs.writeFileSync(windowsFile(), JSON.stringify(data, null, 2), "utf8");
+        writeJsonAtomic(windowsFile(), data);
     } catch (e) {
         console.error("[windows.json] save failed:", e.message);
     }
@@ -209,6 +208,22 @@ function scheduleSaveWindows() {
     }, 500);
 }
 
+// Write via temp file + rename so a crash mid-write never leaves a broken file;
+// the previous version is kept as <file>.bak.
+function writeJsonAtomic(file, data) {
+    const tmp = file + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+    try { if (fs.existsSync(file)) fs.copyFileSync(file, file + ".bak"); } catch (e) {}
+    fs.renameSync(tmp, file);
+}
+
+function readJsonSafe(file) {
+    for (const f of [file, file + ".bak"]) {
+        try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) {}
+    }
+    return null;
+}
+
 function settingsFile() {
     return path.join(app.getPath("userData"), "settings.json");
 }
@@ -222,17 +237,22 @@ let settings = {
 
 function loadSettings() {
     try {
-        const raw = fs.readFileSync(settingsFile(), "utf8");
-        const parsed = JSON.parse(raw);
+        const parsed = readJsonSafe(settingsFile());
         if (parsed && typeof parsed === "object") {
             settings = Object.assign(settings, parsed);
         }
     } catch (e) {}
 }
 
+let _saveSettingsTimer = null;
+function saveSettingsSoon() {
+    if (_saveSettingsTimer) clearTimeout(_saveSettingsTimer);
+    _saveSettingsTimer = setTimeout(() => { _saveSettingsTimer = null; saveSettings(); }, 400);
+}
+
 function saveSettings() {
     try {
-        fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2), "utf8");
+        writeJsonAtomic(settingsFile(), settings);
     } catch (e) {
         console.error("[settings.json] save failed:", e.message);
     }

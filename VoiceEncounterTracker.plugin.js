@@ -108,7 +108,8 @@ module.exports = class VoiceEncounterTracker {
     // =====================================================================
 
     start() {
-        BdApi.Logger.info(this.meta.name, "Starting...");
+        this._stopped = false;
+        vetLog("info", "Starting...");
 
         // ── Hook console.log to catch Discord's streamId ──
         if (!this._origConsoleLog) {
@@ -284,6 +285,7 @@ module.exports = class VoiceEncounterTracker {
         try { BdApi.DOM.removeStyle(this.NATIVE_MUTE_STYLE_ID); } catch (e) {}
         try { BdApi.Patcher.unpatchAll(this.meta.name); } catch (e) {}
 
+        this._stopped = true;
         this.encounters.clear();
         this.modifiedStyles.clear();
         this._mutedCache.clear();
@@ -1307,32 +1309,133 @@ module.exports = class VoiceEncounterTracker {
 
     getStoreKey() { return "encounters"; }
 
-    loadEncounters() {
+    // ── Safe persistence ────────────────────────────────────────────────
+    // BdApi.Data rewrites <name>.config.json in place and plugins have no fs,
+    // so we can't do tmp+rename here. Instead every save is mirrored into
+    // separate backup files (different BdApi.Data namespaces = different files):
+    //   VoiceEncounterTracker.backup-last.config.json   - last good save
+    //   VoiceEncounterTracker.backup-day0..2.config.json - one per day, 3 days
+    // On load, if the main file is missing/broken or holds far less history
+    // than the best backup, the backup is restored automatically.
+
+    _countSessions(users) {
+        let n = 0;
+        for (const u of users || []) n += Array.isArray(u?.sessions) ? u.sessions.length : 0;
+        return n;
+    }
+
+    _readStore(ns) {
         try {
-            const data = BdApi.Data.load(this.meta.name, this.getStoreKey());
-            const arr = Array.isArray(data?.users) ? data.users : [];
-            this.encounters.clear();
-            for (const rec of arr) {
-                if (rec && rec.userId) {
-                    if (!Array.isArray(rec.sessions)) rec.sessions = [];
-                    for (const s of rec.sessions) {
-                        if (!Array.isArray(s.events)) s.events = [];
-                    }
-                    this.encounters.set(rec.userId, rec);
-                }
-            }
+            const d = BdApi.Data.load(ns, this.getStoreKey());
+            if (!d || !Array.isArray(d.users)) return null;
+            return d;
         } catch (e) {
-            this.encounters.clear();
+            vetLog("warn", `read ${ns} failed:`, e);
+            return null;
         }
     }
 
+    _backupNamespaces() {
+        const base = this.meta.name + ".backup-";
+        return [base + "last", base + "day0", base + "day1", base + "day2"];
+    }
+
+    _pickRestoreCandidate(main) {
+        const mainSessions = this._countSessions(main?.users);
+        const clearedAt = main?.clearedAt || 0;
+        let best = null;
+        for (const ns of this._backupNamespaces()) {
+            const d = this._readStore(ns);
+            if (!d) continue;
+            if ((d.savedAt || 0) <= clearedAt) continue;   // older than a deliberate "Clear"
+            const n = this._countSessions(d.users);
+            if (!best || n > best.sessions) best = { ns, data: d, sessions: n };
+        }
+        if (!best || best.sessions === 0) return null;
+        // Restore when the main store is gone, or lost more than half of its history.
+        if (!main || mainSessions < best.sessions * 0.5) return best;
+        return null;
+    }
+
+    loadEncounters() {
+        let main = this._readStore(this.meta.name);
+        let rawOk = true;
+        try { BdApi.Data.load(this.meta.name, this.getStoreKey()); } catch (e) { rawOk = false; }
+
+        const restore = this._pickRestoreCandidate(main);
+        if (restore) {
+            vetLog("warn", `loadEncounters: main store has ${this._countSessions(main?.users)} sessions, `
+                + `restoring ${restore.sessions} sessions from ${restore.ns}`);
+            main = restore.data;
+            this._restoredFrom = restore.ns;
+        } else if (!rawOk) {
+            vetLog("error", "loadEncounters: main store unreadable and no backup; saving disabled until restart");
+            this._encountersLoadFailed = true;
+            return;
+        }
+
+        const arr = Array.isArray(main?.users) ? main.users : [];
+        this.encounters.clear();
+        let bad = 0;
+        for (const rec of arr) {
+            try {
+                if (!rec || !rec.userId) { bad++; continue; }
+                rec.sessions = Array.isArray(rec.sessions) ? rec.sessions.filter(x => x && typeof x === "object") : [];
+                for (const s of rec.sessions) {
+                    if (!Array.isArray(s.events)) s.events = [];
+                }
+                this.encounters.set(rec.userId, rec);
+            } catch (e) { bad++; }
+        }
+        this._storedUserCount = arr.length;
+        this._storedSessionCount = this._countSessions(arr);
+        this._clearedAt = main?.clearedAt || 0;
+        vetLog("info", `loadEncounters: ${this.encounters.size} users, ${this._storedSessionCount} sessions`
+            + (bad ? `, ${bad} bad records skipped` : ""));
+        if (this._restoredFrom) this.saveEncounters();   // write the restored data back to the main file
+    }
+
     saveEncounters() {
+        if (this._stopped) return;   // late timers/async after stop() must not save the cleared map
+        if (this._encountersLoadFailed) {
+            vetLog("warn", "saveEncounters: skipped, load had failed");
+            return;
+        }
+        const users = Array.from(this.encounters.values());
+        const sessions = this._countSessions(users);
+        // Never overwrite existing history with an empty list (e.g. after a failed load).
+        if (users.length === 0 && (this._storedUserCount || 0) > 0) {
+            vetLog("warn", `saveEncounters: refusing to replace ${this._storedUserCount} stored users with an empty list`);
+            return;
+        }
+        const payload = { version: 3, savedAt: Date.now(), clearedAt: this._clearedAt || 0, users };
         try {
-            BdApi.Data.save(this.meta.name, this.getStoreKey(), {
-                version: 3,
-                users: Array.from(this.encounters.values())
-            });
-        } catch (e) {}
+            BdApi.Data.save(this.meta.name, this.getStoreKey(), payload);
+            this._storedUserCount = users.length;
+        } catch (e) {
+            vetLog("error", "saveEncounters failed:", e);
+            return;
+        }
+
+        // Backups. "last" must not be degraded by a save that lost most of the history.
+        const [lastNs, ...dayNs] = this._backupNamespaces();
+        try {
+            const prev = this._readStore(lastNs);
+            const prevSessions = this._countSessions(prev?.users);
+            const deliberateClear = (this._clearedAt || 0) > (prev?.savedAt || 0);
+            if (!prev || deliberateClear || sessions >= prevSessions * 0.5) {
+                BdApi.Data.save(lastNs, this.getStoreKey(), payload);
+            } else {
+                vetLog("warn", `backup-last kept: new save has ${sessions} sessions vs ${prevSessions}`);
+            }
+        } catch (e) { vetLog("warn", "backup-last failed:", e); }
+        try {
+            const day = Math.floor(Date.now() / 86400000);
+            const ns = dayNs[day % dayNs.length];
+            const cur = this._readStore(ns);
+            const curDay = cur?.savedAt ? Math.floor(cur.savedAt / 86400000) : -1;
+            if (curDay !== day) BdApi.Data.save(ns, this.getStoreKey(), payload);
+        } catch (e) { vetLog("warn", "backup-day failed:", e); }
     }
 
     flushEncounters() { this.saveEncounters(); }
@@ -3190,7 +3293,12 @@ module.exports = class VoiceEncounterTracker {
                         this.encounters.clear();
                         if (this._mutedCache) this._mutedCache.clear();
                         if (this._saveDebounce) { clearTimeout(this._saveDebounce); this._saveDebounce = null; }
-                        try { BdApi.Data.delete(this.meta.name, this.getStoreKey()); } catch (e) {}
+                        this._clearedAt = Date.now();
+                        this._storedUserCount = 0;
+                        try {
+                            BdApi.Data.save(this.meta.name, this.getStoreKey(),
+                                { version: 3, savedAt: Date.now(), clearedAt: this._clearedAt, users: [] });
+                        } catch (e) {}
                         try { this.syncRelationshipLists(); } catch (e) {}
                         try { this.syncMuteList(); } catch (e) {}
                         try { this.scheduleOverlayPush(); } catch (e) {}
