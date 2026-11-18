@@ -9,6 +9,41 @@
  * @updateUrl https://raw.githubusercontent.com/sameaslooks/bd-voiceencountertracker/refs/heads/master/VoiceEncounterTracker.plugin.js
  */
 
+// Log: shipped to the overlay -> server/logs/plugin.log.
+// Everything is also mirrored to the console via BdApi.Logger.
+const VET_NAME = "VoiceEncounterTracker";
+function vetLog(level, ...args) {
+    try {
+        const fn = BdApi.Logger[level] || BdApi.Logger.info;
+        fn(VET_NAME, ...args);
+    } catch (e) {}
+    const text = args.map(a => {
+        if (a instanceof Error) return a.stack || a.message;
+        if (typeof a === "string") return a;
+        try { return JSON.stringify(a); } catch (e) { return String(a); }
+    }).join(" ");
+    _vetLogBuf.push(`${new Date().toISOString()} [${level}] ${text}`);
+    if (_vetLogBuf.length > 2000) _vetLogBuf.splice(0, _vetLogBuf.length - 2000);
+    if (!_vetLogTimer) _vetLogTimer = setTimeout(_vetFlushLog, 1000);
+}
+// Logs are shipped to the overlay, which writes server/logs/plugin.log.
+// Kept in memory (up to 2000 lines) while the overlay is not running.
+let _vetLogBuf = [];
+let _vetLogTimer = null;
+function _vetFlushLog() {
+    _vetLogTimer = null;
+    if (!_vetLogBuf.length) return;
+    const lines = _vetLogBuf.splice(0);
+    BdApi.Net.fetch("http://127.0.0.1:17842/log/plugin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lines })
+    }).catch(() => {
+        _vetLogBuf = lines.concat(_vetLogBuf).slice(-2000);
+        if (!_vetLogTimer) _vetLogTimer = setTimeout(_vetFlushLog, 5000);
+    });
+}
+
 module.exports = class VoiceEncounterTracker {
     constructor(meta) {
         this.meta = meta;
@@ -89,7 +124,7 @@ module.exports = class VoiceEncounterTracker {
                     const m = joined.match(/create video element for\s+(\d+)/);
                     if (m) {
                         self._lastDiscordStreamId = m[1];
-                        BdApi.Logger.info(self.meta.name, "caught streamId from log:", m[1]);
+                        vetLog("info", "caught streamId from log:", m[1]);
                     }
                 } catch (e) {}
                 return origLog(...args);
@@ -118,14 +153,14 @@ module.exports = class VoiceEncounterTracker {
                         const id = args?.[0];
                         if (id != null) {
                             self._lastDiscordStreamId = String(id);
-                            BdApi.Logger.info(self.meta.name, "caught streamId from nz patch:", id);
+                            vetLog("info", "caught streamId from nz patch:", id);
                         }
                     } catch (e) {}
                 });
                 this._nzModule = nzMod;
-                BdApi.Logger.info(this.meta.name, "nz patched");
+                vetLog("info", "nz patched");
             } else {
-                BdApi.Logger.warn(this.meta.name, "nz module not found for patching");
+                vetLog("warn", "nz module not found for patching");
             }
         }
 
@@ -170,11 +205,11 @@ module.exports = class VoiceEncounterTracker {
         try { this.pushSpeakingToOverlay(); } catch (e) {}
         try { this.pushPingToOverlay(); } catch (e) {}
 
-        BdApi.Logger.info(this.meta.name, "Started.");
+        vetLog("info", "Started.");
     }
 
     stop() {
-        BdApi.Logger.info(this.meta.name, "Stopping...");
+        vetLog("info", "Stopping...");
         this._cmdLoopGen = (this._cmdLoopGen || 0) + 1; // ends the command long-poll loop
 
         for (const t of this._timers) {
@@ -253,7 +288,7 @@ module.exports = class VoiceEncounterTracker {
         this.modifiedStyles.clear();
         this._mutedCache.clear();
 
-        BdApi.Logger.info(this.meta.name, "Stopped.");
+        vetLog("info", "Stopped.");
     }
 
     _addTimer(t) { this._timers.push(t); return t; }
@@ -436,13 +471,13 @@ module.exports = class VoiceEncounterTracker {
                             ])
                         );
                     } catch (e) {
-                        BdApi.Logger.error(this.meta.name, "user-context patch error:", e);
+                        vetLog("error", "user-context patch error:", e);
                     }
                 },
                 this.meta.name
             );
         } catch (e) {
-            BdApi.Logger.error(this.meta.name, "patchUserContextMenu failed:", e);
+            vetLog("error", "patchUserContextMenu failed:", e);
         }
     }
 
@@ -547,7 +582,7 @@ module.exports = class VoiceEncounterTracker {
     hookDispatcher() {
         const d = this.getDispatcher();
         if (!d || typeof d.dispatch !== "function") {
-            BdApi.Logger.error(this.meta.name, "Dispatcher not found.");
+            vetLog("error", "Dispatcher not found.");
             return;
         }
 
@@ -593,7 +628,7 @@ module.exports = class VoiceEncounterTracker {
             } catch (e) {}
         });
 
-        BdApi.Logger.info(this.meta.name, "Dispatcher hooked.");
+        vetLog("info", "Dispatcher hooked.");
     }
 
     hookSrcObject() {
@@ -624,15 +659,15 @@ module.exports = class VoiceEncounterTracker {
                             }
                             self._lastCapturedStream = v;
                             if (streamId) self._streamsByStreamId.set(String(streamId), v);
-                            BdApi.Logger.info(self.meta.name, "srcObject captured", streamId || "(no id)");
+                            vetLog("info", "srcObject captured", streamId || "(no id)");
                         }
                     } catch (e) {}
                     return origSet.call(this, v);
                 }
             });
-            BdApi.Logger.info(this.meta.name, "srcObject hooked");
+            vetLog("info", "srcObject hooked");
         } catch (e) {
-            BdApi.Logger.error(this.meta.name, "hookSrcObject failed:", e);
+            vetLog("error", "hookSrcObject failed:", e);
         }
     }
 
@@ -881,10 +916,10 @@ module.exports = class VoiceEncounterTracker {
             }
 
             if (added > 0) {
-                BdApi.Logger.info(this.meta.name, `syncActiveFromStore: seeded ${added} user(s)`);
+                vetLog("info", `syncActiveFromStore: seeded ${added} user(s)`);
             }
         } catch (e) {
-            BdApi.Logger.error(this.meta.name, "syncActiveFromStore:", e);
+            vetLog("error", "syncActiveFromStore:", e);
         }
     }
 
@@ -949,8 +984,7 @@ module.exports = class VoiceEncounterTracker {
         };
 
         if (!channelId) {
-            BdApi.Logger.info(this.meta.name,
-                `[leave] ${this.getUserName(userId)} (${userId}) left; tracked=${!!existing}`);
+            vetLog("info", `[leave] ${this.getUserName(userId)} (${userId}) left; tracked=${!!existing}`);
             if (existing) {
                 this.closeSessionAndMeetings(userId, existing, now);
                 this.active.delete(userId);
@@ -1105,11 +1139,11 @@ module.exports = class VoiceEncounterTracker {
     finalizeMeeting(userId, mySession, otherSession, endedAt, trusted = true) {
         const name = `${this.getUserName(userId)} (${userId})`;
         if (!mySession || !otherSession) {
-            BdApi.Logger.info(this.meta.name, `[meeting] skip ${name}: no session (me=${!!mySession}, other=${!!otherSession})`);
+            vetLog("info", `[meeting] skip ${name}: no session (me=${!!mySession}, other=${!!otherSession})`);
             return;
         }
         if (mySession.channelId !== otherSession.channelId) {
-            BdApi.Logger.info(this.meta.name, `[meeting] skip ${name}: different channel`);
+            vetLog("info", `[meeting] skip ${name}: different channel`);
             return;
         }
 
@@ -1118,11 +1152,10 @@ module.exports = class VoiceEncounterTracker {
             ? endedAt
             : Math.min(endedAt, otherSession.lastSeen ?? endedAt, mySession.lastSeen ?? endedAt);
         if (end <= start) {
-            BdApi.Logger.info(this.meta.name, `[meeting] skip ${name}: empty interval`);
+            vetLog("info", `[meeting] skip ${name}: empty interval`);
             return;
         }
-        BdApi.Logger.info(this.meta.name,
-            `[meeting] record ${name}: ${this.formatDuration(end - start)}, ${this.formatTime(start)} → ${this.formatTime(end)}`);
+        vetLog("info", `[meeting] record ${name}: ${this.formatDuration(end - start)}, ${this.formatTime(start)} → ${this.formatTime(end)}`);
 
         const rawEvents = Array.isArray(otherSession.events) ? otherSession.events : [];
         const events = rawEvents
@@ -1251,8 +1284,7 @@ module.exports = class VoiceEncounterTracker {
         rec.sessions.push(merged);
         rec.sessions.sort((a, b) => a.startedAt - b.startedAt);
 
-        BdApi.Logger.info(this.meta.name,
-            `[merge] ${this.getUserName(userId)}: ${involved.length} sessions → ${this.formatDuration(merged.durationMs)}`);
+        vetLog("info", `[merge] ${this.getUserName(userId)}: ${involved.length} sessions → ${this.formatDuration(merged.durationMs)}`);
         this.scheduleSave(this.MEETING_SAVE_MS);
         return true;
     }
@@ -1888,7 +1920,7 @@ module.exports = class VoiceEncounterTracker {
                 return true;
             }
         } catch (e) {}
-        BdApi.Logger.warn(this.meta.name, "toggleSelfMute: not found");
+        vetLog("warn", "toggleSelfMute: not found");
         return false;
     }
 
@@ -1900,7 +1932,7 @@ module.exports = class VoiceEncounterTracker {
                 return true;
             }
         } catch (e) {}
-        BdApi.Logger.warn(this.meta.name, "toggleSelfDeaf: not found");
+        vetLog("warn", "toggleSelfDeaf: not found");
         return false;
     }
 
@@ -1922,7 +1954,7 @@ module.exports = class VoiceEncounterTracker {
         try {
             const D = BdApi.Webpack.getByStrings("startStream", { searchExports: true });
             if (!D || typeof D !== "function") {
-                BdApi.Logger.warn(this.meta.name, "_startSelfStream: startStream not found");
+                vetLog("warn", "_startSelfStream: startStream not found");
                 return false;
             }
 
@@ -1934,11 +1966,11 @@ module.exports = class VoiceEncounterTracker {
                 sources = Array.isArray(data?.sources) ? data.sources : [];
                 preferredId = data?.preferredId || preferredId;
             } catch (e) {
-                BdApi.Logger.warn(this.meta.name, "_startSelfStream: overlay /sources failed", e);
+                vetLog("warn", "_startSelfStream: overlay /sources failed", e);
             }
 
             if (!Array.isArray(sources) || !sources.length) {
-                BdApi.Logger.warn(this.meta.name, "_startSelfStream: no sources available");
+                vetLog("warn", "_startSelfStream: no sources available");
                 return false;
             }
 
@@ -1949,14 +1981,14 @@ module.exports = class VoiceEncounterTracker {
                 sources[0];
 
             if (!pick) {
-                BdApi.Logger.warn(this.meta.name, "_startSelfStream: no source picked");
+                vetLog("warn", "_startSelfStream: no source picked");
                 return false;
             }
 
             let source;
             if (pick.id.startsWith("screen:")) {
                 if (pick.handle == null) {
-                    BdApi.Logger.warn(this.meta.name, "_startSelfStream: screen has no HMONITOR handle", pick);
+                    vetLog("warn", "_startSelfStream: screen has no HMONITOR handle", pick);
                     return false;
                 }
                 source = {
@@ -1972,13 +2004,13 @@ module.exports = class VoiceEncounterTracker {
                 };
             }
 
-            BdApi.Logger.info(this.meta.name, "_startSelfStream: using", source);
+            vetLog("info", "_startSelfStream: using", source);
 
             await D(source).then(result => {
-                BdApi.Logger.info(this.meta.name, "startStream result:", result);
+                vetLog("info", "startStream result:", result);
                 this._currentStreamSource = { id: source.id, name: source.name };
             }).catch(e => {
-                BdApi.Logger.error(this.meta.name, "_startSelfStream:", e);
+                vetLog("error", "_startSelfStream:", e);
             });
 
             const desiredSound = this._pendingStreamSound !== undefined
@@ -1990,7 +2022,7 @@ module.exports = class VoiceEncounterTracker {
 
             return true;
         } catch (e) {
-            BdApi.Logger.error(this.meta.name, "_startSelfStream:", e);
+            vetLog("error", "_startSelfStream:", e);
             return false;
         }
     }
@@ -2001,13 +2033,13 @@ module.exports = class VoiceEncounterTracker {
             const actions = BdApi.Webpack.getByKeys("setGoLiveSource", { searchExports: true });
 
             if (!mes || !actions?.setGoLiveSource) {
-                BdApi.Logger.warn(this.meta.name, "_switchStreamSource: setGoLiveSource not found");
+                vetLog("warn", "_switchStreamSource: setGoLiveSource not found");
                 return false;
             }
 
             const current = mes.getGoLiveSource?.();
             if (!current) {
-                BdApi.Logger.info(this.meta.name, "_switchStreamSource: not streaming");
+                vetLog("info", "_switchStreamSource: not streaming");
                 this._currentStreamSource = { id: discordSourceId, name: name || discordSourceId };
                 return false;
             }
@@ -2028,12 +2060,12 @@ module.exports = class VoiceEncounterTracker {
                 context: "stream"
             };
 
-            BdApi.Logger.info(this.meta.name, "_switchStreamSource:", payload);
+            vetLog("info", "_switchStreamSource:", payload);
             actions.setGoLiveSource(payload);
             this._currentStreamSource = { id: discordSourceId, name: name || discordSourceId };
             return true;
         } catch (e) {
-            BdApi.Logger.error(this.meta.name, "_switchStreamSource:", e);
+            vetLog("error", "_switchStreamSource:", e);
             return false;
         }
     }
@@ -2043,7 +2075,7 @@ module.exports = class VoiceEncounterTracker {
             const me = this.getCurrentUserId();
             const mySession = this.active.get(me);
             if (!mySession) {
-                BdApi.Logger.warn(this.meta.name, "_watchStream: no own session");
+                vetLog("warn", "_watchStream: no own session");
                 return false;
             }
 
@@ -2061,7 +2093,7 @@ module.exports = class VoiceEncounterTracker {
 
             const stream = await this._watchStreamByUserId(userId);
             if (!stream) {
-                BdApi.Logger.warn(this.meta.name, "_watchStream: no stream");
+                vetLog("warn", "_watchStream: no stream");
                 return false;
             }
 
@@ -2069,7 +2101,7 @@ module.exports = class VoiceEncounterTracker {
             await this._startWatchStreamPeer(stream);
             return true;
         } catch (e) {
-            BdApi.Logger.error(this.meta.name, "_watchStream:", e);
+            vetLog("error", "_watchStream:", e);
             return false;
         }
     }
@@ -2078,14 +2110,14 @@ module.exports = class VoiceEncounterTracker {
         const me = this.getCurrentUserId();
         const mySession = this.active.get(me);
         if (!mySession) {
-            BdApi.Logger.warn(this.meta.name, "_watchStreamByUserId: no own session");
+            vetLog("warn", "_watchStreamByUserId: no own session");
             return null;
         }
 
         if (this._watchedUserId === userId) {
             const existing = this._findLiveVideoForStream();
             if (existing) {
-                BdApi.Logger.info(this.meta.name, "_watchStreamByUserId: already live, reusing");
+                vetLog("info", "_watchStreamByUserId: already live, reusing");
                 const track = existing.srcObject.getVideoTracks()[0];
                 try { return new MediaStream([track.clone()]); }
                 catch { return new MediaStream([track]); }
@@ -2096,7 +2128,7 @@ module.exports = class VoiceEncounterTracker {
 
         const streamWatch = BdApi.Webpack.getByStrings("STREAM_WATCH", "allowMultiple", { searchExports: true });
         if (typeof streamWatch !== "function") {
-            BdApi.Logger.error(this.meta.name, "_watchStreamByUserId: streamWatch not found");
+            vetLog("error", "_watchStreamByUserId: streamWatch not found");
             return null;
         }
         try {
@@ -2106,15 +2138,15 @@ module.exports = class VoiceEncounterTracker {
                 channelId: mySession.channelId,
                 ownerId: userId,
             });
-            BdApi.Logger.info(this.meta.name, "STREAM_WATCH dispatched for", userId);
+            vetLog("info", "STREAM_WATCH dispatched for", userId);
         } catch (e) {
-            BdApi.Logger.error(this.meta.name, "streamWatch failed:", e);
+            vetLog("error", "streamWatch failed:", e);
             return null;
         }
 
         const video = await this._waitForLiveVideo(timeout, before);
         if (!video) {
-            BdApi.Logger.warn(this.meta.name, "no live video appeared");
+            vetLog("warn", "no live video appeared");
             return null;
         }
 
@@ -2130,28 +2162,26 @@ module.exports = class VoiceEncounterTracker {
                         this._nativeStreamHandle = handle;
                         const nativeTrack = handle.stream.getVideoTracks()[0];
                         if (nativeTrack) {
-                            BdApi.Logger.info(
-                                this.meta.name,
-                                "native track:",
+                            vetLog("info", "native track:",
                                 nativeTrack.readyState,
                                 "muted:", nativeTrack.muted,
                                 "label:", nativeTrack.label
                             );
-                            BdApi.Logger.info(this.meta.name, "returning original native track (no clone)");
+                            vetLog("info", "returning original native track (no clone)");
                             return new MediaStream([nativeTrack]);
                         }
                     }
                 } catch (e) {
-                    BdApi.Logger.warn(this.meta.name, "nz failed, falling back:", e);
+                    vetLog("warn", "nz failed, falling back:", e);
                 }
             }
         } else {
-            BdApi.Logger.warn(this.meta.name, "no streamId — falling back to srcObject clone");
+            vetLog("warn", "no streamId — falling back to srcObject clone");
         }
 
         const track = video.srcObject?.getVideoTracks?.()[0];
         if (!track) {
-            BdApi.Logger.error(this.meta.name, "no video track on fallback");
+            vetLog("error", "no video track on fallback");
             return null;
         }
         let liveTrack = track;
@@ -2161,10 +2191,10 @@ module.exports = class VoiceEncounterTracker {
         }
         try {
             const cloned = liveTrack.clone();
-            BdApi.Logger.info(this.meta.name, "fallback cloned track:", cloned.readyState);
+            vetLog("info", "fallback cloned track:", cloned.readyState);
             return new MediaStream([cloned]);
         } catch (e) {
-            BdApi.Logger.info(this.meta.name, "fallback without clone:", liveTrack.readyState);
+            vetLog("info", "fallback without clone:", liveTrack.readyState);
             return new MediaStream([liveTrack]);
         }
     }
@@ -2175,7 +2205,7 @@ module.exports = class VoiceEncounterTracker {
                 this._lastDiscordStreamId);
             return String(this._lastDiscordStreamId);
         }
-        BdApi.Logger.warn(this.meta.name, "_extractStreamId: no streamId from nz patch");
+        vetLog("warn", "_extractStreamId: no streamId from nz patch");
         return null;
     }
 
@@ -2308,7 +2338,7 @@ module.exports = class VoiceEncounterTracker {
             offer: { type: desc.type, sdp: desc.sdp },
             candidates: []
         });
-        BdApi.Logger.info(this.meta.name, "watch peer: offer sent");
+        vetLog("info", "watch peer: offer sent");
 
         let answer = null;
         for (let i = 0; i < 60; i++) {
@@ -2320,7 +2350,7 @@ module.exports = class VoiceEncounterTracker {
             await new Promise(r => setTimeout(r, 250));
         }
         if (!answer) {
-            BdApi.Logger.warn(this.meta.name, "watch peer: no answer from viewer");
+            vetLog("warn", "watch peer: no answer from viewer");
             try { pc.close(); } catch (e) {}
             this._watchPeer = null;
             return false;
@@ -2328,9 +2358,9 @@ module.exports = class VoiceEncounterTracker {
 
         try {
             await pc.setRemoteDescription(answer);
-            BdApi.Logger.info(this.meta.name, "watch peer: answer applied");
+            vetLog("info", "watch peer: answer applied");
         } catch (e) {
-            BdApi.Logger.error(this.meta.name, "setRemoteDescription failed:", e);
+            vetLog("error", "setRemoteDescription failed:", e);
             try { pc.close(); } catch (er) {}
             this._watchPeer = null;
             return false;
@@ -2366,12 +2396,12 @@ module.exports = class VoiceEncounterTracker {
                         });
                     } catch (e) {}
                 }, 1000);
-                BdApi.Logger.info(this.meta.name, "sender tuned:", JSON.stringify(params.encodings[0]));
+                vetLog("info", "sender tuned:", JSON.stringify(params.encodings[0]));
             } else {
-                BdApi.Logger.warn(this.meta.name, "sender tuned: no video sender");
+                vetLog("warn", "sender tuned: no video sender");
             }
         } catch (e) {
-            BdApi.Logger.warn(this.meta.name, "sender.setParameters failed:", e.message);
+            vetLog("warn", "sender.setParameters failed:", e.message);
         }
 
         this._framePump = {
@@ -2382,14 +2412,14 @@ module.exports = class VoiceEncounterTracker {
             }
         };
 
-        BdApi.Logger.info(this.meta.name, "watch peer started");
+        vetLog("info", "watch peer started");
         return true;
     }
 
     _stopFramePump() {
         if (this._framePump) {
             this._framePump.stop();
-            BdApi.Logger.info(this.meta.name, "frame pump stopped");
+            vetLog("info", "frame pump stopped");
         }
         if (this._nativeStreamHandle) {
             try { this._nativeStreamHandle.release(); } catch (e) {}
@@ -2404,19 +2434,19 @@ module.exports = class VoiceEncounterTracker {
             const actions = BdApi.Webpack.getByKeys("setGoLiveSource", { searchExports: true });
 
             if (!mes || !actions?.setGoLiveSource) {
-                BdApi.Logger.warn(this.meta.name, "_setStreamSound: setGoLiveSource not found");
+                vetLog("warn", "_setStreamSound: setGoLiveSource not found");
                 return false;
             }
 
             const current = mes.getGoLiveSource?.();
             if (!current) {
                 this._pendingStreamSound = !!enabled;
-                BdApi.Logger.info(this.meta.name, "_setStreamSound: not streaming, saved");
+                vetLog("info", "_setStreamSound: not streaming, saved");
                 return false;
             }
 
             if (!current.desktopSource?.id) {
-                BdApi.Logger.warn(this.meta.name, "_setStreamSound: no desktopSource.id");
+                vetLog("warn", "_setStreamSound: no desktopSource.id");
                 return false;
             }
 
@@ -2445,10 +2475,10 @@ module.exports = class VoiceEncounterTracker {
                         frameRate: quality.frameRate ?? 30,
                         soundshareEnabled: soundBool
                     });
-                    BdApi.Logger.info(this.meta.name, "_setStreamSound: dispatched STREAM_UPDATE_SETTINGS", soundBool);
+                    vetLog("info", "_setStreamSound: dispatched STREAM_UPDATE_SETTINGS", soundBool);
                 }
             } catch (e) {
-                BdApi.Logger.warn(this.meta.name, "_setStreamSound: STREAM_UPDATE_SETTINGS failed", e);
+                vetLog("warn", "_setStreamSound: STREAM_UPDATE_SETTINGS failed", e);
             }
 
             const payload = {
@@ -2464,11 +2494,11 @@ module.exports = class VoiceEncounterTracker {
                 context: "stream"
             };
 
-            BdApi.Logger.info(this.meta.name, "_setStreamSound:", payload);
+            vetLog("info", "_setStreamSound:", payload);
             actions.setGoLiveSource(payload);
             return true;
         } catch (e) {
-            BdApi.Logger.error(this.meta.name, "_setStreamSound:", e);
+            vetLog("error", "_setStreamSound:", e);
             return false;
         }
     }
@@ -2518,7 +2548,7 @@ module.exports = class VoiceEncounterTracker {
                 }
             }
         } catch (e) {}
-        BdApi.Logger.warn(this.meta.name, "_stopSelfStream: button not found");
+        vetLog("warn", "_stopSelfStream: button not found");
         return false;
     }
 

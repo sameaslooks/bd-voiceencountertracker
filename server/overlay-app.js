@@ -850,6 +850,15 @@ function startServer() {
             return;
         }
 
+        if (req.method === "POST" && url === "/log/plugin") {
+            try {
+                const parsed = JSON.parse(await readBody(req) || "{}");
+                const lines = Array.isArray(parsed.lines) ? parsed.lines : [];
+                if (lines.length) appendLog(PLUGIN_LOG_FILE, lines.join("\n") + "\n");
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
         if (req.method === "POST" && url === "/video/close") {
             closeVideoWindow();
             jsonReply(res, 200, { ok: true });
@@ -1698,6 +1707,55 @@ function openVideoWindow(params) {
         _webrtcAnswerCandidates = [];
     });
 }
+
+// =====================================================================
+// Stream window log file: server/logs/video.log (rotated at 5 MB)
+// =====================================================================
+const VIDEO_LOG_DIR = path.join(__dirname, "logs");
+const VIDEO_LOG_FILE = path.join(VIDEO_LOG_DIR, "video.log");
+function appendLog(file, text) {
+    try {
+        fs.mkdirSync(VIDEO_LOG_DIR, { recursive: true });
+        try {
+            if (fs.statSync(file).size > 5 * 1024 * 1024) fs.renameSync(file, file + ".old");
+        } catch (e) {}
+        fs.appendFile(file, text, () => {});
+    } catch (e) {}
+}
+const PLUGIN_LOG_FILE = path.join(VIDEO_LOG_DIR, "plugin.log");
+
+function videoLog(...args) {
+    try {
+        fs.mkdirSync(VIDEO_LOG_DIR, { recursive: true });
+        try {
+            if (fs.statSync(VIDEO_LOG_FILE).size > 5 * 1024 * 1024) {
+                fs.renameSync(VIDEO_LOG_FILE, VIDEO_LOG_FILE + ".old");
+            }
+        } catch (e) {}
+        const line = new Date().toISOString() + " " + args.map(a =>
+            typeof a === "string" ? a : (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })()
+        ).join(" ") + "\n";
+        fs.appendFile(VIDEO_LOG_FILE, line, () => {});
+    } catch (e) {}
+}
+
+function wireVideoWindowLogging(win) {
+    const wc = win.webContents;
+    videoLog("=== video window opened ===");
+    wc.on("console-message", (...a) => {
+        // Electron passes either (event, level, message, line, sourceId) or (event{level,message,...})
+        const ev = a[0] || {};
+        const level = typeof a[1] === "number" ? a[1] : ev.level;
+        const msg = typeof a[2] === "string" ? a[2] : ev.message;
+        videoLog("[console:" + level + "]", String(msg));
+    });
+    wc.on("render-process-gone", (_e, d) => videoLog("RENDER PROCESS GONE", d));
+    wc.on("unresponsive", () => videoLog("WINDOW UNRESPONSIVE"));
+    wc.on("responsive", () => videoLog("window responsive again"));
+    wc.on("did-fail-load", (_e, code, desc) => videoLog("did-fail-load", code, desc));
+    win.on("closed", () => videoLog("=== video window closed ==="));
+}
+app.on("child-process-gone", (_e, d) => videoLog("CHILD PROCESS GONE", d));
 
 function closeVideoWindow() {
     if (videoWindow && !videoWindow.isDestroyed()) {
