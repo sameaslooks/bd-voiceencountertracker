@@ -95,6 +95,9 @@ module.exports = class VoiceEncounterTracker {
 
         this._framePump = null;
         this._watchedUserId = null;
+        // Several streams can be watched at once: one peer + native handle per
+        // viewer key (a user id, or "cam:<id>" for a camera).
+        this._pumps = new Map();
 
         this.prefs = {
             autoMuteBlocked: false,
@@ -1900,6 +1903,8 @@ module.exports = class VoiceEncounterTracker {
                     manualKnown: !!rec?.manual,
                     viewers: isSelf && s.streaming ? this._myStreamViewers(mySession) : null,
                     streamSourceId: isSelf && s.streaming ? this._myStreamSourceId() : null,
+                    streamPreview: s.streaming ? this._streamPreviewUrl(userId, mySession) : null,
+                    streamPaused: s.streaming ? this._streamPaused(userId, mySession) : false,
                     favorite: !isSelf && !!this._favorites?.has(userId),
                     favSound: !isSelf && !!this._favorites?.get(userId)?.sound
                 });
@@ -2053,11 +2058,13 @@ module.exports = class VoiceEncounterTracker {
         }
 
         if (action === "stop-stream") {
-            vetLog("info", "stop-stream requested (viewer closed)");
+            const key = userId ? String(userId) : null;
+            vetLog("info", "stop-stream requested (viewer closed)", key || "(all)");
             // Queued behind any watch in progress, so a half-started watch never
-            // has its track released under it; pending watches are cancelled.
-            this._watchToken = (this._watchToken || 0) + 1;
-            const stop = () => this._stopFramePump();
+            // has its track released under it; a pending watch of the same
+            // viewer is cancelled.
+            if (key) this._bumpWatchToken(key);
+            const stop = () => this._stopFramePump(key);
             this._watchChain = (this._watchChain || Promise.resolve()).then(stop, stop);
             return;
         }
@@ -2095,6 +2102,10 @@ module.exports = class VoiceEncounterTracker {
         }
         if (action === "watch-camera") {
             if (userId) this._watchCamera(String(userId));
+            return;
+        }
+        if (action === "watch-own") {
+            if (userId) this._watchOwn(String(userId));
             return;
         }
         if (action === "leave-voice") {
@@ -2324,11 +2335,17 @@ module.exports = class VoiceEncounterTracker {
     // Watch requests run one at a time: two overlapping watches (one holding
     // Discord's native track while the other makes Discord rejoin the stream)
     // crash Discord. A request that is superseded while waiting is dropped.
+    _bumpWatchToken(key) {
+        this._watchTokens ||= {};
+        return (this._watchTokens[key] = (this._watchTokens[key] || 0) + 1);
+    }
+
     _watchStream(userId, opts = {}) {
-        const token = (this._watchToken = (this._watchToken || 0) + 1);
+        const key = String(userId);
+        const token = this._bumpWatchToken(key);
         const run = async () => {
-            if (token !== this._watchToken) {
-                vetLog("info", "_watchStream: superseded, skipped");
+            if (token !== this._watchTokens[key]) {
+                vetLog("info", "_watchStream: superseded, skipped", key);
                 return false;
             }
             return this._watchStreamImpl(userId, opts);
@@ -2351,15 +2368,16 @@ module.exports = class VoiceEncounterTracker {
                 : `call:${mySession.channelId}:${userId}`;
             vetLog("info", "_watchStream: key =", streamKey);
 
-            if (!reconnect) this._postJSON("/video/open", { userId, streamKey });
+            const key = String(userId);
+            if (!reconnect) this._postJSON("/video/open", { key, userId, streamKey });
 
-            if (!reconnect && this._watchedUserId === userId && this._framePump) {
+            if (!reconnect && this._pumps.has(key)) {
                 vetLog("info", "_watchStream: already watching, reusing");
                 return true;
             }
             if (reconnect) {
                 vetLog("info", "_watchStream: reconnect for", userId);
-                this._stopFramePump();
+                this._stopFramePump(key);
             }
 
             // The last pump on this user's stream sent no frames at all:
@@ -2369,7 +2387,7 @@ module.exports = class VoiceEncounterTracker {
             const rewatch = frozen && Date.now() - lastRewatch > 30000;
             if (rewatch) {
                 this._lastRewatchAt[userId] = Date.now();
-                this._stopFramePump();
+                this._stopFramePump(String(userId));
                 // Let Discord's pipeline let go of the old track before it rejoins.
                 await new Promise(res => setTimeout(res, 1000));
             }
@@ -2382,8 +2400,7 @@ module.exports = class VoiceEncounterTracker {
                 return false;
             }
 
-            this._watchedUserId = userId;
-            await this._startWatchStreamPeer(stream);
+            await this._startWatchStreamPeer(stream, String(userId));
             return true;
         } catch (e) {
             vetLog("error", "_watchStream:", e);
@@ -2402,7 +2419,7 @@ module.exports = class VoiceEncounterTracker {
             return null;
         }
 
-        if (!rewatch && this._watchedUserId === userId) {
+        if (!rewatch && this._pumps.has(String(userId))) {
             const existing = this._findLiveVideoForStream();
             if (existing) {
                 vetLog("info", "_watchStreamByUserId: already live, reusing");
@@ -2446,8 +2463,9 @@ module.exports = class VoiceEncounterTracker {
                 const fresh = await this._reuseDiscordWatch(userId, { excludeSid: frozenSid });
                 if (fresh) return fresh;
             }
-            vetLog("warn", "rewatch: no new stream id from Discord");
-            return null;
+            // Discord kept the same stream id: take what there is rather than fail.
+            vetLog("warn", "rewatch: no new stream id from Discord, using the current one");
+            return await this._reuseDiscordWatch(userId);
         }
 
         const video = await this._waitForLiveVideo(timeout, before);
@@ -2547,9 +2565,11 @@ module.exports = class VoiceEncounterTracker {
             }
         }
 
-        // 2) Discord's own <video> element (only safe when exactly one stream is watched)
+        // 2) Discord's own <video> element (only safe when exactly one stream is
+        //    watched; my own stream doesn't count)
         if (excludeSid != null) return null;
-        if (active.length === 1) {
+        const me = this.getCurrentUserId();
+        if (active.filter(x => String(x.ownerId) !== String(me)).length === 1) {
             const v = this._findLiveVideoForStream() || await this._waitForLiveVideo(3000);
             const t = v?.srcObject?.getVideoTracks?.()[0];
             if (t) {
@@ -2644,28 +2664,49 @@ module.exports = class VoiceEncounterTracker {
         });
     }
 
-    async _startWatchStreamPeer(stream) {
-        // Close only the previous peer. The native handle and user id were
-        // just set for THIS stream; releasing the handle here pulled Discord's
-        // track out from under the new peer.
-        const keepHandle = this._nativeStreamHandle;
-        const keepUser = this._watchedUserId;
-        const keepSid = this._sourceSid;
-        if (this._framePump) {
-            this._framePump.stop();
-            vetLog("info", "frame pump stopped (replaced)");
+    // `key` = which viewer this feeds. The native handle / stream id that the
+    // watch just acquired (this._nativeStreamHandle / this._sourceSid) move into
+    // this viewer's entry; only this viewer's previous peer is closed.
+    async _startWatchStreamPeer(stream, key, { low = false } = {}) {
+        // My own preview: small and cheap (360p, 25 fps, ~1.2 Mbps); others' streams: full quality.
+        const tuneEncoding = (enc) => {
+            if (low) {
+                const h = stream.getVideoTracks()[0]?.getSettings?.().height || 1080;
+                enc.maxBitrate = 1_200_000;
+                enc.scaleResolutionDownBy = Math.max(1, h / 360);
+                enc.maxFramerate = 25;
+                enc.degradationPreference = "balanced";
+            } else {
+                enc.maxBitrate = 8_000_000;
+                enc.scaleResolutionDownBy = 1;
+                enc.degradationPreference = "maintain-resolution";
+            }
+            enc.networkPriority = "high";
+            enc.priority = "high";
+        };
+        const handle = this._nativeStreamHandle;
+        const sid = this._sourceSid || null;
+        this._nativeStreamHandle = null;
+        this._sourceSid = null;
+        if (this._pumps.has(key)) {
+            this._stopFramePump(key);
+            vetLog("info", "frame pump stopped (replaced)", key);
         }
-        this._nativeStreamHandle = keepHandle;
-        this._watchedUserId = keepUser;
-        this._sourceSid = keepSid;
 
         const pc = new RTCPeerConnection({ iceServers: [] });
-        this._watchPeer = pc;
         let statsTimer = null;
         let statsPrevPackets = 0;
-        const pumpUserId = this._watchedUserId != null ? String(this._watchedUserId) : null;
-        const pumpSid = this._sourceSid || null;
+        const pumpUserId = /^(cam|own):/.test(key) ? null : key;   // frozen-source check is for others' streams
+        const pumpSid = sid;
         const pumpStartedAt = Date.now();
+        const entry = {
+            pc, handle, sid,
+            stop: () => {
+                if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+                try { pc.close(); } catch (e) {}
+            }
+        };
+        this._pumps.set(key, entry);
 
         pc.onconnectionstatechange = () => {
             vetLog("info", "watch peer state:", pc.connectionState);
@@ -2688,11 +2729,7 @@ module.exports = class VoiceEncounterTracker {
                 if (!params.encodings || params.encodings.length === 0) {
                     params.encodings = [{}];
                 }
-                params.encodings[0].maxBitrate = 8_000_000;
-                params.encodings[0].scaleResolutionDownBy = 1;
-                params.encodings[0].networkPriority = "high";
-                params.encodings[0].priority = "high";
-                params.encodings[0].degradationPreference = "maintain-resolution";
+                tuneEncoding(params.encodings[0]);
                 await sender.setParameters(params);
                 vetLog("info", "sender tuned (pre-offer):",
                     JSON.stringify(params.encodings[0]));
@@ -2731,6 +2768,7 @@ module.exports = class VoiceEncounterTracker {
 
         const desc = pc.localDescription;
         this._postJSON("/webrtc/offer", {
+            key,
             offer: { type: desc.type, sdp: desc.sdp },
             candidates: []
         });
@@ -2739,16 +2777,16 @@ module.exports = class VoiceEncounterTracker {
         let answer = null;
         for (let i = 0; i < 60; i++) {
             try {
-                const r = await BdApi.Net.fetch(`${this.OVERLAY_URL}/webrtc/answer`, { cache: "no-store" });
+                if (this._pumps.get(key) !== entry) return false;     // closed meanwhile
+                const r = await BdApi.Net.fetch(`${this.OVERLAY_URL}/webrtc/answer?key=${encodeURIComponent(key)}`, { cache: "no-store" });
                 const data = await r.json();
                 if (data?.answer) { answer = data.answer; break; }
             } catch (e) {}
             await new Promise(r => setTimeout(r, 250));
         }
         if (!answer) {
-            vetLog("warn", "watch peer: no answer from viewer");
-            try { pc.close(); } catch (e) {}
-            this._watchPeer = null;
+            vetLog("warn", "watch peer: no answer from viewer", key);
+            if (this._pumps.get(key) === entry) this._stopFramePump(key);
             return false;
         }
 
@@ -2757,8 +2795,7 @@ module.exports = class VoiceEncounterTracker {
             vetLog("info", "watch peer: answer applied");
         } catch (e) {
             vetLog("error", "setRemoteDescription failed:", e);
-            try { pc.close(); } catch (er) {}
-            this._watchPeer = null;
+            if (this._pumps.get(key) === entry) this._stopFramePump(key);
             return false;
         }
 
@@ -2769,14 +2806,10 @@ module.exports = class VoiceEncounterTracker {
                 if (!params.encodings || params.encodings.length === 0) {
                     params.encodings = [{}];
                 }
-                params.encodings[0].maxBitrate = 8_000_000;
-                params.encodings[0].scaleResolutionDownBy = 1;
-                params.encodings[0].degradationPreference = "maintain-resolution";
-                params.encodings[0].networkPriority = "high";
-                params.encodings[0].priority = "high";
+                tuneEncoding(params.encodings[0]);
                 await sender.setParameters(params);
                 statsTimer = setInterval(async () => {
-                    if (pc.connectionState === "closed" || this._watchPeer !== pc) {
+                    if (pc.connectionState === "closed" || this._pumps.get(key) !== entry) {
                         clearInterval(statsTimer); statsTimer = null; return;
                     }
                     try {
@@ -2786,8 +2819,10 @@ module.exports = class VoiceEncounterTracker {
                                 // Connected for 5 s and not one frame encoded: the
                                 // source itself gives nothing. Remember it so the
                                 // next watch of this user makes Discord rejoin.
+                                // (a stream Discord paused — window minimized — sends nothing on purpose)
                                 if (!r.framesEncoded && pc.connectionState === "connected" &&
                                     Date.now() - pumpStartedAt > 5000 && pumpUserId &&
+                                    !this._streamPaused(pumpUserId, this.active.get(this.getCurrentUserId())) &&
                                     !(this._frozenSource && this._frozenSource.userId === pumpUserId)) {
                                     this._frozenSource = { userId: pumpUserId, sid: pumpSid };
                                     vetLog("warn", "watch source frozen (0 frames encoded), sid", pumpSid);
@@ -2821,16 +2856,7 @@ module.exports = class VoiceEncounterTracker {
             vetLog("warn", "sender.setParameters failed:", e.message);
         }
 
-        this._framePump = {
-            stop: () => {
-                if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
-                try { pc.close(); } catch (e) {}
-                this._watchPeer = null;
-                this._framePump = null;
-            }
-        };
-
-        vetLog("info", "watch peer started");
+        vetLog("info", "watch peer started", key, "· watching", this._pumps.size);
         return true;
     }
 
@@ -3282,18 +3308,21 @@ module.exports = class VoiceEncounterTracker {
         return this._navFn;
     }
 
-    // Same as Discord's own "Message" button: opens (or creates) the DM.
-    _openDM(userId) {
+    // Opens the DM with this user, like Discord's "Message": the existing DM
+    // channel (/channels/@me/<id>), or a new one made for just this user.
+    // (openPrivateChannel took the id as a recipients list here and made an
+    // empty group, so it isn't used.)
+    async _openDM(userId) {
         try {
-            const mod = BdApi.Webpack.getByKeys("openPrivateChannel", { searchExports: true });
-            if (typeof mod?.openPrivateChannel === "function") {
-                mod.openPrivateChannel(String(userId));
-            } else {
-                const cid = this._dmChannelId(userId);
-                if (cid) { this._openChannel(cid, "@me"); return; }
-                vetLog("warn", "openPrivateChannel not found");
+            let cid = this._dmChannelId(userId);
+            if (!cid) {
+                const mod = BdApi.Webpack.getByKeys("getOrEnsurePrivateChannel", { searchExports: true })
+                         || BdApi.Webpack.getByKeys("ensurePrivateChannel", { searchExports: true });
+                const fn = mod?.getOrEnsurePrivateChannel || mod?.ensurePrivateChannel;
+                if (typeof fn === "function") cid = await fn.call(mod, String(userId));
             }
-            this._focusDiscord();
+            if (!cid) { vetLog("warn", "_openDM: no DM channel for", userId); return; }
+            this._openChannel(String(cid), "@me");
         } catch (e) { vetLog("error", "_openDM:", e); }
     }
 
@@ -3440,6 +3469,31 @@ module.exports = class VoiceEncounterTracker {
         } catch (e) { return []; }
     }
 
+    // The thumbnail Discord shows for a stream (refreshed by Discord every few
+    // seconds while someone watches the channel).
+    _streamPreviewUrl(userId, mySession) {
+        try {
+            const st = BdApi.Webpack.getStore("ApplicationStreamPreviewStore");
+            if (!st) return null;
+            const g = mySession?.guildId ?? null, c = mySession?.channelId ?? null;
+            const url = st.getPreviewURL?.(g, c, String(userId))
+                ?? st.getPreviewURLForStreamKey?.(g ? `guild:${g}:${c}:${userId}` : `call:${c}:${userId}`);
+            return typeof url === "string" ? url : null;
+        } catch (e) { return null; }
+    }
+
+    // Discord pauses a stream when the streamer's window is minimized (and
+    // says so in its own UI).
+    _streamPaused(userId, mySession) {
+        try {
+            const ass = BdApi.Webpack.getStore("ApplicationStreamingStore");
+            const g = mySession?.guildId ?? null;
+            const st = ass?.getActiveStreamForUser?.(String(userId), g) || ass?.getStreamForUser?.(String(userId), g)
+                || (ass?.getAllActiveStreams?.() || []).find(x => String(x?.ownerId) === String(userId));
+            return !!st && (st.state === "PAUSED" || st.paused === true);
+        } catch (e) { return false; }
+    }
+
     _streamKeyOf(st) {
         if (!st) return null;
         return st.guildId ? `guild:${st.guildId}:${st.channelId}:${st.ownerId}` : `call:${st.channelId}:${st.ownerId}`;
@@ -3461,30 +3515,63 @@ module.exports = class VoiceEncounterTracker {
 
     // A camera goes through the same viewer window as streams. Discord only
     // receives someone's camera while its call view subscribes to it.
-    async _watchCamera(userId) {
-        try {
-            const vss = BdApi.Webpack.getStore("VideoStreamStore");
-            const sid = vss?.getStreamId?.(userId, "video") ?? vss?.getStreamId?.(userId);
-            const nz = this._findNzFunction();
-            const handle = sid && typeof nz === "function" ? nz(String(sid)) : null;
-            const t = handle?.stream?.getVideoTracks?.()[0];
-            if (!t) {
-                vetLog("warn", "watch-camera: no camera track for", userId, "sid", sid);
-                BdApi.UI.showToast("Camera isn't loaded in Discord — open the call view once", { type: "warning" });
-                try { handle?.release?.(); } catch (e) {}
-                return;
-            }
-            this._watchToken = (this._watchToken || 0) + 1;
-            const run = async () => {
-                this._stopFramePump();
-                this._postJSON("/video/open", { userId, camera: true });
+    // My own stream, taken from Discord's own pipeline (the frames it captured
+    // to send, before encoding) through the same native handle as others'
+    // streams. If Discord has no such stream, the overlay falls back to a local
+    // capture of the streamed window.
+    async _watchOwn(userId) {
+        const key = "own:" + userId;
+        const token = this._bumpWatchToken(key);
+        const run = async () => {
+            if (token !== this._watchTokens[key]) return;
+            try {
+                const vss = BdApi.Webpack.getStore("VideoStreamStore");
+                const sid = vss?.getStreamId?.(userId, "stream");
+                const nz = this._findNzFunction();
+                const handle = sid && typeof nz === "function" ? nz(String(sid)) : null;
+                const t = handle?.stream?.getVideoTracks?.()[0];
+                if (!t) {
+                    vetLog("info", "watch-own: Discord has no own stream track (sid", sid, ") — local capture");
+                    try { handle?.release?.(); } catch (e) {}
+                    this._postJSON("/video/own-local", {});
+                    return;
+                }
+                vetLog("info", "watch-own: Discord's own stream track via sid", sid);
                 this._nativeStreamHandle = handle;
                 this._sourceSid = String(sid);
-                this._watchedUserId = userId;
-                await this._startWatchStreamPeer(new MediaStream([t]));
-            };
-            this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
-        } catch (e) { vetLog("error", "_watchCamera:", e); }
+                await this._startWatchStreamPeer(new MediaStream([t]), key, { low: true });
+            } catch (e) {
+                vetLog("error", "_watchOwn:", e);
+                this._postJSON("/video/own-local", {});
+            }
+        };
+        this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
+    }
+
+    async _watchCamera(userId) {
+        const key = "cam:" + userId;
+        const token = this._bumpWatchToken(key);
+        const run = async () => {
+            if (token !== this._watchTokens[key]) return;
+            try {
+                const vss = BdApi.Webpack.getStore("VideoStreamStore");
+                const sid = vss?.getStreamId?.(userId, "video") ?? vss?.getStreamId?.(userId);
+                const nz = this._findNzFunction();
+                const handle = sid && typeof nz === "function" ? nz(String(sid)) : null;
+                const t = handle?.stream?.getVideoTracks?.()[0];
+                if (!t) {
+                    vetLog("warn", "watch-camera: no camera track for", userId, "sid", sid);
+                    BdApi.UI.showToast("Camera isn't loaded in Discord — open the call view once", { type: "warning" });
+                    try { handle?.release?.(); } catch (e) {}
+                    return;
+                }
+                this._postJSON("/video/open", { key, userId, camera: true });
+                this._nativeStreamHandle = handle;
+                this._sourceSid = String(sid);
+                await this._startWatchStreamPeer(new MediaStream([t]), key);
+            } catch (e) { vetLog("error", "_watchCamera:", e); }
+        };
+        this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
     }
 
     // =====================================================================
@@ -3793,17 +3880,21 @@ module.exports = class VoiceEncounterTracker {
         };
     }
 
-    _stopFramePump() {
-        if (this._framePump) {
-            this._framePump.stop();
-            vetLog("info", "frame pump stopped");
+    // Stop one viewer's peer and release its Discord handle (no key = all).
+    _stopFramePump(key = null) {
+        const keys = key != null ? [String(key)] : [...this._pumps.keys()];
+        for (const k of keys) {
+            const e = this._pumps.get(k);
+            if (!e) continue;
+            this._pumps.delete(k);
+            try { e.stop(); } catch (er) {}
+            if (e.handle) { try { e.handle.release(); } catch (er) {} }
+            vetLog("info", "frame pump stopped", k);
         }
-        if (this._nativeStreamHandle) {
+        if (key == null && this._nativeStreamHandle) {
             try { this._nativeStreamHandle.release(); } catch (e) {}
-            this._nativeStreamHandle = null;
         }
-        this._watchedUserId = null;
-        this._sourceSid = null;
+        if (key == null) { this._nativeStreamHandle = null; this._sourceSid = null; }
     }
 
     _setStreamSound(enabled) {

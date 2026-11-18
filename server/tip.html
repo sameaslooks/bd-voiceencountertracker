@@ -80,24 +80,39 @@ async function renderPing() {
     report();
 }
 
-// My stream: what I'm streaming + who watches
-async function renderMyLive() {
+// LIVE: the stream's preview (Discord's thumbnail; for my own stream a local
+// capture of the streamed window if Discord has none).
+async function renderPreview() {
     let st = {}, thumbs = {};
     try { st = await (await fetch(API + "/state", { cache: "no-store" })).json(); } catch (e) {}
+    const u = (st.users || []).find(x => x.userId === uidParam);
+    let url = u && u.streamPreview;
+    if (!url && u && u.isSelf) {
+        try { thumbs = (await (await fetch(API + "/sources/thumbs", { cache: "no-store" })).json()).thumbs || {}; } catch (e) {}
+        const src = u.streamSourceId || "";
+        url = thumbs[src] || (src.startsWith("screen-handle:") ? Object.entries(thumbs).find(([k]) => k.startsWith("screen:"))?.[1] : null);
+    }
+    el.innerHTML = url ? `<img class="prev" src="${esc(url)}">` : `<span class="muted">No preview yet</span>`;
+    const img = el.querySelector("img");
+    if (img) img.onload = report;
+    report();
+}
+
+// Viewer count: who watches my stream
+async function renderViewers() {
+    let st = {};
+    try { st = await (await fetch(API + "/state", { cache: "no-store" })).json(); } catch (e) {}
     const me = (st.users || []).find(u => u.isSelf);
-    try { thumbs = (await (await fetch(API + "/sources/thumbs", { cache: "no-store" })).json()).thumbs || {}; } catch (e) {}
-    const src = me?.streamSourceId || "";
-    let url = thumbs[src];
-    if (!url && src.startsWith("screen-handle:")) url = Object.entries(thumbs).find(([k]) => k.startsWith("screen:"))?.[1];
     const v = Array.isArray(me?.viewers) ? me.viewers : [];
-    el.innerHTML = (url ? `<img class="prev" src="${url}">` : "") +
-        (v.length ? v.map(x => `<div class="v${x.stranger ? " s" : ""}"><img src="${avatarUrl(x.userId, x.avatar)}">${esc(x.name)}${x.stranger ? ` <svg class="warn" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M10.3 3.7a2 2 0 0 1 3.4 0l8.2 14.1A2 2 0 0 1 20.2 21H3.8a2 2 0 0 1-1.7-3.2l8.2-14.1ZM11 9v5h2V9h-2Zm0 7v2h2v-2h-2Z"/></svg>` : ""}</div>`).join("")
-                  : `<div class="v muted">No viewers</div>`);
+    el.innerHTML = v.length
+        ? v.map(x => `<div class="v${x.stranger ? " s" : ""}"><img src="${avatarUrl(x.userId, x.avatar)}">${esc(x.name)}${x.stranger ? ` <svg class="warn" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M10.3 3.7a2 2 0 0 1 3.4 0l8.2 14.1A2 2 0 0 1 20.2 21H3.8a2 2 0 0 1-1.7-3.2l8.2-14.1ZM11 9v5h2V9h-2Zm0 7v2h2v-2h-2Z"/></svg>` : ""}</div>`).join("")
+        : `<div class="v muted">No viewers</div>`;
     report();
 }
 
 // Someone's activity: art + full status (+ progress for music, elapsed for games)
 const uid = new URLSearchParams(location.search).get("uid");
+const uidParam = uid;
 const KIND = { game: "Playing", listening: "Listening to", watching: "Watching", streaming: "Streaming" };
 const mmss = (ms) => { const t = Math.max(0, Math.round(ms / 1000)); const h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = t % 60;
     return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(s).padStart(2, "0"); };
@@ -132,9 +147,10 @@ async function renderActivity() {
     report();
 }
 
-const run = mode === "mylive" ? renderMyLive : mode === "activity" ? renderActivity : renderPing;
+const run = mode === "preview" ? renderPreview : mode === "viewers" ? renderViewers
+          : mode === "activity" ? renderActivity : renderPing;
 run();
-setInterval(run, mode === "mylive" ? 2000 : 1000);
+setInterval(run, mode === "preview" ? 3000 : mode === "viewers" ? 1500 : 1000);
 </script>
 </body>
 </html>

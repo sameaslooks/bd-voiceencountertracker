@@ -15,7 +15,7 @@
         display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
         color: #dbdee1; -webkit-app-region: drag; cursor: move;
     }
-    .t { font-size: 12px; font-weight: 600; color: #fff; }
+    .t { font-size: 13px; font-weight: 700; color: #fff; }
     .s { font-size: 10px; color: #b5bac1; }
     svg { width: 22px; height: 22px; color: #b5bac1; }
 </style>
@@ -29,11 +29,14 @@ const ICON = {
     notify: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2a6 6 0 0 0-6 6v3.6l-1.7 3A1 1 0 0 0 5.2 16h13.6a1 1 0 0 0 .9-1.4L18 11.6V8a6 6 0 0 0-6-6Zm-2.5 16a2.5 2.5 0 0 0 5 0h-5Z"/></svg>`
 };
 const LABEL = {
-    "stream-big":   ["Stream", "drag · resize from the edges"],
-    "stream-small": ["Stream preview", "drag · resize from the edges"],
+    "stream-big":   ["Stream 1", "drag · resize from the edges"],
+    "stream-small": ["Stream 1 · preview", "drag · resize from the edges"],
+    "stream-extra": ["Stream", "opens here when one more is watched"],
     "notify":       ["Notifications", "drag"]
 };
-const [t, s] = LABEL[kind] || ["", ""];
+let [t, s] = LABEL[kind] || LABEL[String(kind).replace(/-\d+$/, "")] || ["", ""];
+const extraN = /^stream-extra-(\d+)$/.exec(kind || "");
+if (extraN) t = "Stream " + (Number(extraN[1]) + 1);     // extra-1 = the 2nd stream
 document.getElementById("f").innerHTML = `${kind === "notify" ? ICON.notify : ICON.stream}<span class="t">${t}</span><span class="s">${s}</span>`;
 </script>
 </body>

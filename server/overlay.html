@@ -282,7 +282,7 @@
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70px;
     }
     .user .mobile-ico { width: 10px; height: 13px; color: #949ba4; flex-shrink: 0; }
-    .vs-live.self-live { cursor: default; }
+    .vs-live.self-live { cursor: pointer; }
     .user .mylive { display: inline-flex; align-items: center; flex-shrink: 0; }
     .hdr-ico { width: 11px; height: 11px; vertical-align: -1px; margin-right: 3px; }
     .vcard .go svg { width: 14px; height: 14px; display: block; }
@@ -815,16 +815,16 @@ function actionButton(action, title, active, svgPath, userId) {
            `</button>`;
 }
 
+// LIVE: hover = preview of the stream, click = watch it (my own too, captured
+// locally). The viewer count next to my LIVE: hover = who watches.
 function liveBadgeHtml(u) {
     if (!u.streaming) return "";
-    if (u.isSelf) {
-        const v = Array.isArray(u.viewers) ? u.viewers : [];
-        const warn = v.some(x => x.stranger) ? " warn" : "";
-        return `<span class="mylive" data-mylive="1"><span class="vs-live self-live">LIVE</span>` +
-            (v.length ? `<span class="viewers${warn}" title="Viewers"><svg class="eye-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 5C6.5 5 2.7 9.4 1.6 11.4a1.3 1.3 0 0 0 0 1.2C2.7 14.6 6.5 19 12 19s9.3-4.4 10.4-6.4a1.3 1.3 0 0 0 0-1.2C21.3 9.4 17.5 5 12 5Zm0 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"/></svg><span>${v.length}</span></span>` : "") + `</span>`;
-    }
-    return `<span class="vs-live" data-act="watch-stream" data-uid="${esc(u.userId)}" ` +
-           `title="Streaming — click to watch">LIVE</span>`;
+    const live = `<span class="vs-live${u.isSelf ? " self-live" : ""}" data-act="${u.isSelf ? "watch-own" : "watch-stream"}" data-uid="${esc(u.userId)}" data-tipmode="preview">LIVE</span>`;
+    if (!u.isSelf) return live;
+    const v = Array.isArray(u.viewers) ? u.viewers : [];
+    const warn = v.some(x => x.stranger) ? " warn" : "";
+    return `<span class="mylive">${live}` +
+        (v.length ? `<span class="viewers${warn}" data-tipmode="viewers" data-uid="${esc(u.userId)}"><svg class="eye-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 5C6.5 5 2.7 9.4 1.6 11.4a1.3 1.3 0 0 0 0 1.2C2.7 14.6 6.5 19 12 19s9.3-4.4 10.4-6.4a1.3 1.3 0 0 0 0-1.2C21.3 9.4 17.5 5 12 5Zm0 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"/></svg><span>${v.length}</span></span>` : "") + `</span>`;
 }
 
 function voiceStatusHtml(u, now) {
@@ -1256,6 +1256,7 @@ elUsers.addEventListener("click", (e) => {
     if (!action) return;
 
     if (action === "watch-camera") { postCommand({ action: "watch-camera", userId }); return; }
+    if (action === "watch-own") { closeTip(); fetch("http://127.0.0.1:17842/video/own", { method: "POST" }).catch(() => {}); return; }
     if (action === "watch-stream") {
         fetch(API_COMMAND, {
             method: "POST",
@@ -1438,16 +1439,16 @@ elUsers.addEventListener("mouseout", (e) => {
     closeTip();
 });
 
-// ─── My LIVE badge: hover shows a preview of what I stream + who watches ───
+// ─── LIVE (preview) / viewer count (who watches): hover tooltips ───
 let tipTimer = null;
 elUsers.addEventListener("mouseover", (e) => {
-    const b = crossed(e, "[data-mylive]");
+    const b = crossed(e, "[data-tipmode]");
     if (!b) return;
     clearTimeout(tipTimer);
-    tipTimer = setTimeout(() => openTipAt("mylive", b), 250);
+    tipTimer = setTimeout(() => openTipAt(b.getAttribute("data-tipmode"), b, b.getAttribute("data-uid")), 250);
 });
 elUsers.addEventListener("mouseout", (e) => {
-    if (!crossed(e, "[data-mylive]")) return;
+    if (!crossed(e, "[data-tipmode]")) return;
     clearTimeout(tipTimer);
     closeTip();
 });

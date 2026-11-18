@@ -99,6 +99,9 @@
         box-shadow: 0 4px 18px rgba(0,0,0,0.45);
         max-width: calc(100% - 24px);
     }
+    #reconnect.paused .spinner { display: none; }
+    #reconnect .pause-ico { display: none; width: 18px; height: 18px; color: #b5bac1; flex-shrink: 0; }
+    #reconnect.paused .pause-ico { display: block; }
     #reconnect .spinner {
         flex: none;
         width: 18px; height: 18px;
@@ -152,6 +155,7 @@
     <div id="reconnect">
         <div class="card">
             <div class="spinner"></div>
+            <svg class="pause-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 4h3.5v16H7zM13.5 4H17v16h-3.5z"/></svg>
             <div class="text">
                 <div class="title" id="reconnect-text">Reconnecting…</div>
                 <div class="sub" id="reconnect-sub"></div>
@@ -162,6 +166,9 @@
 
 <script>
 const API_BASE = "http://127.0.0.1:17842";
+// Which viewer this window is (several can be open); set by the overlay app.
+const viewKey = () => (window.__vetStreamParams || {}).key || "";
+const isLocal = () => !!(window.__vetStreamParams || {}).local;
 const elView = document.getElementById("view");
 const elStatus = document.getElementById("status");
 const ctx = elView.getContext("2d", { alpha: false });
@@ -209,7 +216,7 @@ function reportAspect(w, h) {
     fetch(API_BASE + "/video/aspect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ width: w, height: h })
+        body: JSON.stringify({ key: viewKey(), width: w, height: h })
     }).catch(() => {});
 }
 
@@ -348,7 +355,7 @@ let zoomSaveTimer = null;
 function saveZoomSoon() {
     clearTimeout(zoomSaveTimer);
     zoomSaveTimer = setTimeout(() => {
-        fetch(API_BASE + "/video/zoom", { method: "POST", body: JSON.stringify({ z: zoom.z, cx: zoom.cx, cy: zoom.cy }) }).catch(() => {});
+        fetch(API_BASE + "/video/zoom", { method: "POST", body: JSON.stringify({ key: viewKey(), z: zoom.z, cx: zoom.cx, cy: zoom.cy }) }).catch(() => {});
     }, 400);
 }
 
@@ -583,7 +590,27 @@ let reconnectAttempts = 0;
 const elReconnect = document.getElementById("reconnect");
 const elReconnectSub = document.getElementById("reconnect-sub");
 
+// Discord paused the stream (streamer's window minimized): show the last frame
+// blurred with a quiet note; no spinner, no reconnecting.
+let streamPaused = false;
+window.__vetSetPaused = (on, own) => {
+    streamPaused = !!on;
+    elReconnect.classList.toggle("paused", streamPaused);
+    if (streamPaused) {
+        reconnecting = false;
+        document.getElementById("reconnect-text").textContent = "Stream paused";
+        elReconnectSub.textContent = own ? "Your streamed window is minimized" : "The streamer minimized their window";
+        elReconnect.classList.add("show");
+    } else {
+        document.getElementById("reconnect-text").textContent = "Reconnecting…";
+        elReconnectSub.textContent = "";
+        if (!reconnecting) elReconnect.classList.remove("show");
+        lastFrameAt = performance.now();      // give frames a moment to come back
+    }
+};
+
 function startReconnect(reason) {
+    if (streamPaused) return;
     if (!reconnecting) {
         reconnecting = true;
         reconnectSince = performance.now();
@@ -616,13 +643,60 @@ function hideSavedFrame() {
 }
 
 function endReconnect() {
+    if (streamPaused) return;          // a stray frame while paused doesn't end the pause card
     reconnecting = false;
     hideSavedFrame();
     elReconnect.classList.remove("show");
     log("stream resumed after", Math.round(performance.now() - reconnectSince), "ms,", reconnectAttempts, "attempt(s)");
 }
 
+// ---------------------------------------------------------------------
+// My own stream: capture the same window / screen I'm streaming, locally
+// (no Discord, no WebRTC). Frames go through the same playout pipeline.
+// ---------------------------------------------------------------------
+let localStream = null;
+let localRetry = null;
+// A preview of what I stream, not the stream itself: 360p / 25 fps is plenty
+// for a small window and keeps the game's frame rate intact.
+window.__vetStartLocal = async (sourceId) => {
+    clearTimeout(localRetry);
+    localRetry = null;
+    try {
+        if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+        log("local capture of", sourceId);
+        localStream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: { mandatory: {
+                chromeMediaSource: "desktop", chromeMediaSourceId: sourceId,
+                maxFrameRate: 25, maxWidth: 640, maxHeight: 360
+            } }
+        });
+        const track = localStream.getVideoTracks()[0];
+        track.addEventListener("ended", () => { log("local capture ended"); retryLocal(sourceId); });
+        setStatus("");
+        if (streamPaused) window.__vetSetPaused(false);
+        startStatsLog();
+        startReader(track);
+    } catch (e) {
+        // Windows can't capture a minimized window: keep trying until it's back.
+        log("local capture failed:", e.message);
+        window.__vetSetPaused(true, true);
+        retryLocal(sourceId);
+    }
+};
+function retryLocal(sourceId) {
+    clearTimeout(localRetry);
+    localRetry = setTimeout(() => { localRetry = null; window.__vetStartLocal(sourceId); }, 3000);
+}
+
 async function requestReconnect() {
+    // My own stream: just capture again, nothing to ask the plugin for.
+    if (isLocal()) {
+        lastReconnectReq = performance.now();
+        reconnectAttempts++;
+        if (!localRetry) window.__vetStartLocal((window.__vetStreamParams || {}).sourceId);
+        return;
+    }
     // Only grab the canvas while it still holds a real frame (first attempt);
     // after a reload it is blank and the stored frame is kept.
     if (!elLastFrame.classList.contains("show")) saveLastFrame();
@@ -631,7 +705,7 @@ async function requestReconnect() {
     elReconnectSub.textContent = reconnectAttempts > 1 ? "Attempt " + reconnectAttempts : "";
     try {
         const r = await fetch(API_BASE + "/video/reconnect", {
-            method: "POST", body: JSON.stringify({ attempt: reconnectAttempts })
+            method: "POST", body: JSON.stringify({ key: viewKey(), attempt: reconnectAttempts })
         });
         const d = await r.json();
         log("reconnect request #" + reconnectAttempts, JSON.stringify(d));
@@ -655,7 +729,7 @@ window.__vetResumeReconnect = (attempts) => {
 };
 
 setInterval(() => {
-    if (!lastFrameAt) return;           // never started yet
+    if (!lastFrameAt || streamPaused) return;   // never started yet / paused on purpose
     const now = performance.now();
     if (!reconnecting && now - lastFrameAt > STALL_MS) startReconnect("no frames for " + Math.round(now - lastFrameAt) + " ms");
     if (reconnecting && now - lastReconnectReq > RECONNECT_EVERY_MS) requestReconnect();
@@ -739,11 +813,11 @@ if (window.vetWebRTC) {
 }
 
 document.getElementById("btn-close").addEventListener("click", () => {
-    fetch(API_BASE + "/video/close", { method: "POST" }).catch(() => {});
+    fetch(API_BASE + "/video/close", { method: "POST", body: JSON.stringify({ key: viewKey() }) }).catch(() => {});
 });
 
 document.getElementById("btn-pin").addEventListener("click", () => {
-    fetch(API_BASE + "/video/preview", { method: "POST" }).catch(() => {});
+    fetch(API_BASE + "/video/preview", { method: "POST", body: JSON.stringify({ key: viewKey() }) }).catch(() => {});
 });
 
 const btnAlpha = document.getElementById("btn-alpha");

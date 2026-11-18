@@ -143,23 +143,17 @@ let lastAliveState = false;
 const windows = new Map();
 const waitingWindows = new Map();
 let popupWindow = null;
-let videoWindow = null;
+// Stream viewers, one window each. Key: a streamer's user id, "cam:<id>" for a
+// camera, "local:<id>" for my own stream captured locally.
+const viewers = new Map();
 let notifyWindow = null;
 let menuWindow = null;
 let tipWindow = null;
 let senderWindow = null;
 
-let _webrtcOffer = null;
-let _webrtcOfferCandidates = [];
-let _webrtcAnswer = null;
-let _webrtcAnswerCandidates = [];
-
 let _webrtcIceForSender = [];
 let _webrtcIceForReceiver = [];
 
-let _videoFullscreenState = false;
-let _videoPreviewState = false;
-let _videoSavedBounds = null;
 let _videoAlpha = 1.0;
 
 let _saveWindowsTimer = null;
@@ -417,9 +411,11 @@ function setClickThrough(enabled) {
 // The stream viewer follows the same state: while the overlay is dimmed the
 // mouse must not hover or click it either.
 function applyVideoClickThrough() {
-    if (!videoWindow || videoWindow.isDestroyed()) return;
-    try { videoWindow.setIgnoreMouseEvents(_clickThroughState, { forward: false }); } catch (e) {}
-    try { videoWindow.setFocusable(!_clickThroughState); } catch (e) {}
+    for (const v of viewers.values()) {
+        if (!v.win || v.win.isDestroyed()) continue;
+        try { v.win.setIgnoreMouseEvents(_clickThroughState, { forward: false }); } catch (e) {}
+        try { v.win.setFocusable(!_clickThroughState); } catch (e) {}
+    }
 }
 
 let _lastFgSig = "";
@@ -625,10 +621,18 @@ public class VetEnum {
     public static string List() {
         var sb = new StringBuilder();
         EnumWindows((h, l) => {
+            // Same rule Windows uses for the taskbar: visible, not cloaked, and
+            // either WS_EX_APPWINDOW, or unowned and neither WS_EX_TOOLWINDOW
+            // nor WS_EX_NOACTIVATE. Frame, size and transparency don't matter,
+            // so borderless games that fully minimize still count.
             if (!IsWindowVisible(h)) return true;
-            if (GetWindow(h, 4) != IntPtr.Zero) return true;              // owned (dialogs, popups)
             int ex = GetWindowLong(h, -20);
-            if ((ex & 0x80) != 0) return true;                             // tool window
+            bool appWindow = (ex & 0x40000) != 0;
+            bool owned = GetWindow(h, 4) != IntPtr.Zero;
+            if (!appWindow && (owned || (ex & 0x80) != 0 || (ex & 0x08000000) != 0)) return true;
+            // Layered + WS_EX_TRANSPARENT = the mouse goes through it: an
+            // on-screen overlay (Medal, FPS counters...), never an app window.
+            if ((ex & 0x80000) != 0 && (ex & 0x20) != 0) return true;
             int cloaked = 0;
             DwmGetWindowAttribute(h, 14, out cloaked, 4);
             if (cloaked != 0) return true;                                 // hidden UWP / other desktop
@@ -684,9 +688,22 @@ async function refreshSources(force = false) {
             const m = /^window:(\d+):/.exec(c.id);
             if (m) hwnds.push(Number(m[1]));
         }
+        // Only windows that have a taskbar button (what Discord's own picker
+        // shows). If the enumeration failed, don't filter at all.
+        const taskbarWins = await enumerateTopWindows();
+        const onTaskbar = taskbarWins.length ? new Set(taskbarWins.map(w => w.hwnd)) : null;
+        const hwndOf = (id) => Number(/^window:(\d+):/.exec(id)?.[1] || 0);
+        if (onTaskbar) {
+            for (let i = sources.length - 1; i >= 0; i--) {
+                if (sources[i].id.startsWith("window:") && !onTaskbar.has(hwndOf(sources[i].id))) sources.splice(i, 1);
+            }
+            for (let i = carried.length - 1; i >= 0; i--) {
+                if (!onTaskbar.has(hwndOf(carried[i].id))) carried.splice(i, 1);
+            }
+        }
         // Windows Chromium didn't list (minimized and the like)
         const seenHwnd = new Set(hwnds);
-        const extra = (await enumerateTopWindows()).filter(w => !seenHwnd.has(w.hwnd) && w.pid !== process.pid);
+        const extra = taskbarWins.filter(w => !seenHwnd.has(w.hwnd) && w.pid !== process.pid);
         for (const w of extra) hwnds.push(w.hwnd);
         const windowProcMap = await getWindowProcessInfo(hwnds);
 
@@ -972,48 +989,47 @@ function startServer() {
             try {
                 const body = await readBody(req);
                 const parsed = JSON.parse(body);
-                _webrtcOffer = parsed.offer || null;
-                _webrtcOfferCandidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
-                // A new offer invalidates the previous answer; otherwise the plugin
-                // picks up the stale one and the new connection never comes up.
-                _webrtcAnswer = null;
-                _webrtcAnswerCandidates = [];
-
-                if (videoWindow && !videoWindow.isDestroyed()) {
-                    try {
-                        videoWindow.webContents.send("webrtc:offer", {
-                            sdp: _webrtcOffer,
-                            candidates: _webrtcOfferCandidates
-                        });
-                    } catch (e) {}
+                const v = viewerFor(parsed.key);
+                if (v) {
+                    v.offer = parsed.offer || null;
+                    v.offerCandidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
+                    // A new offer invalidates the previous answer; otherwise the plugin
+                    // picks up the stale one and the new connection never comes up.
+                    v.answer = null;
+                    v.answerCandidates = [];
+                    if (v.win && !v.win.isDestroyed()) {
+                        try { v.win.webContents.send("webrtc:offer", { sdp: v.offer, candidates: v.offerCandidates }); } catch (e) {}
+                    }
                 }
                 jsonReply(res, 200, { ok: true });
             } catch (e) { jsonReply(res, 400, { ok: false, error: e.message }); }
             return;
         }
-        if (req.method === "GET" && url === "/webrtc/offer") {
-            jsonReply(res, 200, { offer: _webrtcOffer, candidates: _webrtcOfferCandidates });
+        if (req.method === "GET" && url.startsWith("/webrtc/offer")) {
+            const v = viewerFor(new URL(req.url, "http://x").searchParams.get("key"));
+            jsonReply(res, 200, { offer: v?.offer || null, candidates: v?.offerCandidates || [] });
             return;
         }
         if (req.method === "POST" && url === "/webrtc/answer") {
             try {
                 const body = await readBody(req);
                 const parsed = JSON.parse(body);
-                _webrtcAnswer = parsed.answer || null;
-                _webrtcAnswerCandidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
+                const v = viewerFor(parsed.key);
+                if (v) {
+                    v.answer = parsed.answer || null;
+                    v.answerCandidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
+                }
                 jsonReply(res, 200, { ok: true });
             } catch (e) { jsonReply(res, 400, { ok: false, error: e.message }); }
             return;
         }
-        if (req.method === "GET" && url === "/webrtc/answer") {
-            jsonReply(res, 200, { answer: _webrtcAnswer, candidates: _webrtcAnswerCandidates });
+        if (req.method === "GET" && url.startsWith("/webrtc/answer")) {
+            const v = viewerFor(new URL(req.url, "http://x").searchParams.get("key"));
+            jsonReply(res, 200, { answer: v?.answer || null, candidates: v?.answerCandidates || [] });
             return;
         }
         if (req.method === "POST" && url === "/webrtc/reset") {
-            _webrtcOffer = null;
-            _webrtcOfferCandidates = [];
-            _webrtcAnswer = null;
-            _webrtcAnswerCandidates = [];
+            for (const v of viewers.values()) { v.offer = null; v.offerCandidates = []; v.answer = null; v.answerCandidates = []; }
             _webrtcIceForSender = [];
             _webrtcIceForReceiver = [];
             jsonReply(res, 200, { ok: true });
@@ -1051,25 +1067,27 @@ function startServer() {
             return;
         }
         if (req.method === "POST" && url === "/video/close") {
-            closeVideoWindow();
+            let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
+            closeVideoWindow(d.key);
             jsonReply(res, 200, { ok: true });
             return;
         }
         if (req.method === "POST" && url === "/video/aspect") {
             try {
                 const d = JSON.parse(await readBody(req) || "{}");
-                applyVideoAspect(Number(d.width), Number(d.height));
+                applyVideoAspect(viewerFor(d.key), Number(d.width), Number(d.height));
             } catch (e) {}
             jsonReply(res, 200, { ok: true });
             return;
         }
         if (req.method === "POST" && url === "/video/reconnect") {
-            const live = isVideoStreamLive(_videoUserId);
-            let attempt = 0;
-            try { attempt = Number(JSON.parse(await readBody(req) || "{}").attempt) || 0; } catch (e) {}
+            let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
+            const v = viewerFor(d.key);
+            const live = !!v && isViewerLive(v);
+            const attempt = Number(d.attempt) || 0;
             if (live) {
-                videoLog("reconnect requested by viewer for", _videoUserId, "attempt", attempt);
-                reopenVideoStream(attempt);
+                videoLog("reconnect requested by viewer for", v.key, "attempt", attempt);
+                reopenVideoStream(v, attempt);
             }
             jsonReply(res, 200, { ok: true, live, pluginAlive: isPluginAlive() });
             return;
@@ -1077,19 +1095,31 @@ function startServer() {
         if (req.method === "POST" && url === "/video/zoom") {
             try {
                 const d = JSON.parse(await readBody(req) || "{}");
-                if (_videoUserId) {
+                const v = viewerFor(d.key);
+                if (v) {
                     const vp = videoPrefs();
                     vp.zoom = vp.zoom && typeof vp.zoom === "object" ? vp.zoom : {};
-                    if (Number(d.z) > 1) vp.zoom[_videoUserId] = { z: Number(d.z), cx: Number(d.cx), cy: Number(d.cy) };
-                    else delete vp.zoom[_videoUserId];
+                    if (Number(d.z) > 1) vp.zoom[v.key] = { z: Number(d.z), cx: Number(d.cx), cy: Number(d.cy) };
+                    else delete vp.zoom[v.key];
                     saveSettingsSoon();
                 }
             } catch (e) {}
             jsonReply(res, 200, { ok: true });
             return;
         }
+        if (req.method === "POST" && url === "/video/own-local") {
+            ownStreamToLocal();
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/video/own") {
+            openOwnStream();
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
         if (req.method === "POST" && url === "/video/preview") {
-            toggleVideoPreview();
+            let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
+            toggleVideoPreview(viewerFor(d.key));
             jsonReply(res, 200, { ok: true });
             return;
         }
@@ -1245,6 +1275,7 @@ function startServer() {
                 else if (what === "enabled") { settings.layoutProfilesEnabled = !!d.on; saveSettingsSoon(); }
                 else if (what === "setup" && key) startSetup(key);
                 else if (what === "done") finishSetup(true);
+                else if (what === "add-stream") addSetupStreamFrame(null);
                 else if (what === "cancel") finishSetup(false);
                 else if (what === "open") openLayoutsWindow();
                 else if (what === "close") { if (layoutsWindow && !layoutsWindow.isDestroyed()) layoutsWindow.close(); }
@@ -1796,8 +1827,7 @@ function startSetup(key) {
     // Start from what's saved for this layout, if anything.
     if (layoutProfiles()[key]) applyLayoutProfile(layoutProfiles()[key]);
     openSetupFrames(key);
-    setupMode.timer = setTimeout(() => finishSetup(true), SETUP_MS);
-    setupMode.tick = setInterval(paintSetup, 250);
+    setupMode.tick = setInterval(setupTick, 250);
     paintSetup();
     videoLog("[layout] setup", key);
     sseBroadcast("layouts", layoutsInfo());
@@ -1805,10 +1835,26 @@ function startSetup(key) {
 
 function setupMoved() {
     if (!setupMode) return;
-    clearTimeout(setupMode.timer);
-    setupMode.until = Date.now() + SETUP_AFTER_MOVE_MS;
-    setupMode.timer = setTimeout(() => finishSetup(true), Math.max(0, setupMode.until - Date.now()));
-    sseBroadcast("layouts", layoutsInfo());
+    setupMode.until = Math.max(setupMode.until, Date.now() + SETUP_AFTER_MOVE_MS);
+    setupMode.moved = true;
+}
+
+// The countdown holds while the cursor is over the overlay or a frame (you're
+// dragging or about to); it runs again once you let go and move away.
+function setupTick() {
+    if (!setupMode) return;
+    const pt = screen.getCursorScreenPoint();
+    const inside = (w) => {
+        if (!w || w.isDestroyed()) return false;
+        const b = w.getBounds();
+        return pt.x >= b.x && pt.x < b.x + b.width && pt.y >= b.y && pt.y < b.y + b.height;
+    };
+    const over = Object.values(setupFrames).some(inside) || [...windows.values()].some(r => inside(r.win));
+    const now = Date.now();
+    if (over) setupMode.until = Math.max(setupMode.until, now + (setupMode.moved ? SETUP_AFTER_MOVE_MS : 3000));
+    paintSetup();
+    if (now - (setupMode.lastBroadcast || 0) > 900) { setupMode.lastBroadcast = now; sseBroadcast("layouts", layoutsInfo()); }
+    if (now >= setupMode.until) finishSetup(true);
 }
 
 function paintSetup() {
@@ -1827,8 +1873,8 @@ function paintSetup() {
 
 function finishSetup(save) {
     if (!setupMode) return;
-    const { key, timer, tick } = setupMode;
-    clearTimeout(timer); clearInterval(tick);
+    const { key, tick } = setupMode;
+    clearInterval(tick);
     if (save) saveLayoutProfile(key);     // reads the frames, so before they close
     setupMode = null;
     closeSetupFrames();
@@ -1874,6 +1920,11 @@ function saveLayoutProfile(key) {
     const ph = (k) => setupFrames[k] && !setupFrames[k].isDestroyed() ? setupFrames[k].getBounds() : null;
     const big = ph("stream-big"), small = ph("stream-small"), nt = ph("notify");
     if (big || small) p.video = { bounds: big || p.video?.bounds || null, previewBounds: small || p.video?.previewBounds || null };
+    // more stream windows (multistream): their places, in order
+    const extra = Object.keys(setupFrames).filter(k => /^stream-extra-\d+$/.test(k))
+        .sort((a, b) => Number(a.split("-").pop()) - Number(b.split("-").pop()))
+        .map(k => ph(k)).filter(Boolean);
+    if (Object.keys(setupFrames).length) p.video = { ...(p.video || {}), extra };
     if (nt) p.notify = { x: nt.x, y: nt.y, width: nt.width };
     layoutProfiles()[key] = p;
     saveSettingsSoon();
@@ -1896,13 +1947,17 @@ function applyLayoutProfile(p) {
             const vp = videoPrefs();
             if (p.video.bounds) vp.bounds = p.video.bounds;
             if (p.video.previewBounds) vp.previewBounds = p.video.previewBounds;
-            if (videoWindow && !videoWindow.isDestroyed()) {
-                const b = _videoPreviewState ? p.video.previewBounds : p.video.bounds;
+            if (Array.isArray(p.video.extra)) vp.extraBounds = p.video.extra;
+            // stream windows in the order they were opened: 1st = main place,
+            // 2nd, 3rd... = the extra places
+            const list = [...viewers.values()].filter(v => v.win && !v.win.isDestroyed());
+            list.forEach((v, i) => {
+                const b = i === 0 ? (v.preview ? p.video.previewBounds : p.video.bounds) : (p.video.extra || [])[i - 1];
                 if (b && boundsOnScreen(b)) {
-                    if (!_videoPreviewState) _videoSavedBounds = b;
-                    videoWindow.setBounds(fitToAspect(b, _videoAspect));
+                    if (i === 0 && !v.preview) v.savedBounds = b;
+                    v.win.setBounds(fitToAspect(b, v.aspect));
                 }
-            }
+            });
             saveSettingsSoon();
         }
     } catch (e) {}
@@ -1927,7 +1982,7 @@ function openSetupFrames(key) {
     const nt = prof.notify
         ? { x: prof.notify.x, y: prof.notify.y, width: prof.notify.width, height: 110 }
         : { x: ab ? ab.x : wa.x + 20, y: ab ? ab.y + ab.height + 4 : wa.y + 200, width: ab ? ab.width : WINDOW_WIDTH, height: 110 };
-    const make = (kind, b, resizable) => {
+    const make = _setupFrameMake = (kind, b, resizable) => {
         const w = new BrowserWindow({
             ...b, frame: false, transparent: true, backgroundColor: "#00000000",
             alwaysOnTop: true, resizable, skipTaskbar: true, hasShadow: false,
@@ -1936,6 +1991,7 @@ function openSetupFrames(key) {
         });
         w.setAlwaysOnTop(true, "screen-saver");
         w.loadFile(path.join(__dirname, "placeholder.html"), { query: { kind } });
+        w.on("move", () => setupMoved());
         w.once("ready-to-show", () => { try { w.showInactive(); } catch (e) {} });
         w.on("moved", () => setupMoved());
         w.on("resized", () => setupMoved());
@@ -1944,6 +2000,26 @@ function openSetupFrames(key) {
     make("stream-big", big, true);
     make("stream-small", small, true);
     make("notify", nt, false);
+    (prof.video?.extra || vp.extraBounds || []).filter(b => boundsOnScreen(b)).forEach(b => addSetupStreamFrame(b));
+}
+
+// One more stream window place (for watching several streams). A new frame
+// opens left of the last one.
+let _setupFrameMake = null;
+function addSetupStreamFrame(bounds) {
+    if (!setupMode) return;
+    const n = Object.keys(setupFrames).filter(k => k.startsWith("stream-extra-")).length + 1;
+    let b = bounds;
+    if (!b) {
+        const prevKey = n > 1 ? "stream-extra-" + (n - 1) : "stream-big";
+        const prev = setupFrames[prevKey] && !setupFrames[prevKey].isDestroyed() ? setupFrames[prevKey].getBounds() : null;
+        const wa = screen.getPrimaryDisplay().workArea;
+        b = prev ? { x: prev.x - Math.round(prev.width / 2) - 16, y: prev.y, width: Math.round(prev.width / 2), height: Math.round(prev.height / 2) }
+                 : { x: wa.x + 40, y: wa.y + 40, width: 400, height: 225 };
+        if (b.x < wa.x) b.x = wa.x + 8;
+    }
+    _setupFrameMake("stream-extra-" + n, b, true);
+    setupMoved();
 }
 
 function closeSetupFrames() {
@@ -2544,8 +2620,21 @@ function setOpacityAll(val) {
 }
 
 // =====================================================================
-// Video window (WebRTC receiver)
+// Stream viewers (WebRTC receivers, or a local capture of my own stream)
 // =====================================================================
+
+// Which viewer a request is about; no key = the most recently opened one.
+function viewerFor(key) {
+    if (key != null && key !== "" && viewers.has(String(key))) return viewers.get(String(key));
+    let last = null;
+    for (const v of viewers.values()) last = v;
+    return key ? null : last;
+}
+
+function viewerByWin(win) {
+    for (const v of viewers.values()) if (v.win === win) return v;
+    return null;
+}
 
 function wireVideoWindowIpc(win) {
     const ch = `vet-webrtc-${win.id}`;
@@ -2555,29 +2644,27 @@ function wireVideoWindowIpc(win) {
     ipcMain.removeAllListeners(ch + ":alpha");
 
     ipcMain.on(ch + ":answer", (_e, payload) => {
-        _webrtcAnswer = payload?.sdp || null;
-        _webrtcAnswerCandidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
-        console.log("[webrtc] answer received from video window");
+        const v = viewerByWin(win);
+        if (!v) return;
+        v.answer = payload?.sdp || null;
+        v.answerCandidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
+        console.log("[webrtc] answer received from viewer", v.key);
     });
 
     ipcMain.on(ch + ":ready", () => {
-        if (_webrtcOffer) {
-            try {
-                win.webContents.send("webrtc:offer", {
-                    sdp: _webrtcOffer,
-                    candidates: _webrtcOfferCandidates
-                });
-            } catch (e) {}
+        const v = viewerByWin(win);
+        if (v && v.offer) {
+            try { win.webContents.send("webrtc:offer", { sdp: v.offer, candidates: v.offerCandidates }); } catch (e) {}
         }
         try { win.webContents.send("video:alpha-state", _videoAlpha); } catch (e) {}
     });
 
     ipcMain.on(ch + ":alpha", (_e, alpha) => {
-        const v = Math.max(0.2, Math.min(1, Number(alpha)));
-        if (Number.isFinite(v)) {
-            _videoAlpha = v;
-            try { win.setOpacity(v); } catch (e) {}
-            videoPrefs().alpha = v;
+        const val = Math.max(0.2, Math.min(1, Number(alpha)));
+        if (Number.isFinite(val)) {
+            _videoAlpha = val;
+            for (const v of viewers.values()) { try { v.win.setOpacity(val); } catch (e) {} }
+            videoPrefs().alpha = val;
             saveSettingsSoon();
         }
     });
@@ -2585,40 +2672,96 @@ function wireVideoWindowIpc(win) {
     win.webContents._vetIpcChannel = ch;
 }
 
-let _videoParams = {};
-let _videoReopenAttempts = 0;
+// What the plugin has to do to (re)start a viewer's picture.
+function pluginStartCommand(v) {
+    if (v.local) return null;
+    if (v.camera) return ["watch-camera", v.userId];
+    if (v.own) return ["watch-own", v.userId];
+    return ["watch-stream", v.userId];
+}
 
 // Reconnect = the same thing as closing and reopening the viewer, minus
 // recreating the window: drop the plugin's capture, forget the old WebRTC
 // handshake, reload the page and ask the plugin to watch from scratch.
-function reopenVideoStream(attempt) {
-    if (!videoWindow || videoWindow.isDestroyed() || !_videoUserId) return;
-    const userId = _videoUserId;
-    queuePluginCommand("stop-stream", userId);
-    _webrtcOffer = null;
-    _webrtcOfferCandidates = [];
-    _webrtcAnswer = null;
-    _webrtcAnswerCandidates = [];
-    _webrtcIceForSender = [];
-    _webrtcIceForReceiver = [];
-    _videoReopenAttempts = Math.max(1, attempt || 1);
-    try { videoWindow.webContents.reload(); } catch (e) {}
-    queuePluginCommand("watch-stream", userId);
+// A local capture just reloads and captures again.
+function reopenVideoStream(v, attempt) {
+    if (!v || !v.win || v.win.isDestroyed()) return;
+    if (!v.local) queuePluginCommand("stop-stream", v.key);
+    v.offer = null; v.offerCandidates = []; v.answer = null; v.answerCandidates = [];
+    v.reopenAttempts = Math.max(1, attempt || 1);
+    try { v.win.webContents.reload(); } catch (e) {}
+    const cmd = pluginStartCommand(v);
+    if (cmd) queuePluginCommand(cmd[0], cmd[1]);
+}
+
+// Where a new viewer opens: the saved place for the first, the next ones
+// stepped down-right so they don't sit exactly on top of each other.
+// Which places the active layout gives stream windows (falls back to the
+// last remembered ones).
+function layoutVideoPlaces() {
+    const vp = videoPrefs();
+    const prof = layoutProfiles()[_profileKey]?.video || {};
+    return {
+        bounds: boundsOnScreen(prof.bounds) ? prof.bounds : vp.bounds,
+        previewBounds: boundsOnScreen(prof.previewBounds) ? prof.previewBounds : vp.previewBounds,
+        extra: Array.isArray(prof.extra) && prof.extra.length ? prof.extra : (Array.isArray(vp.extraBounds) ? vp.extraBounds : [])
+    };
+}
+
+// Stream windows are numbered in the order they were opened (my own stream
+// included): #1 takes the main place (or the preview one, if that's how you
+// left it), #2, #3... take the extra places from Setup. Without a place, a
+// window steps left of the main one.
+function placeForIndex(n) {
+    const pl = layoutVideoPlaces();
+    if (n === 0) {
+        const preview = !!videoPrefs().preview && boundsOnScreen(pl.previewBounds);
+        const base = preview ? pl.previewBounds : pl.bounds;
+        return { bounds: boundsOnScreen(base) ? base : null, preview };
+    }
+    const ex = pl.extra[n - 1];
+    if (boundsOnScreen(ex)) return { bounds: ex, preview: false };
+    const base = boundsOnScreen(pl.bounds) ? pl.bounds : null;
+    if (!base) return { bounds: null, preview: false };
+    const b = { ...base, width: Math.round(base.width / 2), height: Math.round(base.height / 2) };
+    b.x = base.x - n * (b.width + 12); b.y = base.y;
+    return { bounds: boundsOnScreen(b) ? b : { ...base, x: base.x + n * 32, y: base.y + n * 32 }, preview: false };
+}
+
+function viewerStartPlace() {
+    return placeForIndex(viewers.size);
+}
+
+// A window in the middle closed: the ones after it move up one place
+// (e.g. #3 takes #2's place when #2 goes away).
+function reflowViewers(fromIndex) {
+    [...viewers.values()].forEach((v, i) => {
+        if (i < fromIndex || !v.win || v.win.isDestroyed()) return;
+        const pl = placeForIndex(i);
+        if (!pl.bounds) return;
+        if (i === 0 && pl.preview !== v.preview) v.preview = pl.preview;
+        try { v.win.setBounds(fitToAspect(pl.bounds, v.aspect)); } catch (e) {}
+        try { v.win.webContents.executeJavaScript(`window.__vetSetPreview && window.__vetSetPreview(${v.preview});`).catch(() => {}); } catch (e) {}
+    });
 }
 
 function openVideoWindow(params) {
-    if (params && params.userId) { _videoUserId = String(params.userId); _videoNotLiveSince = 0; }
-    if (videoWindow && !videoWindow.isDestroyed()) {
-        if (!videoWindow.isVisible()) videoWindow.showInactive();
+    params = params || {};
+    const userId = params.userId ? String(params.userId) : null;
+    const key = String(params.key || (params.local ? "local:" + userId : params.camera ? "cam:" + userId : params.own ? "own:" + userId : userId) || "");
+    if (!key) return;
+    const existing = viewers.get(key);
+    if (existing && existing.win && !existing.win.isDestroyed()) {
+        existing.notLiveSince = 0;
+        if (!existing.win.isVisible()) existing.win.showInactive();
         return;
     }
     const vp = videoPrefs();
     if (typeof vp.alpha === "number") _videoAlpha = Math.max(0.2, Math.min(1, vp.alpha));
-    _videoPreviewState = !!vp.preview && boundsOnScreen(vp.previewBounds);
-    const startBounds = _videoPreviewState ? vp.previewBounds
-        : (boundsOnScreen(vp.bounds) ? vp.bounds : null);
-    _videoSavedBounds = boundsOnScreen(vp.bounds) ? vp.bounds : null;
-    videoWindow = new BrowserWindow({
+    const place = viewerStartPlace();
+    const preview = place.preview;
+    const startBounds = place.bounds;
+    const win = new BrowserWindow({
         width: 640, height: 380, minWidth: 160, minHeight: 90,
         ...(startBounds || {}),
         frame: false, transparent: true, backgroundColor: "#00000000",
@@ -2631,58 +2774,130 @@ function openVideoWindow(params) {
             backgroundThrottling: false
         }
     });
-    videoWindow.setAlwaysOnTop(true, "screen-saver");
+    const v = {
+        key, userId, win, params: { ...params, key },
+        local: !!params.local, camera: !!params.camera, own: !!params.own, sourceId: params.sourceId || null,
+        preview, savedBounds: boundsOnScreen(vp.bounds) ? vp.bounds : null,
+        aspect: 0, notLiveSince: 0, reopenAttempts: 0,
+        offer: null, offerCandidates: [], answer: null, answerCandidates: []
+    };
+    viewers.set(key, v);
+
+    win.setAlwaysOnTop(true, "screen-saver");
     applyVideoClickThrough();
-    videoWindow.setVisibleOnAllWorkspaces(true);
-    try { videoWindow.setOpacity(_videoAlpha); } catch (e) {}
-    videoWindow.loadFile(path.join(__dirname, "video.html"));
+    win.setVisibleOnAllWorkspaces(true);
+    try { win.setOpacity(_videoAlpha); } catch (e) {}
+    win.loadFile(path.join(__dirname, "video.html"));
 
-    wireVideoWindowIpc(videoWindow);
-    wireVideoWindowLogging(videoWindow);
-    videoWindow.on("move", saveVideoBoundsSoon);
-    videoWindow.on("resize", saveVideoBoundsSoon);
+    wireVideoWindowIpc(win);
+    wireVideoWindowLogging(win);
+    win.on("move", () => saveVideoBoundsSoon(v));
+    win.on("resize", () => saveVideoBoundsSoon(v));
 
-    _videoParams = params || {};
     // Runs on every load, including reloads done by reopenVideoStream().
-    videoWindow.webContents.on("did-finish-load", () => {
+    win.webContents.on("did-finish-load", () => {
         try {
-            if (!videoWindow || videoWindow.isDestroyed()) return;
-            const ch = videoWindow.webContents._vetIpcChannel;
-            const resume = _videoReopenAttempts;
-            _videoReopenAttempts = 0;
-            videoWindow.webContents.executeJavaScript(
-                `window.__vetStreamParams = ${JSON.stringify(_videoParams || {})};` +
+            if (win.isDestroyed()) return;
+            const ch = win.webContents._vetIpcChannel;
+            const resume = v.reopenAttempts;
+            v.reopenAttempts = 0;
+            // A reload brings the window back onto the taskbar on Windows.
+            try { win.setSkipTaskbar(true); } catch (e) {}
+            v.paused = false;               // the page starts fresh; the next state re-sends it
+            win.webContents.executeJavaScript(
+                `window.__vetStreamParams = ${JSON.stringify(v.params)};` +
                 (resume ? `if (window.__vetResumeReconnect) window.__vetResumeReconnect(${resume});` : "") +
-                `if (window.__vetSetPreview) window.__vetSetPreview(${_videoPreviewState});` +
-                `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((videoPrefs().zoom || {})[_videoUserId] || null)});` +
-                `if (window.vetWebRTC) window.vetWebRTC.setChannel(${JSON.stringify(ch)});`
+                `if (window.__vetSetPreview) window.__vetSetPreview(${v.preview});` +
+                `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((videoPrefs().zoom || {})[v.key] || null)});` +
+                (v.local ? `if (window.__vetStartLocal) window.__vetStartLocal(${JSON.stringify(v.sourceId)});`
+                         : `if (window.vetWebRTC) window.vetWebRTC.setChannel(${JSON.stringify(ch)});`)
             );
         } catch (e) {}
     });
 
     // Don't steal focus from the game: a focused viewer stops the overlay's
     // fullscreen click-through/transparency.
-    videoWindow.once("ready-to-show", () => {
-        videoWindow.showInactive();
-    });
+    win.once("ready-to-show", () => { try { win.showInactive(); win.setSkipTaskbar(true); } catch (e) {} });
 
-    videoWindow.on("closed", () => {
-        videoWindow = null;
-        if (_videoUserId) queuePluginCommand("stop-stream", _videoUserId);
-        _videoUserId = null;
-        _videoNotLiveSince = 0;
-        _videoAspect = 0;
-        _videoFullscreenState = false;
-        _videoPreviewState = false;
-        _videoSavedBounds = null;
-
-        _webrtcOffer = null;
-        _webrtcOfferCandidates = [];
-        _webrtcAnswer = null;
-        _webrtcAnswerCandidates = [];
+    win.on("closed", () => {
+        if (viewers.get(key) === v) {
+            const idx = [...viewers.keys()].indexOf(key);
+            viewers.delete(key);
+            if (!v._swapped) reflowViewers(idx);
+        }
+        if (!v.local) queuePluginCommand("stop-stream", key);
     });
 }
 
+// What I'm streaming right now, as a capture id ("window:<hwnd>:0" / "screen:..").
+function myStreamCaptureId() {
+    const me = (Array.isArray(state.users) ? state.users : []).find(u => u.isSelf);
+    if (!me || !me.streaming || !me.streamSourceId) return null;
+    let src = String(me.streamSourceId);
+    const sh = /^screen-handle:(\d+)/.exec(src);
+    if (sh) {
+        const scr = cachedSources.find(s => s.type === "screen" && String(s.handle) === sh[1]);
+        src = scr ? scr.id : "screen:0:0";
+    }
+    return { userId: me.userId, src };
+}
+
+// My own stream: from Discord's pipeline via the plugin (what Discord
+// captured to send); if Discord has none, a local capture of the window.
+function openOwnStream() {
+    const cur = myStreamCaptureId();
+    if (!cur) { videoLog("own stream: not streaming"); return; }
+    if (viewers.has("own:" + cur.userId) || viewers.has("local:" + cur.userId)) return;
+    openVideoWindow({ own: true, userId: cur.userId });
+    queuePluginCommand("watch-own", cur.userId);
+}
+
+// The plugin couldn't get Discord's own-stream track: swap to local capture.
+function ownStreamToLocal() {
+    const cur = myStreamCaptureId();
+    if (!cur) return;
+    const v = viewers.get("own:" + cur.userId);
+    let bounds = null;
+    const order = [...viewers.keys()];
+    if (v && v.win && !v.win.isDestroyed()) {
+        try { bounds = v.win.getBounds(); } catch (e) {}
+        v.local = true;                 // its "closed" handler must not ask the plugin for anything
+        v._swapped = true;              // ...nor move the others
+        viewers.delete(v.key);
+        try { v.win.close(); } catch (e) {}
+    }
+    openVideoWindow({ local: true, userId: cur.userId, sourceId: cur.src });
+    const nk = "local:" + cur.userId;
+    const nv = viewers.get(nk);
+    if (nv) {
+        if (bounds) { try { nv.win.setBounds(bounds); } catch (e) {} }
+        // put it back where the "own" window was in the order
+        const at = order.indexOf("own:" + cur.userId);
+        if (at >= 0) {
+            const rest = [...viewers.entries()].filter(([k]) => k !== nk);
+            rest.splice(Math.min(at, rest.length), 0, [nk, nv]);
+            viewers.clear();
+            for (const [k, x] of rest) viewers.set(k, x);
+        }
+    }
+}
+
+// I switched what I stream: the "my stream" viewer follows.
+function followMyStreamSource() {
+    const cur = myStreamCaptureId();
+    if (!cur) return;
+    for (const v of viewers.values()) {
+        if (!v.local || v.sourceId === cur.src || !v.win || v.win.isDestroyed()) continue;
+        videoLog("own stream source changed", v.sourceId, "->", cur.src);
+        v.sourceId = cur.src;
+        v.params.sourceId = cur.src;
+        try {
+            v.win.webContents.executeJavaScript(
+                `window.__vetStreamParams = ${JSON.stringify(v.params)};` +
+                `if (window.__vetStartLocal) window.__vetStartLocal(${JSON.stringify(cur.src)});`).catch(() => {});
+        } catch (e) {}
+    }
+}
 // =====================================================================
 // Stream window log file: server/logs/video.log (rotated at 5 MB)
 // =====================================================================
@@ -2732,11 +2947,12 @@ function wireVideoWindowLogging(win) {
 }
 app.on("child-process-gone", (_e, d) => videoLog("CHILD PROCESS GONE", d));
 
-function closeVideoWindow() {
-    if (videoWindow && !videoWindow.isDestroyed()) {
-        try { videoWindow.close(); } catch (e) {}
+// One viewer by key (no key = all of them).
+function closeVideoWindow(key) {
+    const list = key ? [viewers.get(String(key))].filter(Boolean) : [...viewers.values()];
+    for (const v of list) {
+        try { if (v.win && !v.win.isDestroyed()) v.win.close(); } catch (e) {}
     }
-    videoWindow = null;
 }
 
 function queuePluginCommand(action, userId, name) {
@@ -2747,9 +2963,7 @@ function queuePluginCommand(action, userId, name) {
     flushCommandWaiters();
 }
 
-// -- Which stream the viewer shows, and whether it is still live --
-let _videoUserId = null;
-let _videoNotLiveSince = 0;
+// -- Is what a viewer shows still on? (stream live / camera on) --
 const VIDEO_AUTOCLOSE_MS = 3000;
 
 function isVideoStreamLive(userId) {
@@ -2759,14 +2973,38 @@ function isVideoStreamLive(userId) {
     return !!(u && u.streaming);
 }
 
+function isViewerLive(v) {
+    if (!v.userId || !state.channelId) return false;
+    const u = (Array.isArray(state.users) ? state.users : []).find(x => String(x.userId) === v.userId);
+    return !!u && (v.camera ? !!u.video : !!u.streaming);
+}
+
+// Streamer's window minimized (Discord pauses the stream): the viewer shows a
+// calm "paused" card instead of reconnecting.
+function updateViewerPaused() {
+    const users = Array.isArray(state.users) ? state.users : [];
+    for (const v of viewers.values()) {
+        if (v.camera || v.local || !v.win || v.win.isDestroyed()) continue;
+        const u = users.find(x => String(x.userId) === v.userId);
+        const paused = !!(u && u.streaming && u.streamPaused);
+        if (paused === !!v.paused) continue;
+        v.paused = paused;
+        videoLog("stream", paused ? "paused" : "resumed", v.key);
+        try { v.win.webContents.executeJavaScript(`window.__vetSetPaused && window.__vetSetPaused(${paused}, ${!!v.own});`).catch(() => {}); } catch (e) {}
+    }
+}
+
 function checkVideoAutoClose() {
-    if (!videoWindow || videoWindow.isDestroyed() || !_videoUserId) { _videoNotLiveSince = 0; return; }
     if (!isPluginAlive()) return;   // no fresh info: don't guess
-    if (isVideoStreamLive(_videoUserId)) { _videoNotLiveSince = 0; return; }
-    if (!_videoNotLiveSince) { _videoNotLiveSince = Date.now(); return; }
-    if (Date.now() - _videoNotLiveSince >= VIDEO_AUTOCLOSE_MS) {
-        videoLog("auto-close: stream ended or left voice", _videoUserId);
-        closeVideoWindow();
+    followMyStreamSource();
+    updateViewerPaused();
+    for (const v of [...viewers.values()]) {
+        if (isViewerLive(v)) { v.notLiveSince = 0; continue; }
+        if (!v.notLiveSince) { v.notLiveSince = Date.now(); continue; }
+        if (Date.now() - v.notLiveSince >= VIDEO_AUTOCLOSE_MS) {
+            videoLog("auto-close: ended or left voice", v.key);
+            closeVideoWindow(v.key);
+        }
     }
 }
 
@@ -2786,63 +3024,64 @@ function boundsOnScreen(b) {
     });
 }
 
-let _videoSaveTimer = null;
-function saveVideoBoundsSoon() {
-    if (_videoSaveTimer) clearTimeout(_videoSaveTimer);
-    _videoSaveTimer = setTimeout(() => {
-        _videoSaveTimer = null;
-        if (!videoWindow || videoWindow.isDestroyed()) return;
+// The first viewer's place is the remembered one; extra viewers don't
+// overwrite it.
+function saveVideoBoundsSoon(v) {
+    if (v._saveTimer) clearTimeout(v._saveTimer);
+    v._saveTimer = setTimeout(() => {
+        v._saveTimer = null;
+        if (!v.win || v.win.isDestroyed()) return;
+        if (viewers.values().next().value !== v) return;
         const p = videoPrefs();
-        const b = videoWindow.getBounds();
-        if (_videoPreviewState) p.previewBounds = b; else p.bounds = b;
-        p.preview = _videoPreviewState;
+        const b = v.win.getBounds();
+        if (v.preview) p.previewBounds = b; else p.bounds = b;
+        p.preview = v.preview;
         saveSettings();
     }, 500);
 }
 
 // Lock the window to the stream's aspect ratio and fit the current size to it:
 // keep the width, adjust the height (so no black bars).
-let _videoAspect = 0;
 function fitToAspect(b, aspect) {
     if (!aspect) return b;
     return { x: b.x, y: b.y, width: b.width, height: Math.max(90, Math.round(b.width / aspect)) };
 }
-function applyVideoAspect(w, h) {
-    if (!videoWindow || videoWindow.isDestroyed() || !(w > 0) || !(h > 0)) return;
+function applyVideoAspect(v, w, h) {
+    if (!v || !v.win || v.win.isDestroyed() || !(w > 0) || !(h > 0)) return;
     const aspect = w / h;
-    if (Math.abs(aspect - _videoAspect) < 0.01) return;
-    _videoAspect = aspect;
+    if (Math.abs(aspect - v.aspect) < 0.01) return;
+    v.aspect = aspect;
     try {
-        videoWindow.setAspectRatio(aspect);
-        videoWindow.setBounds(fitToAspect(videoWindow.getBounds(), aspect));
+        v.win.setAspectRatio(aspect);
+        v.win.setBounds(fitToAspect(v.win.getBounds(), aspect));
     } catch (e) {}
-    videoLog("aspect locked", w + "x" + h);
+    videoLog("aspect locked", v.key, w + "x" + h);
 }
 
-function toggleVideoPreview() {
-    if (!videoWindow || videoWindow.isDestroyed()) return;
+function toggleVideoPreview(v) {
+    if (!v || !v.win || v.win.isDestroyed()) return;
+    const first = viewers.values().next().value === v;
     const p = videoPrefs();
-    const cur = videoWindow.getBounds();
-    if (!_videoPreviewState) {
-        p.bounds = cur;
-        _videoSavedBounds = cur;
-        const target = boundsOnScreen(p.previewBounds) ? p.previewBounds
+    const cur = v.win.getBounds();
+    if (!v.preview) {
+        if (first) p.bounds = cur;
+        v.savedBounds = cur;
+        const target = boundsOnScreen(p.previewBounds) && first ? p.previewBounds
             : { x: cur.x + cur.width - 320, y: cur.y, width: 320, height: 180 };
         // keep the stream's proportions in preview too
-        _videoPreviewState = true;
-        videoWindow.setBounds(fitToAspect(target, _videoAspect));
+        v.preview = true;
+        v.win.setBounds(fitToAspect(target, v.aspect));
     } else {
-        p.previewBounds = cur;
-        const target = boundsOnScreen(p.bounds) ? p.bounds : _videoSavedBounds;
-        _videoPreviewState = false;
-        if (target) videoWindow.setBounds(fitToAspect(target, _videoAspect));
+        if (first) p.previewBounds = cur;
+        const target = first && boundsOnScreen(p.bounds) ? p.bounds : v.savedBounds;
+        v.preview = false;
+        if (target) v.win.setBounds(fitToAspect(target, v.aspect));
     }
-    p.preview = _videoPreviewState;
-    saveSettings();
+    if (first) { p.preview = v.preview; saveSettings(); }
     try {
-        videoWindow.webContents.executeJavaScript(
-            `if (window.__vetSetPreview) window.__vetSetPreview(${_videoPreviewState});` +
-            (_videoPreviewState ? "" : `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((p.zoom || {})[_videoUserId] || null)});`)
+        v.win.webContents.executeJavaScript(
+            `if (window.__vetSetPreview) window.__vetSetPreview(${v.preview});` +
+            (v.preview ? "" : `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((p.zoom || {})[v.key] || null)});`)
         ).catch(() => {});
     } catch (e) {}
 }

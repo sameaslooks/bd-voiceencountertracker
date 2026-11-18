@@ -82,6 +82,7 @@ function render() {
             </div>
             ${info.setup && info.setup.key === it.key
                 ? `<span class="cd">${Math.max(0, Math.ceil((info.setup.until - Date.now()) / 1000))}s</span>
+                   <button class="b" data-do="add-stream" title="Another stream window place (for watching several streams)">+ Stream window</button>
                    <button class="b pri" data-do="done">Done</button><button class="b" data-do="cancel">Cancel</button>`
                 : `${it.saved ? `<button class="b" data-do="apply" title="Move the windows there now">Apply</button>` : ""}
                    <button class="b pri" data-do="setup" title="For 30 s the overlay takes the mouse even in the game: drag it, and it's saved">Setup</button>
