@@ -255,9 +255,10 @@ module.exports = class VoiceEncounterTracker {
         try { BdApi.ContextMenu.unpatch("user-context", this.meta.name); } catch (e) {}
 
         try {
+            // "stopping": the overlay must not take this for leaving voice.
             this._postJSON("/state", {
                 guildId: null, channelId: null, channelName: null, users: [],
-                prefs: this._prefsPayload()
+                prefs: this._prefsPayload(), stopping: true
             });
             this._postJSON("/speaking", { speakers: [] });
             this._postJSON("/ping", { last: null, avg: null });
@@ -654,6 +655,10 @@ module.exports = class VoiceEncounterTracker {
                         try { self.injectBadges(); } catch (e) {}
                         try { self.pushStateToOverlay(); } catch (e) {}
                     }, self.INJECT_THROTTLE_MS));
+                } else if (action.type === "STREAM_UPDATE" || action.type === "STREAM_CREATE" ||
+                           action.type === "STREAM_DELETE" || action.type === "STREAM_SERVER_UPDATE") {
+                    // viewers joined / left my stream: refresh the count right away
+                    try { self.pushStateToOverlay(); } catch (e) {}
                 } else if (action.type === "PRESENCE_UPDATES" || action.type === "PRESENCES_REPLACE") {
                     try { self.scheduleOverlayPush(); } catch (e) {}
                 } else if (action.type === "CALL_CREATE" || action.type === "CALL_UPDATE" || action.type === "CALL_DELETE") {
@@ -2102,6 +2107,7 @@ module.exports = class VoiceEncounterTracker {
         }
         if (action === "dismiss-return") {
             this._returnTo = null;
+            this._postJSON("/return/dismiss", {});
             this._saveLastVoice({ ...(this._loadLastVoice() || {}), selfLeft: true });
             this.scheduleOverlayPush();
             return;
@@ -2999,11 +3005,23 @@ module.exports = class VoiceEncounterTracker {
         this.scheduleOverlayPush();
     }
 
-    _checkReturnToChannel() {
+    async _checkReturnToChannel() {
         const inVoice = this._voiceStore()?.getVoiceChannelId?.();
         if (inVoice) return;
-        const lv = this._loadLastVoice();
-        if (!lv || lv.selfLeft || !lv.channelId) return;
+        // The overlay outlives Discord and knows where we were when the
+        // connection dropped; fall back to our own record.
+        let lv = null;
+        try {
+            const r = await BdApi.Net.fetch(this.OVERLAY_URL + "/plugin/hello", { method: "POST", body: "{}" });
+            const d = await r.json();
+            if (d?.lastVoice?.channelId) lv = { channelId: d.lastVoice.channelId, guildId: d.lastVoice.guildId ?? null, seenAt: d.lastVoice.at };
+        } catch (e) {}
+        if (!lv) {
+            const own = this._loadLastVoice();
+            if (own && !own.selfLeft) lv = own;
+        }
+        if (!lv || !lv.channelId) return;
+        if (this._voiceStore()?.getVoiceChannelId?.()) return;
         if (Date.now() - (lv.seenAt || 0) > this.RETURN_MAX_AGE_MS) return;
         if (!this.getChannelName(lv.channelId)) return;   // channel gone or no access
         this._returnTo = { channelId: lv.channelId, guildId: lv.guildId ?? null };
@@ -3381,7 +3399,9 @@ module.exports = class VoiceEncounterTracker {
             let ids = [];
             try { ids = ass.getViewerIds?.(st) || []; } catch (e) {}
             if (!ids.length) { try { ids = ass.getViewerIds?.(st.streamKey || this._streamKeyOf(st)) || []; } catch (e) {} }
-            ids = ids.map(String).filter(id => id !== me);
+            // Discord's viewer list lags behind people leaving voice; only count
+            // viewers who are in my channel right now.
+            ids = ids.map(String).filter(id => id !== me && this.active.get(id)?.channelId === mySession?.channelId);
             const us = this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore");
             const now = Date.now();
             this._knownViewers ||= new Set();
@@ -3397,8 +3417,9 @@ module.exports = class VoiceEncounterTracker {
                 const watchFrom = this._viewerSince.get(id);
                 const sess = this.active.get(id);
                 const joinedAt = sess && sess.channelId === mySession?.channelId ? (sess.startedAt || 0) : 0;
+                // ...and the mark goes away after they've been watching that long too.
                 const stranger = !this._favorites?.has(id) && joinedAt > this._streamStartedAt &&
-                    watchFrom - joinedAt < this.STRANGER_VIEWER_MS;
+                    watchFrom - joinedAt < this.STRANGER_VIEWER_MS && now - watchFrom < this.STRANGER_VIEWER_MS;
                 return { userId: id, name: this.getDisplayName(id, mySession?.guildId) || u?.username || id, avatar: u?.avatar ?? null, stranger };
             });
             // Warn once per viewer when someone unexpected starts watching after

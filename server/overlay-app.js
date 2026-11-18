@@ -426,6 +426,11 @@ let _lastFgSig = "";
 function startCursorWatchdog() {
     setInterval(async () => {
         try {
+            if (setupMode) {
+                if (_clickThroughState) setClickThrough(false);
+                _cursorStableCount = 0;
+                return;
+            }
             if (!settings.clickThroughOnGameFocus) {
                 if (_clickThroughState) setClickThrough(false);
                 _cursorStableCount = 0;
@@ -1140,8 +1145,10 @@ function startServer() {
             try {
                 const body = await readBody(req);
                 const prevSound = state.streamSound;
+                const gap = lastPluginSeen ? Date.now() - lastPluginSeen : Infinity;
                 state = Object.assign({ updatedAt: Date.now() }, JSON.parse(body));
                 lastPluginSeen = Date.now();
+                noteVoiceForReturn(gap);
                 jsonReply(res, 200, { ok: true });
                 broadcastState();
                 applyAutoResizeAll();
@@ -1207,6 +1214,21 @@ function startServer() {
             jsonReply(res, 200, { ok: true });
             return;
         }
+        // Plugin start: it asks where we were (and we know it restarted).
+        if (req.method === "POST" && url === "/plugin/hello") {
+            pluginRestarted = true;
+            const lv = lastVoiceSeen && !lastVoiceSeen.left && Date.now() - lastVoiceSeen.at < RETURN_OFFER_MS ? lastVoiceSeen : null;
+            jsonReply(res, 200, { lastVoice: lv });
+            return;
+        }
+        if (req.method === "POST" && url === "/return/dismiss") {
+            returnOffer = null;
+            if (lastVoiceSeen) lastVoiceSeen.left = true;
+            broadcastState();
+            applyAutoResizeAll();
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
         if (req.method === "GET" && url === "/layouts") {
             jsonReply(res, 200, layoutsInfo());
             return;
@@ -1221,6 +1243,9 @@ function startServer() {
                 else if (what === "delete" && key) { delete layoutProfiles()[key]; saveSettingsSoon(); }
                 else if (what === "forget" && key && settings.seenGames) { delete settings.seenGames[key]; delete layoutProfiles()[key]; saveSettingsSoon(); }
                 else if (what === "enabled") { settings.layoutProfilesEnabled = !!d.on; saveSettingsSoon(); }
+                else if (what === "setup" && key) startSetup(key);
+                else if (what === "done") finishSetup(true);
+                else if (what === "cancel") finishSetup(false);
                 else if (what === "open") openLayoutsWindow();
                 else if (what === "close") { if (layoutsWindow && !layoutsWindow.isDestroyed()) layoutsWindow.close(); }
             } catch (e) {}
@@ -1537,13 +1562,17 @@ function ensureNotifyWindow() {
     notifyWindow.on("closed", () => { notifyWindow = null; });
 }
 
+let notifyPos = null;   // { x, y, width } from the active layout; null = docked under the voice window
+
 function positionNotifyWindow() {
     if (!notifyWindow || notifyWindow.isDestroyed()) return;
     const anchor = notifyAnchor();
     const h = notifyContentH > 0 ? notifyContentH
         : Math.max(1, notifications.length + (incomingCall ? 2 : 0)) * NOTIFY_ITEM_H;
     try {
-        if (anchor) {
+        if (notifyPos && boundsOnScreen({ ...notifyPos, height: h })) {
+            notifyWindow.setBounds({ x: notifyPos.x, y: notifyPos.y, width: notifyPos.width, height: h });
+        } else if (anchor) {
             const [ax, ay] = anchor.getPosition();
             const [aw, ah] = anchor.getSize();
             notifyWindow.setBounds({ x: ax, y: ay + ah + 4, width: aw, height: h });
@@ -1712,7 +1741,7 @@ async function noteForegroundForProfiles(pid, gameLike) {
         if (!exe) return;
         if (!NOT_GAMES.test(exe)) { key = exe; noteSeenGame(exe); }
     }
-    if (key === _profileKey) return;
+    if (key === _profileKey || setupMode) return;
     const prev = _profileKey;
     _profileKey = key;
     sseBroadcast("layouts", layoutsInfo());
@@ -1741,6 +1770,7 @@ function layoutsInfo() {
     return {
         enabled: settings.layoutProfilesEnabled !== false,
         current: _profileKey,
+        setup: setupMode ? { key: setupMode.key, until: setupMode.until } : null,
         items: [...keys].map(k => ({
             key: k,
             saved: !!profiles[k],
@@ -1749,6 +1779,64 @@ function layoutsInfo() {
             lastSeen: k === "default" ? Infinity : (seen[k] || 0)
         })).sort((a, b) => (a.key === "default" ? -1 : b.key === "default" ? 1 : (b.lastSeen - a.lastSeen)))
     };
+}
+
+// Setup: for a while the overlay windows take the mouse even in a game,
+// look translucent with a dashed frame and a countdown, so you can drag them
+// where you want them. Ends 5 s after the last move, after 30 s, or
+// via Done; then the positions are saved to that layout.
+const SETUP_MS = 30_000;
+const SETUP_AFTER_MOVE_MS = 5000;   // each move gives this long to move the next frame
+let setupMode = null;     // { key, until, timer, tick }
+
+function startSetup(key) {
+    finishSetup(false);
+    setupMode = { key, until: Date.now() + SETUP_MS };
+    if (_clickThroughState) setClickThrough(false);
+    // Start from what's saved for this layout, if anything.
+    if (layoutProfiles()[key]) applyLayoutProfile(layoutProfiles()[key]);
+    openSetupFrames(key);
+    setupMode.timer = setTimeout(() => finishSetup(true), SETUP_MS);
+    setupMode.tick = setInterval(paintSetup, 250);
+    paintSetup();
+    videoLog("[layout] setup", key);
+    sseBroadcast("layouts", layoutsInfo());
+}
+
+function setupMoved() {
+    if (!setupMode) return;
+    clearTimeout(setupMode.timer);
+    setupMode.until = Date.now() + SETUP_AFTER_MOVE_MS;
+    setupMode.timer = setTimeout(() => finishSetup(true), Math.max(0, setupMode.until - Date.now()));
+    sseBroadcast("layouts", layoutsInfo());
+}
+
+function paintSetup() {
+    const label = setupMode
+        ? `${setupMode.key === "default" ? "Desktop" : setupMode.key} · ${Math.max(0, Math.ceil((setupMode.until - Date.now()) / 1000))}s`
+        : "";
+    for (const rec of windows.values()) {
+        if (!rec.win || rec.win.isDestroyed()) continue;
+        try { rec.win.setOpacity(setupMode ? 0.7 : OPACITY); } catch (e) {}
+        try {
+            rec.win.webContents.executeJavaScript(
+                `window.__vetSetup && window.__vetSetup(${JSON.stringify(setupMode ? label : null)});`).catch(() => {});
+        } catch (e) {}
+    }
+}
+
+function finishSetup(save) {
+    if (!setupMode) return;
+    const { key, timer, tick } = setupMode;
+    clearTimeout(timer); clearInterval(tick);
+    if (save) saveLayoutProfile(key);     // reads the frames, so before they close
+    setupMode = null;
+    closeSetupFrames();
+    if (save) applyLayoutProfile(layoutProfiles()[key]);
+    paintSetup();
+    _profileKey = "__setup__";          // let the next foreground check re-pick the layout
+    videoLog("[layout] setup done", key, save ? "(saved)" : "(cancelled)");
+    sseBroadcast("layouts", layoutsInfo());
 }
 
 let layoutsWindow = null;
@@ -1774,13 +1862,19 @@ function layoutProfiles() {
 }
 
 function saveLayoutProfile(key) {
-    const p = { windows: {}, savedAt: Date.now() };
+    const prev = layoutProfiles()[key] || {};
+    const p = { windows: {}, savedAt: Date.now(), video: prev.video || null, notify: prev.notify || null };
     for (const rec of windows.values()) {
         if (!rec.win || rec.win.isDestroyed()) continue;
         const [x, y] = rec.win.getPosition();
         p.windows[rec.id] = { x, y };
     }
     if (!Object.keys(p.windows).length) return;
+    // During setup the frames tell where stream / notifications go.
+    const ph = (k) => setupFrames[k] && !setupFrames[k].isDestroyed() ? setupFrames[k].getBounds() : null;
+    const big = ph("stream-big"), small = ph("stream-small"), nt = ph("notify");
+    if (big || small) p.video = { bounds: big || p.video?.bounds || null, previewBounds: small || p.video?.previewBounds || null };
+    if (nt) p.notify = { x: nt.x, y: nt.y, width: nt.width };
     layoutProfiles()[key] = p;
     saveSettingsSoon();
 }
@@ -1796,9 +1890,67 @@ function applyLayoutProfile(p) {
             rec.x = pos.x; rec.y = pos.y;
         }
         scheduleSaveWindows();
+        notifyPos = p.notify || null;
         positionNotifyWindow();
+        if (p.video) {
+            const vp = videoPrefs();
+            if (p.video.bounds) vp.bounds = p.video.bounds;
+            if (p.video.previewBounds) vp.previewBounds = p.video.previewBounds;
+            if (videoWindow && !videoWindow.isDestroyed()) {
+                const b = _videoPreviewState ? p.video.previewBounds : p.video.bounds;
+                if (b && boundsOnScreen(b)) {
+                    if (!_videoPreviewState) _videoSavedBounds = b;
+                    videoWindow.setBounds(fitToAspect(b, _videoAspect));
+                }
+            }
+            saveSettingsSoon();
+        }
     } catch (e) {}
     setTimeout(() => { _applyingProfile = false; }, 300);
+}
+
+// ── Setup frames: empty stand-ins for the stream viewer (big + preview) and
+// the notification block, so they can be placed even when nothing is open.
+const setupFrames = {};
+
+function openSetupFrames(key) {
+    closeSetupFrames();
+    const prof = layoutProfiles()[key] || {};
+    const vp = videoPrefs();
+    const anchor = notifyAnchor();
+    let ab = null;
+    try { if (anchor) ab = anchor.getBounds(); } catch (e) {}
+    const wa = screen.getPrimaryDisplay().workArea;
+    const pick = (...c) => c.find(b => b && boundsOnScreen(b)) || null;
+    const big = pick(prof.video?.bounds, vp.bounds, { x: wa.x + Math.round(wa.width / 2 - 320), y: wa.y + Math.round(wa.height / 2 - 180), width: 640, height: 360 });
+    const small = pick(prof.video?.previewBounds, vp.previewBounds, { x: wa.x + wa.width - 340, y: wa.y + 20, width: 320, height: 180 });
+    const nt = prof.notify
+        ? { x: prof.notify.x, y: prof.notify.y, width: prof.notify.width, height: 110 }
+        : { x: ab ? ab.x : wa.x + 20, y: ab ? ab.y + ab.height + 4 : wa.y + 200, width: ab ? ab.width : WINDOW_WIDTH, height: 110 };
+    const make = (kind, b, resizable) => {
+        const w = new BrowserWindow({
+            ...b, frame: false, transparent: true, backgroundColor: "#00000000",
+            alwaysOnTop: true, resizable, skipTaskbar: true, hasShadow: false,
+            focusable: true, show: false, minWidth: 120, minHeight: 60,
+            webPreferences: { nodeIntegration: false, contextIsolation: true }
+        });
+        w.setAlwaysOnTop(true, "screen-saver");
+        w.loadFile(path.join(__dirname, "placeholder.html"), { query: { kind } });
+        w.once("ready-to-show", () => { try { w.showInactive(); } catch (e) {} });
+        w.on("moved", () => setupMoved());
+        w.on("resized", () => setupMoved());
+        setupFrames[kind] = w;
+    };
+    make("stream-big", big, true);
+    make("stream-small", small, true);
+    make("notify", nt, false);
+}
+
+function closeSetupFrames() {
+    for (const k of Object.keys(setupFrames)) {
+        try { if (!setupFrames[k].isDestroyed()) setupFrames[k].close(); } catch (e) {}
+        delete setupFrames[k];
+    }
 }
 
 function closePopupWindow() {
@@ -1900,9 +2052,53 @@ function buildNetResponse() {
     };
 }
 
+// "Return to channel": the overlay outlives Discord, so it remembers the last
+// channel. Leaving while the plugin is connected is a normal leave. If the
+// connection was lost (Discord crashed / restarted, plugin reloaded) while in
+// voice and afterwards we're not in voice, offer to go back.
+const RETURN_GAP_MS = 6000;            // no state for this long = connection was lost
+const RETURN_OFFER_MS = 30 * 60_000;
+let lastVoiceSeen = null;              // { channelId, guildId, channelName, guildName, at, left }
+let returnOffer = null;
+let pluginRestarted = false;           // the plugin said hello since we last saw voice
+
+function noteVoiceForReturn(gap) {
+    if (state.stopping) { pluginRestarted = true; return; }   // plugin / Discord shutting down: not a leave
+    const lost = gap > RETURN_GAP_MS || pluginRestarted;
+    if (state.channelId) {
+        lastVoiceSeen = {
+            channelId: String(state.channelId), guildId: state.guildId ?? null,
+            channelName: state.channelName || null, guildName: state.guildName || null,
+            at: Date.now(), left: false
+        };
+        returnOffer = null;
+        pluginRestarted = false;
+        return;
+    }
+    if (!lastVoiceSeen || lastVoiceSeen.left) return;
+    if (lost && Date.now() - lastVoiceSeen.at < RETURN_OFFER_MS) {
+        returnOffer = { ...lastVoiceSeen };
+        videoLog("[return] offering", returnOffer.channelId, "after", gap === Infinity ? "start" : Math.round(gap) + " ms", "gap");
+    } else if (!lost && !returnOffer) {
+        lastVoiceSeen.left = true;     // left normally
+    }
+    pluginRestarted = false;
+}
+
+function returnCardFromOverlay() {
+    if (!returnOffer || state.channelId) return null;
+    if (Date.now() - returnOffer.at > RETURN_OFFER_MS) { returnOffer = null; return null; }
+    return { channelId: returnOffer.channelId, channelName: returnOffer.channelName,
+             guildName: returnOffer.guildName, count: 0, members: [] };
+}
+
 function buildStateResponse() {
     if (sessionNote && sessionNote.channelId !== state.channelId) sessionNote = null;   // left / moved: note is gone
-    return { ...state, pluginAlive: isPluginAlive(), net: buildNetResponse(), note: sessionNote ? sessionNote.text : null };
+    return {
+        ...state, pluginAlive: isPluginAlive(), net: buildNetResponse(), note: sessionNote ? sessionNote.text : null,
+        // the plugin's own card (with who's there) wins; else the overlay's
+        returnTo: state.returnTo || returnCardFromOverlay()
+    };
 }
 
 function startNetTicker() {
@@ -2034,6 +2230,7 @@ function createWindowFromRecord(record) {
             if (d) rec.monitor = displayToMonitorRecord(d);
             scheduleSaveWindows();
             positionNotifyWindow();
+            if (setupMode) setupMoved();
         } catch (e) {}
     });
 

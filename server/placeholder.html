@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    html, body {
+        margin: 0; padding: 0; height: 100%; background: transparent; overflow: hidden;
+        font-family: "gg sans", "Noto Sans", "Segoe UI", sans-serif; user-select: none;
+    }
+    /* The whole frame drags the window */
+    #f {
+        box-sizing: border-box; height: 100%;
+        border: 2px dashed #5865f2; border-radius: 6px;
+        background: rgba(30, 31, 34, 0.55);
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+        color: #dbdee1; -webkit-app-region: drag; cursor: move;
+    }
+    .t { font-size: 12px; font-weight: 600; color: #fff; }
+    .s { font-size: 10px; color: #b5bac1; }
+    svg { width: 22px; height: 22px; color: #b5bac1; }
+</style>
+</head>
+<body>
+<div id="f"></div>
+<script>
+const kind = new URLSearchParams(location.search).get("kind");
+const ICON = {
+    stream: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 4a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h16a3 3 0 0 0 3-3V7a3 3 0 0 0-3-3H4Zm0 2h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z"/></svg>`,
+    notify: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2a6 6 0 0 0-6 6v3.6l-1.7 3A1 1 0 0 0 5.2 16h13.6a1 1 0 0 0 .9-1.4L18 11.6V8a6 6 0 0 0-6-6Zm-2.5 16a2.5 2.5 0 0 0 5 0h-5Z"/></svg>`
+};
+const LABEL = {
+    "stream-big":   ["Stream", "drag · resize from the edges"],
+    "stream-small": ["Stream preview", "drag · resize from the edges"],
+    "notify":       ["Notifications", "drag"]
+};
+const [t, s] = LABEL[kind] || ["", ""];
+document.getElementById("f").innerHTML = `${kind === "notify" ? ICON.notify : ICON.stream}<span class="t">${t}</span><span class="s">${s}</span>`;
+</script>
+</body>
+</html>

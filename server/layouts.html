@@ -42,6 +42,8 @@
     .row button.i:hover { color: #ed4245; }
     .row button.i svg { width: 13px; height: 13px; }
     .empty { padding: 10px; color: #80848e; }
+    .cd { color: #fff; font-weight: 600; font-variant-numeric: tabular-nums; min-width: 26px; text-align: right; }
+    .row.setup { background: rgba(88,101,242,0.12); }
 </style>
 </head>
 <body>
@@ -51,7 +53,7 @@
         <label class="sw"><input type="checkbox" id="on"> Switch automatically</label>
         <button class="x" id="close" title="Close"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M6.7 5.3 12 10.6l5.3-5.3 1.4 1.4-5.3 5.3 5.3 5.3-1.4 1.4-5.3-5.3-5.3 5.3-1.4-1.4 5.3-5.3-5.3-5.3z"/></svg></button>
     </div>
-    <div class="hint">Place the overlay windows where you want them for a game, then press <b>Save current positions</b> on that game. The saved layout comes back whenever that game is in front; <b>Desktop</b> is used everywhere else. Games appear here once you've played them with the overlay running.</div>
+    <div class="hint"><b>Setup</b> — for 30 s the overlay takes the mouse even inside the game and turns translucent: switch to the game and drag it where you want; empty frames stand in for the stream (big and preview) and the notifications. It's saved 5 s after your last move. <b>Save</b> stores where the windows are right now. A saved layout comes back whenever that game is in front; <b>Desktop</b> is used everywhere else. Games show up here once you've played them with the overlay running.</div>
     <div id="list"></div>
 </div>
 <script>
@@ -73,13 +75,17 @@ function render() {
     el.innerHTML = info.items.length ? info.items.map(it => {
         const name = it.key === "default" ? "Desktop" : it.key;
         const status = it.saved ? `saved ${ago(it.savedAt)} · ${it.windows} window${it.windows === 1 ? "" : "s"}` : "not saved — uses the current positions";
-        return `<div class="row" data-key="${esc(it.key)}">
+        return `<div class="row${info.setup && info.setup.key === it.key ? " setup" : ""}" data-key="${esc(it.key)}">
             <div class="n">
                 <span class="k">${it.key === info.current ? `<span class="dot" title="In front now"></span>` : ""}${esc(name)}</span>
                 <span class="s">${esc(status)}</span>
             </div>
-            ${it.saved ? `<button class="b" data-do="apply" title="Move the windows there now">Apply now</button>` : ""}
-            <button class="b pri" data-do="save">Save current positions</button>
+            ${info.setup && info.setup.key === it.key
+                ? `<span class="cd">${Math.max(0, Math.ceil((info.setup.until - Date.now()) / 1000))}s</span>
+                   <button class="b pri" data-do="done">Done</button><button class="b" data-do="cancel">Cancel</button>`
+                : `${it.saved ? `<button class="b" data-do="apply" title="Move the windows there now">Apply</button>` : ""}
+                   <button class="b pri" data-do="setup" title="For 30 s the overlay takes the mouse even in the game: drag it, and it's saved">Setup</button>
+                   <button class="b" data-do="save" title="Save where the windows are now">Save</button>`}
             ${it.key === "default" ? "" : `<button class="i" data-do="${it.saved ? "delete" : "forget"}" title="${it.saved ? "Delete this layout" : "Remove from the list"}">${TRASH}</button>`}
         </div>`;
     }).join("") : `<div class="empty">No layouts yet.</div>`;
@@ -109,6 +115,8 @@ const es = new EventSource(API + "/events");
 es.addEventListener("layouts", (e) => { try { info = JSON.parse(e.data); render(); } catch (err) {} });
 load();
 setInterval(load, 30000);
+// tick the setup countdown locally
+setInterval(() => { if (info && info.setup) render(); }, 500);
 </script>
 </body>
 </html>
