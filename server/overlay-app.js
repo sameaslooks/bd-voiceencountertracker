@@ -405,6 +405,15 @@ function setClickThrough(enabled) {
             ).catch(() => {});
         } catch (e) {}
     }
+    applyVideoClickThrough();
+}
+
+// The stream viewer follows the same state: while the overlay is dimmed the
+// mouse must not hover or click it either.
+function applyVideoClickThrough() {
+    if (!videoWindow || videoWindow.isDestroyed()) return;
+    try { videoWindow.setIgnoreMouseEvents(_clickThroughState, { forward: false }); } catch (e) {}
+    try { videoWindow.setFocusable(!_clickThroughState); } catch (e) {}
 }
 
 let _lastFgSig = "";
@@ -1800,6 +1809,7 @@ function openVideoWindow(params) {
         }
     });
     videoWindow.setAlwaysOnTop(true, "screen-saver");
+    applyVideoClickThrough();
     videoWindow.setVisibleOnAllWorkspaces(true);
     try { videoWindow.setOpacity(_videoAlpha); } catch (e) {}
     videoWindow.loadFile(path.join(__dirname, "video.html"));
