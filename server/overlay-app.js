@@ -1952,6 +1952,14 @@ function createTray() {
 // Lifecycle
 // =====================================================================
 
+// Only one overlay may run: a second copy stacks a duplicate window on top
+// and can't bind the HTTP port.
+if (!app.requestSingleInstanceLock()) {
+    console.log("[overlay] another instance is already running, exiting");
+    app.quit();
+    process.exit(0);
+}
+
 app.whenReady().then(async () => {
     loadSettings();
     await refreshSources(true);
