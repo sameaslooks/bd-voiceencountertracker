@@ -34,6 +34,7 @@ const HEIGHT_EMPTY_VC  = 60;
 const ROW_HEIGHT       = 32;
 const CARD_HEIGHT      = 40;
 const NOTE_HEIGHT      = 34;
+const STATS_HEIGHT     = 54;
 
 const NET_BANNER_HEIGHT = 30;
 
@@ -1174,7 +1175,7 @@ function startServer() {
         if (req.method === "POST" && url === "/tip/open") {
             try {
                 const d = JSON.parse(await readBody(req) || "{}");
-                openTipWindow(String(d.mode || "ping"), Number(d.x), Number(d.y));
+                openTipWindow(String(d.mode || "ping"), Number(d.x), Number(d.y), d.uid ? String(d.uid) : "", Number(d.w));
             } catch (e) {}
             jsonReply(res, 200, { ok: true });
             return;
@@ -1455,6 +1456,7 @@ function addNotification(n) {
         authorId: String(n.authorId || ""), name: String(n.name || "user"), avatar: n.avatar || null,
         channelId: String(n.channelId), guildId: n.guildId ? String(n.guildId) : null,
         where: n.where ? String(n.where) : null, text: String(n.text || ""),
+        devices: Array.isArray(n.devices) ? n.devices.slice(0, 2).map(d => ({ kind: d.kind === "output" ? "output" : "input", name: String(d.name || "") })) : null,
         expiresAt: Date.now() + Math.max(3000, Math.min(60_000, Number(n.ttlMs) || NOTIFY_SHOW_MS))
     };
     // One card per chat: a newer message replaces the older card.
@@ -1610,7 +1612,7 @@ const pingHistory = [];      // { t, v } for the last 10 minutes
 let sessionNote = null;      // { channelId, text } — cleared when leaving that channel
 let noteEditing = false;
 
-function openTipWindow(mode, x, y) {
+function openTipWindow(mode, x, y, uid = "", w = 0) {
     closeTipWindow();
     const pt = Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : screen.getCursorScreenPoint();
     tipWindow = new BrowserWindow({
@@ -1621,21 +1623,24 @@ function openTipWindow(mode, x, y) {
         webPreferences: { nodeIntegration: false, contextIsolation: true, backgroundThrottling: false }
     });
     tipWindow._vetAnchor = pt;
+    tipWindow._vetWidth = w > 0 ? Math.round(w) : 0;
     tipWindow.setAlwaysOnTop(true, "screen-saver");
     try { tipWindow.setIgnoreMouseEvents(true); } catch (e) {}
-    tipWindow.loadFile(path.join(__dirname, "tip.html"), { query: { mode } });
+    tipWindow.loadFile(path.join(__dirname, "tip.html"), { query: { mode, uid } });
     tipWindow.on("closed", () => { tipWindow = null; });
 }
 
 function sizeTipWindow(w, h) {
     if (!tipWindow || tipWindow.isDestroyed() || !(w > 0) || !(h > 0)) return;
     const pt = tipWindow._vetAnchor;
+    if (tipWindow._vetWidth) w = tipWindow._vetWidth;      // as wide as the overlay block
     const wa = screen.getDisplayNearestPoint(pt).workArea;
     let x = Math.min(pt.x, wa.x + wa.width - w), y = pt.y;
     if (y + h > wa.y + wa.height) y = Math.max(wa.y, pt.y - h - 30);
     try {
         tipWindow.setBounds({ x: Math.max(wa.x, x), y, width: Math.ceil(w), height: Math.ceil(h) });
         if (!tipWindow.isVisible()) tipWindow.showInactive();
+        tipWindow.moveTop();
     } catch (e) {}
 }
 
@@ -1865,9 +1870,10 @@ function computeTargetHeight() {
         if (state.channelId) cards = Array.isArray(state.departures) ? Math.min(state.departures.length, 3) : 0;
         else if (state.returnTo) cards = 1;
     }
+    const statsExtra = (alive && !state.channelId && state.leaveStats) ? STATS_HEIGHT : 0;
     const cardsExtra = cards ? cards * CARD_HEIGHT + 4 : 0;
     const noteExtra = (alive && state.channelId && (noteEditing || (sessionNote && sessionNote.channelId === state.channelId))) ? NOTE_HEIGHT : 0;
-    return Math.min(MAX_HEIGHT, baseHeight + netExtra + cardsExtra + noteExtra);
+    return Math.min(MAX_HEIGHT, baseHeight + netExtra + cardsExtra + noteExtra + statsExtra);
 }
 
 function applyAutoResize(rec) {

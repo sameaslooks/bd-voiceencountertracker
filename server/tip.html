@@ -8,19 +8,31 @@
         font-family: "gg sans", "Noto Sans", "Segoe UI", sans-serif; user-select: none;
     }
     #tip {
-        display: inline-block; box-sizing: border-box;
+        display: block; box-sizing: border-box; width: 100%;
         background: rgba(17,18,20,0.97); color: #dbdee1;
         border: 1px solid rgba(255,255,255,0.1); border-radius: 6px;
-        padding: 6px 8px; font-size: 11px; max-width: 240px;
+        padding: 6px 8px; font-size: 11px;
     }
     .row { display: flex; justify-content: space-between; gap: 10px; white-space: nowrap; }
     .row b { color: #fff; }
     .muted { color: #949ba4; }
     svg { display: block; margin-top: 5px; }
-    img.prev { width: 220px; border-radius: 4px; display: block; margin-bottom: 5px; background: #000; }
+    img.prev { width: 100%; border-radius: 4px; display: block; margin-bottom: 5px; background: #000; }
     .v { display: flex; align-items: center; gap: 5px; padding: 1px 0; white-space: nowrap; }
     .v img { width: 14px; height: 14px; border-radius: 50%; }
     .v.s { color: #f0b232; }
+    .v svg.warn { width: 11px; height: 11px; }
+    .act { display: flex; gap: 8px; align-items: center; }
+    .act .art { width: 52px; height: 52px; border-radius: 5px; object-fit: cover; flex-shrink: 0; background: #2b2d31; }
+    .act .art.small { width: 40px; height: 40px; }
+    .act .tx { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+    .act .kind { color: #949ba4; font-size: 10px; text-transform: uppercase; letter-spacing: .3px; font-weight: 600; }
+    .act .t1 { color: #fff; font-weight: 600; font-size: 12px; }
+    .act .t2, .act .t3 { color: #c4c9ce; }
+    .act .t1, .act .t2, .act .t3 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bar { height: 3px; background: rgba(255,255,255,0.15); border-radius: 2px; margin-top: 5px; overflow: hidden; }
+    .bar i { display: block; height: 100%; background: #fff; }
+    .times { display: flex; justify-content: space-between; color: #949ba4; font-size: 10px; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -50,7 +62,7 @@ async function renderPing() {
     if (!pts.length) { el.innerHTML = `<span class="muted">No ping data</span>`; return report(); }
     const vals = pts.map(p => p.v);
     const max = Math.max(...vals), avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-    const W = 220, H = 46, t0 = d.now - 10 * 60_000;
+    const W = Math.max(160, el.clientWidth - 16), H = 46, t0 = d.now - 10 * 60_000;
     const top = Math.max(100, max * 1.1);
     const x = (t) => Math.max(0, (t - t0) / (10 * 60_000) * W);
     const y = (v) => H - Math.min(H, v / top * H);
@@ -79,12 +91,48 @@ async function renderMyLive() {
     if (!url && src.startsWith("screen-handle:")) url = Object.entries(thumbs).find(([k]) => k.startsWith("screen:"))?.[1];
     const v = Array.isArray(me?.viewers) ? me.viewers : [];
     el.innerHTML = (url ? `<img class="prev" src="${url}">` : "") +
-        (v.length ? v.map(x => `<div class="v${x.stranger ? " s" : ""}"><img src="${avatarUrl(x.userId, x.avatar)}">${esc(x.name)}${x.stranger ? " ⚠" : ""}</div>`).join("")
+        (v.length ? v.map(x => `<div class="v${x.stranger ? " s" : ""}"><img src="${avatarUrl(x.userId, x.avatar)}">${esc(x.name)}${x.stranger ? ` <svg class="warn" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M10.3 3.7a2 2 0 0 1 3.4 0l8.2 14.1A2 2 0 0 1 20.2 21H3.8a2 2 0 0 1-1.7-3.2l8.2-14.1ZM11 9v5h2V9h-2Zm0 7v2h2v-2h-2Z"/></svg>` : ""}</div>`).join("")
                   : `<div class="v muted">No viewers</div>`);
     report();
 }
 
-const run = mode === "mylive" ? renderMyLive : renderPing;
+// Someone's activity: art + full status (+ progress for music, elapsed for games)
+const uid = new URLSearchParams(location.search).get("uid");
+const KIND = { game: "Playing", listening: "Listening to", watching: "Watching", streaming: "Streaming" };
+const mmss = (ms) => { const t = Math.max(0, Math.round(ms / 1000)); const h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = t % 60;
+    return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(s).padStart(2, "0"); };
+async function renderActivity() {
+    let st = {};
+    try { st = await (await fetch(API + "/state", { cache: "no-store" })).json(); } catch (e) {}
+    const u = (st.users || []).find(x => x.userId === uid);
+    const a = u && u.activity;
+    if (!a) { el.innerHTML = `<span class="muted">No activity</span>`; return report(); }
+    const now = Date.now();
+    const music = a.type === "listening";
+    const art = a.image || a.icon;
+    const lines = music
+        ? [a.details, a.state ? "by " + a.state : null, a.imageText && a.imageText !== a.details ? "on " + a.imageText : null]
+        : [a.name, a.details, a.state];
+    let extra = "";
+    if (music && a.start && a.end && a.end > a.start) {
+        const p = Math.min(1, Math.max(0, (now - a.start) / (a.end - a.start)));
+        extra = `<div class="bar"><i style="width:${(p * 100).toFixed(1)}%"></i></div>
+                 <div class="times"><span>${mmss(now - a.start)}</span><span>${mmss(a.end - a.start)}</span></div>`;
+    } else if (a.start) {
+        extra = `<div class="times"><span>for ${mmss(now - a.start)}</span><span></span></div>`;
+    }
+    el.innerHTML = `<div class="act">
+        ${art ? `<img class="art${music ? "" : " small"}" src="${esc(art)}" onerror="this.remove()">` : ""}
+        <div class="tx">
+            <span class="kind">${esc((KIND[a.type] || "") + (music && a.name ? " " + a.name : ""))}</span>
+            ${lines.filter(Boolean).map((l, i) => `<span class="t${i + 1}">${esc(l)}</span>`).join("")}
+            ${extra}
+        </div>
+    </div>`;
+    report();
+}
+
+const run = mode === "mylive" ? renderMyLive : mode === "activity" ? renderActivity : renderPing;
 run();
 setInterval(run, mode === "mylive" ? 2000 : 1000);
 </script>

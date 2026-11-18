@@ -80,6 +80,8 @@ module.exports = class VoiceEncounterTracker {
         this.PING_PUSH_MS        = 1000;
         this.DEPARTURE_SHOW_MS   = 20_000;          // "-> #channel" card after someone moves
         this.RETURN_MAX_AGE_MS   = 30 * 60_000;     // offer to rejoin only this soon after
+        this.DAY_GAP_MS          = 8 * 60 * 60_000; // "today" = since the last voice pause this long
+        this.LEAVE_STATS_MS      = 90_000;          // how long the stats card shows after leaving
         this.COMMAND_POLL_MS     = 1_000;
         this.MAX_SESSIONS        = 500;
         this.MAX_EVENTS_PER_SESSION = 300;
@@ -645,6 +647,7 @@ module.exports = class VoiceEncounterTracker {
                         try { self.handleVoiceState(vs); } catch (e) {}
                     }
                     try { self._rememberOwnChannel(); } catch (e) {}
+                    try { self._trackOwnSession(); } catch (e) {}
                     if (self._injectDebounce) clearTimeout(self._injectDebounce);
                     self._injectDebounce = self._addTimer(setTimeout(() => {
                         try { self.injectBadges(); } catch (e) {}
@@ -1843,7 +1846,8 @@ module.exports = class VoiceEncounterTracker {
                     guildId: null, channelId: null, channelName: null, users: [],
                     prefs: this._prefsPayload(),
                     streamSound: null,
-                    returnTo: this._returnCard()
+                    returnTo: this._returnCard(),
+                    leaveStats: this._leaveStats && Date.now() < this._leaveStats.until ? this._leaveStats : null
                 });
                 return;
             }
@@ -3080,9 +3084,9 @@ module.exports = class VoiceEncounterTracker {
             .replace(/<#(\d+)>/g, (_, id) => "#" + (this.getChannelName(id) || "channel"))
             .replace(/<a?:(\w+):\d+>/g, ":$1:")
             .replace(/\s+/g, " ").trim();
-        if (!text && msg.attachments?.length) text = "📎 " + (msg.attachments[0]?.filename || "attachment");
-        if (!text && msg.embeds?.length) text = "🔗 link";
-        if (!text && msg.sticker_items?.length) text = "🏷 sticker";
+        if (!text && msg.attachments?.length) text = "Attachment: " + (msg.attachments[0]?.filename || "file");
+        if (!text && msg.embeds?.length) text = "Link";
+        if (!text && msg.sticker_items?.length) text = "Sticker";
         if (text.length > 160) text = text.slice(0, 157) + "…";
 
         const where = isDM
@@ -3129,8 +3133,10 @@ module.exports = class VoiceEncounterTracker {
     // Person card: activity, mobile, volume, quick actions
     // =====================================================================
 
-    // What the person is doing, for a small icon on the card.
-    // { type: "game"|"spotify"|"listening"|"watching"|"streaming"|"custom", name, details, icon, canListen }
+    // What the person is doing: a small icon on the card, details in a tooltip.
+    // { type, platform, name, details, state, icon, image, imageText, start, end, canListen }
+    //   platform: "spotify" | "soundcloud" | "youtube" | "apple" | "music" | null
+    //   icon:  small app icon (games), image: big picture (album art / game art)
     _activityFor(userId) {
         try {
             const ps = this._sc?.PresenceStore ?? BdApi.Webpack.getStore("PresenceStore");
@@ -3144,31 +3150,41 @@ module.exports = class VoiceEncounterTracker {
                 if (!img) return null;
                 if (img.startsWith("spotify:")) return "https://i.scdn.co/image/" + img.slice(8);
                 if (img.startsWith("mp:")) return "https://media.discordapp.net/" + img.slice(3);
+                if (/^https?:/.test(img)) return img;
                 if (appId && /^\d+$/.test(img)) return `https://cdn.discordapp.com/app-assets/${appId}/${img}.png`;
                 return null;
             };
             const appIcon = (appId) => {
                 try {
                     const app = (this._sc?.ApplicationStore ?? BdApi.Webpack.getStore("ApplicationStore"))?.getApplication?.(appId);
-                    if (app?.icon) return `https://cdn.discordapp.com/app-icons/${appId}/${app.icon}.png?size=32`;
+                    if (app?.icon) return `https://cdn.discordapp.com/app-icons/${appId}/${app.icon}.png?size=64`;
                 } catch (e) {}
                 return null;
             };
-            const isSpotify = pick.type === 2 && (pick.name === "Spotify" || String(pick.id || "").startsWith("spotify"));
             if (pick.type === 4) {
                 const text = pick.state || "";
                 if (!text && !pick.emoji) return null;
-                return { type: "custom", name: (pick.emoji?.name ? pick.emoji.name + " " : "") + text, details: null, icon: null };
+                return { type: "custom", name: (pick.emoji?.name ? pick.emoji.name + " " : "") + text };
             }
+            const n = String(pick.name || "").toLowerCase();
+            const isSpotify = n === "spotify" || String(pick.id || "").startsWith("spotify");
+            const platform = isSpotify ? "spotify"
+                : n.includes("soundcloud") ? "soundcloud"
+                : n.includes("youtube music") || n === "youtube" ? "youtube"
+                : n.includes("apple music") ? "apple"
+                : pick.type === 2 ? "music" : null;
             return {
-                type: isSpotify ? "spotify" : pick.type === 0 ? "game" : pick.type === 2 ? "listening"
+                type: pick.type === 0 ? "game" : pick.type === 2 ? "listening"
                     : pick.type === 3 ? "watching" : "streaming",
+                platform,
                 name: pick.name || "",
-                details: isSpotify ? [pick.details, pick.state].filter(Boolean).join(" — ")
-                    : [pick.details, pick.state].filter(Boolean).join(" · ") || null,
-                icon: (pick.application_id && appIcon(pick.application_id))
-                    || asset(pick.assets?.large_image, pick.application_id)
-                    || asset(pick.assets?.small_image, pick.application_id),
+                details: pick.details || null,
+                state: pick.state || null,
+                icon: pick.application_id ? appIcon(pick.application_id) : null,
+                image: asset(pick.assets?.large_image, pick.application_id) || asset(pick.assets?.small_image, pick.application_id),
+                imageText: pick.assets?.large_text || null,
+                start: pick.timestamps?.start ? Number(pick.timestamps.start) : null,
+                end: pick.timestamps?.end ? Number(pick.timestamps.end) : null,
                 canListen: isSpotify && !!pick.sync_id
             };
         } catch (e) { return null; }
@@ -3344,7 +3360,7 @@ module.exports = class VoiceEncounterTracker {
                         id: "viewer-" + v.userId + "-" + now, kind: "mention",
                         authorId: v.userId, name: v.name, avatar: v.avatar,
                         channelId: "viewer-" + v.userId, guildId: null,
-                        where: "your stream", text: "👁 started watching your stream", at: now
+                        where: "your stream", text: "started watching your stream", at: now
                     });
                 }
             }
@@ -3546,16 +3562,100 @@ module.exports = class VoiceEncounterTracker {
         const prev = this._audioDevices;
         this._audioDevices = cur;
         if (!prev || sig(prev) === sig(cur)) return;
-        const lines = [];
-        if (prev.input !== cur.input || name(prev.inputs, prev.input) !== name(cur.inputs, cur.input)) lines.push("🎙 " + name(cur.inputs, cur.input));
-        if (prev.output !== cur.output || name(prev.outputs, prev.output) !== name(cur.outputs, cur.output)) lines.push("🎧 " + name(cur.outputs, cur.output));
-        if (!lines.length) return;
-        vetLog("info", "audio device changed:", lines.join(" · "));
+        const devices = [];
+        if (prev.input !== cur.input || name(prev.inputs, prev.input) !== name(cur.inputs, cur.input)) devices.push({ kind: "input", name: name(cur.inputs, cur.input) });
+        if (prev.output !== cur.output || name(prev.outputs, prev.output) !== name(cur.outputs, cur.output)) devices.push({ kind: "output", name: name(cur.outputs, cur.output) });
+        if (!devices.length) return;
+        vetLog("info", "audio device changed:", devices.map(d => d.kind + "=" + d.name).join(", "));
         this._postJSON("/notify", {
             id: "device-" + Date.now(), kind: "device", authorId: "", name: "Audio device changed",
             avatar: null, channelId: "device", guildId: null, where: null,
-            text: lines.join(" · "), ttlMs: 30000, at: Date.now()
+            text: "", devices, ttlMs: 30000, at: Date.now()
         });
+    }
+
+    // =====================================================================
+    // Own voice time + a short stats card after leaving voice
+    // =====================================================================
+
+    // My own voice sessions (for "today"), kept for 14 days.
+    _loadMyVoice() {
+        try {
+            const v = BdApi.Data.load(this.meta.name, "myVoice");
+            return Array.isArray(v) ? v : [];
+        } catch (e) { return []; }
+    }
+
+    _trackOwnSession() {
+        const me = this.getCurrentUserId();
+        const mine = me ? this.active.get(me) : null;
+        const now = Date.now();
+        if (mine?.channelId) {
+            if (!this._mySess || this._mySess.channelId !== mine.channelId) {
+                if (this._mySess) this._endOwnSession(now, false);   // moved: one session per channel
+                this._mySess = { start: mine.startedAt || now, channelId: mine.channelId, guildId: mine.guildId ?? null };
+            }
+            return;
+        }
+        if (this._mySess) this._endOwnSession(now, true);
+    }
+
+    _endOwnSession(end, left) {
+        const sess = this._mySess;
+        this._mySess = null;
+        if (!sess || end - sess.start < 5000) return;
+        const list = this._loadMyVoice().filter(x => x.end > end - 14 * 86400_000);
+        list.push({ start: sess.start, end, channelId: sess.channelId });
+        try { BdApi.Data.save(this.meta.name, "myVoice", list); } catch (e) {}
+        if (!left) return;
+        // People's sessions are written when I leave; read them a moment later.
+        this._addTimer(setTimeout(() => {
+            try {
+                this._leaveStats = this._buildLeaveStats(sess.start, end, list);
+                this.pushStateToOverlay();
+                this._addTimer(setTimeout(() => this.scheduleOverlayPush(), this.LEAVE_STATS_MS + 200));
+            } catch (e) { vetLog("warn", "leave stats:", e); }
+        }, 800));
+    }
+
+    // "Today" starts after the last pause in voice of DAY_GAP_MS or more.
+    _dayStart(list, now) {
+        const xs = list.slice().sort((a, b) => b.start - a.start);
+        let start = now, prevStart = now;
+        for (const x of xs) {
+            if (prevStart - x.end >= this.DAY_GAP_MS) break;
+            start = Math.min(start, x.start);
+            prevStart = Math.min(prevStart, x.start);
+        }
+        return start;
+    }
+
+    _topPeople(from, to, n = 3) {
+        const out = [];
+        const us = this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore");
+        for (const rec of this.encounters.values()) {
+            let ms = 0;
+            for (const sn of rec.sessions || []) {
+                const a = Math.max(sn.startedAt, from), b = Math.min(sn.endedAt, to);
+                if (b > a) ms += b - a;
+            }
+            if (ms < 60_000) continue;
+            const u = us?.getUser?.(rec.userId);
+            out.push({ userId: rec.userId, name: this.getStoredDisplayName(rec.userId) || this.getUserName(rec.userId), avatar: u?.avatar ?? null, ms });
+        }
+        return out.sort((a, b) => b.ms - a.ms).slice(0, n);
+    }
+
+    _buildLeaveStats(start, end, list) {
+        const dayFrom = this._dayStart(list, end);
+        const todayMs = list.filter(x => x.end > dayFrom).reduce((a, x) => a + (x.end - Math.max(x.start, dayFrom)), 0);
+        return {
+            until: Date.now() + this.LEAVE_STATS_MS,
+            sessionMs: end - start,
+            todayMs,
+            topSession: this._topPeople(start, end),
+            topToday: this._topPeople(dayFrom, end)
+        };
     }
 
     _stopFramePump() {
@@ -4774,7 +4874,7 @@ module.exports = class VoiceEncounterTracker {
                 const startTime = `${String(start.getHours()).padStart(2,"0")}:${String(start.getMinutes()).padStart(2,"0")}`;
                 const endTime   = `${String(end.getHours()).padStart(2,"0")}:${String(end.getMinutes()).padStart(2,"0")}`;
                 const dur = this.formatDuration(s.durationMs ?? (s.endedAt - s.startedAt));
-                const guild = s.guildName || (s.guildId ? s.guildId.slice(-6) : "📞 DM");
+                const guild = s.guildName || (s.guildId ? s.guildId.slice(-6) : "DM");
                 const channel = s.channelName || (s.channelId ? s.channelId.slice(-6) : "—");
                 const sessName = this._escape(s.username
                     ? (s.globalName && s.globalName !== s.username ? `${s.globalName} (${s.username})` : s.username)

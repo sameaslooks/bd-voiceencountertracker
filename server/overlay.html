@@ -269,24 +269,35 @@
     /* Activity (game / Spotify / ...) and phone icons next to the name */
     .user .act-ico {
         width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; object-fit: cover;
+        display: inline-flex; align-items: center; justify-content: center;
     }
+    .user .act-ico svg { width: 13px; height: 13px; display: block; }
+    .user span.act-ico { color: #b5bac1; }
+    /* Game icons stay monochrome in the list (the overlay is muted on purpose);
+       colour comes back on hover and in the tooltip. */
+    .user img.act-ico { filter: grayscale(1); opacity: 0.75; transition: filter .15s, opacity .15s; }
+    .user img.act-ico:hover { filter: none; opacity: 1; }
     .user .act-txt {
         font-size: 10px; color: #949ba4; flex-shrink: 1; min-width: 0;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70px;
     }
     .user .mobile-ico { width: 10px; height: 13px; color: #949ba4; flex-shrink: 0; }
     .vs-live.self-live { cursor: default; }
-    .vs-live.self-live .eye { font-weight: 600; opacity: 0.9; }
+    .vs-live.self-live .eye { font-weight: 600; opacity: 0.9; display: inline-flex; align-items: center; gap: 2px; }
+    .vs-live .eye-ico { width: 10px; height: 10px; }
+    .hdr-ico { width: 11px; height: 11px; vertical-align: -1px; margin-right: 3px; }
+    .vcard .go svg { width: 14px; height: 14px; display: block; }
     .vs-live.self-live.warn { background: #f0b232; color: #1e1f22; }
     .cam-btn { cursor: pointer; display: inline-flex; }
     .cam-btn:hover { filter: brightness(1.6); }
     /* Unread DMs from this person */
     .user .dm-badge {
         position: absolute; right: -4px; bottom: -3px;
-        min-width: 14px; height: 14px; padding: 0 3px; box-sizing: border-box;
-        border-radius: 7px; background: #ed4245; color: #fff;
-        font-size: 9px; font-weight: 700; line-height: 14px; text-align: center;
-        border: 2px solid #1e1f22; pointer-events: none;
+        min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box;
+        border-radius: 8px; background: #ed4245; color: #fff;
+        font-size: 9px; font-weight: 700; line-height: 1;
+        display: flex; align-items: center; justify-content: center;
+        border: 2px solid #1e1f22; pointer-events: none; font-variant-numeric: tabular-nums;
     }
     .user .avatar-wrap img {
         width: 100%;
@@ -460,7 +471,6 @@
         0%   { background: rgba(250, 200, 40, 0.38); }
         100% { background: transparent; }
     }
-    .user.fav .name { color: #f5d06a; }
 
     /* Leave voice (header, left of the stream button): hold, the ring closes, then we leave */
     #leave-btn {
@@ -493,8 +503,8 @@
     /* Session note: one line under the list, gone when you leave the channel */
     #note {
         display: none; margin: 0 4px 4px; padding: 4px 7px; min-height: 26px; box-sizing: border-box;
-        background: rgba(250,200,40,0.10); border: 1px solid rgba(250,200,40,0.30); border-radius: 5px;
-        color: #f2e6b8; font-size: 11px; line-height: 16px; cursor: text;
+        background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 5px;
+        color: #c4c9ce; font-size: 11px; line-height: 16px; cursor: text;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         -webkit-app-region: no-drag;
     }
@@ -503,6 +513,18 @@
         width: 100%; background: transparent; border: none; outline: none; color: #fff;
         font: inherit; padding: 0;
     }
+    /* After leaving voice: a tiny summary for a minute and a half */
+    .vstats {
+        margin: 0 4px; padding: 4px 6px; border-radius: 5px; box-sizing: border-box;
+        background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.07);
+        font-size: 10px; color: #b5bac1; line-height: 15px;
+    }
+    .vstats .top { display: flex; gap: 8px; }
+    .vstats b { color: #fff; font-weight: 600; }
+    .vstats .row { display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; }
+    .vstats .lbl { color: #80848e; width: 42px; flex-shrink: 0; }
+    .vstats .p { display: inline-flex; align-items: center; gap: 3px; }
+    .vstats .p img { width: 12px; height: 12px; border-radius: 50%; }
     /* Cards: "-> #channel" after someone moved, and "return to channel" */
     #cards { display: flex; flex-direction: column; gap: 4px; padding: 0 4px 4px; }
     #cards:empty { display: none; }
@@ -667,14 +689,23 @@ elSignal.addEventListener("mouseenter", () => {
     signalTipTimer = setTimeout(showSignalTip, 400);
 });
 // Ping graph (last 10 min) opens in a separate tip window below the icon.
-function openTipAt(mode, el) {
+let openTipKey = null;
+function openTipAt(mode, el, uid) {
+    const key = mode + ":" + (uid || "");
+    if (openTipKey === key) return;          // already showing (e.g. the list re-rendered under the cursor)
+    openTipKey = key;
     const r = el.getBoundingClientRect();
     fetch("http://127.0.0.1:17842/tip/open", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, x: window.screenX + Math.round(r.right) - 230, y: window.screenY + Math.round(r.bottom) + 4 })
+        // Under the whole overlay block, same width, on top of everything
+        // (the notification block included).
+        body: JSON.stringify({
+            mode, uid: uid || null,
+            x: window.screenX, y: window.screenY + window.innerHeight + 3, w: window.innerWidth
+        })
     }).catch(() => {});
 }
-function closeTip() { fetch("http://127.0.0.1:17842/tip/close", { method: "POST" }).catch(() => {}); }
+function closeTip() { openTipKey = null; fetch("http://127.0.0.1:17842/tip/close", { method: "POST" }).catch(() => {}); }
 function showSignalTip() { openTipAt("ping", elSignal); }
 elSignal.addEventListener("mouseleave", () => {
     clearTimeout(signalTipTimer);
@@ -762,7 +793,7 @@ function liveBadgeHtml(u) {
     if (u.isSelf) {
         const v = Array.isArray(u.viewers) ? u.viewers : [];
         const warn = v.some(x => x.stranger) ? " warn" : "";
-        return `<span class="vs-live self-live${warn}" data-mylive="1">LIVE${v.length ? ` <span class="eye">👁 ${v.length}</span>` : ""}</span>`;
+        return `<span class="vs-live self-live${warn}" data-mylive="1">LIVE${v.length ? ` <span class="eye"><svg class="eye-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 5C6.5 5 2.7 9.4 1.6 11.4a1.3 1.3 0 0 0 0 1.2C2.7 14.6 6.5 19 12 19s9.3-4.4 10.4-6.4a1.3 1.3 0 0 0 0-1.2C21.3 9.4 17.5 5 12 5Zm0 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"/></svg>${v.length}</span>` : ""}</span>`;
     }
     return `<span class="vs-live" data-act="watch-stream" data-uid="${esc(u.userId)}" ` +
            `title="Streaming — click to watch">LIVE</span>`;
@@ -820,13 +851,23 @@ function voiceStatusHtml(u, now) {
     return `<div class="vstatus">${parts.join("")}</div>`;
 }
 
-const ACT_VERB = { game: "Playing", spotify: "Spotify", listening: "Listening to", watching: "Watching", streaming: "Streaming" };
-function activityHtml(a) {
-    if (!a) return "";
-    const tip = esc(a.type === "custom" ? a.name : `${ACT_VERB[a.type] || ""} ${a.type === "spotify" ? "" : a.name}`.trim() + (a.details ? ` — ${a.details}` : ""));
-    if (a.icon) return `<img class="act-ico" src="${esc(a.icon)}" title="${tip}" onerror="this.remove()">`;
-    if (a.type === "custom") return "";
-    return `<span class="act-txt" title="${tip}">${esc(a.name)}</span>`;
+// Music: the platform's icon. Games: the game's icon. Details in a tooltip.
+// Monochrome (currentColor) platform marks; the arcs/holes are cut out with a
+// mask so they show whatever is behind the card.
+const PLATFORM_SVG = {
+    spotify: `<svg viewBox="0 0 24 24"><mask id="m-sp"><rect width="24" height="24" fill="#fff"/><g fill="none" stroke="#000" stroke-linecap="round"><path d="M6.6 9.7Q12 7.7 17.5 10.5" stroke-width="2"/><path d="M7.3 12.9Q12 11.3 16.7 13.6" stroke-width="1.7"/><path d="M8 15.9Q12 14.7 15.8 16.5" stroke-width="1.4"/></g></mask><circle cx="12" cy="12" r="10.5" fill="currentColor" mask="url(#m-sp)"/></svg>`,
+    soundcloud: `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="2" y="12.5" width="1.4" height="4.5" rx=".7"/><rect x="4.4" y="11" width="1.4" height="6" rx=".7"/><rect x="6.8" y="9.8" width="1.4" height="7.2" rx=".7"/><rect x="9.2" y="8.8" width="1.4" height="8.2" rx=".7"/><path d="M11.6 8.2a5.3 5.3 0 0 1 7.3 3.6A2.7 2.7 0 0 1 19.4 17h-7.8z"/></svg>`,
+    youtube: `<svg viewBox="0 0 24 24"><mask id="m-yt"><rect width="24" height="24" fill="#fff"/><path d="M10 8.8v6.4l5.4-3.2z" fill="#000"/></mask><rect x="1.5" y="5" width="21" height="14" rx="4" fill="currentColor" mask="url(#m-yt)"/></svg>`,
+    apple: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.5 3.5v11.2a2.8 2.8 0 1 1-1.7-2.6V7.4l-7 1.5v7.8a2.8 2.8 0 1 1-1.7-2.6V5.6z"/></svg>`,
+    music: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.5 3.5v11.2a2.8 2.8 0 1 1-1.7-2.6V7.4l-7 1.5v7.8a2.8 2.8 0 1 1-1.7-2.6V5.6z"/></svg>`
+};
+function activityHtml(a, userId) {
+    if (!a || a.type === "custom") return "";
+    const attrs = `class="act-ico" data-acttip="${esc(userId)}"`;
+    if (a.platform && PLATFORM_SVG[a.platform]) return `<span ${attrs}>${PLATFORM_SVG[a.platform]}</span>`;
+    if (a.icon) return `<img ${attrs} src="${esc(a.icon)}" onerror="this.remove()">`;
+    if (a.image) return `<img ${attrs} src="${esc(a.image)}" onerror="this.remove()">`;
+    return `<span class="act-txt" data-acttip="${esc(userId)}">${esc(a.name)}</span>`;
 }
 
 function renderUsersList(now = Date.now()) {
@@ -888,7 +929,7 @@ function renderUsersList(now = Date.now()) {
             </div>
             <span class="name" title="${esc(titleAttr)}">${esc(shownName)}</span>
             ${u.mobile ? `<svg class="mobile-ico" viewBox="0 0 10 14" aria-hidden="true"><title>On phone</title><rect x="1" y="0.8" width="8" height="12.4" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="5" cy="10.6" r="0.9" fill="currentColor"/></svg>` : ""}
-            ${activityHtml(u.activity)}
+            ${activityHtml(u.activity, u.userId)}
             ${voiceStatusHtml(u, now)}
             ${liveBadgeHtml(u)}
             <span class="spacer"></span>
@@ -992,7 +1033,10 @@ function renderState(data) {
         elSrcBtn.classList.add("hidden");
         elLeaveBtn.classList.add("hidden");
         favPresence = null;
-        renderCards(data.returnTo ? [{ kind: "return", ...data.returnTo }] : []);
+        renderCards([
+            ...(data.leaveStats ? [{ kind: "stats", ...data.leaveStats }] : []),
+            ...(data.returnTo ? [{ kind: "return", ...data.returnTo }] : [])
+        ]);
         return;
     }
     elSrcBtn.classList.remove("hidden");
@@ -1036,9 +1080,9 @@ function renderState(data) {
         return ta - tb;
     });
 
-    elChannelName.textContent = data.isDM
-        ? `📞 ${data.channelName || "DM call"}`
-        : (data.channelName || "Voice");
+    elChannelName.innerHTML = data.isDM
+        ? `<svg class="hdr-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.6 10.8a15.2 15.2 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.6a1 1 0 0 1-.25 1l-2.2 2.2Z"/></svg>${esc(data.channelName || "DM call")}`
+        : esc(data.channelName || "Voice");
     elCount.textContent = users.length ? `(${users.length})` : "";
 
     const bucket = ts => {
@@ -1053,7 +1097,7 @@ function renderState(data) {
         `${u.userId}:${u.kind}:${u.blocked?1:0}:${u.ignored?1:0}:${u.muted?1:0}:${u.isSelf?1:0}` +
         `:${u.selfMute?1:0}:${u.selfDeaf?1:0}:${u.serverMute?1:0}:${u.serverDeaf?1:0}` +
         `:${u.streaming?1:0}:${u.video?1:0}:${u.suppress?1:0}:${u.favorite?1:0}:${u.unreadDM||0}` +
-        `:${u.mobile?1:0}:${Array.isArray(u.viewers) ? u.viewers.map(v => v.userId + (v.stranger ? "!" : "")).join(",") : ""}:${u.activity ? u.activity.type + "/" + u.activity.name + "/" + (u.activity.icon || "") + "/" + (u.activity.details || "") : ""}` +
+        `:${u.mobile?1:0}:${u.activity ? (u.activity.platform || "") + "/" + (u.activity.state || "") : ""}:${Array.isArray(u.viewers) ? u.viewers.map(v => v.userId + (v.stranger ? "!" : "")).join(",") : ""}:${u.activity ? u.activity.type + "/" + u.activity.name + "/" + (u.activity.icon || "") + "/" + (u.activity.details || "") : ""}` +
         `:${bucket(u.selfMuteAt)}:${bucket(u.selfDeafAt)}` +
         `:${bucket(u.selfUnmuteAt)}:${bucket(u.selfUndeafAt)}`
     ).join("|") +
@@ -1257,7 +1301,17 @@ function renderCards(cards) {
     const sig = JSON.stringify(cards);
     if (sig === lastCardsSig) return;
     lastCardsSig = sig;
+    const hm = (ms) => { const m = Math.round(ms / 60000); return m < 60 ? m + "m" : Math.floor(m / 60) + "h" + (m % 60 ? " " + (m % 60) + "m" : ""); };
+    const people = (list) => (list || []).map(p =>
+        `<span class="p" title="${esc(p.name)}"><img src="${avatarUrl({ userId: p.userId, avatar: p.avatar })}" onerror="this.style.opacity='0.3'">${hm(p.ms)}</span>`).join("");
     elCards.innerHTML = cards.map(c => {
+        if (c.kind === "stats") {
+            return `<div class="vstats">
+                <div class="top"><span>Session <b>${hm(c.sessionMs)}</b></span><span>Today <b>${hm(c.todayMs)}</b></span></div>
+                ${c.topSession?.length ? `<div class="row"><span class="lbl">session</span>${people(c.topSession)}</div>` : ""}
+                ${c.topToday?.length ? `<div class="row"><span class="lbl">today</span>${people(c.topToday)}</div>` : ""}
+            </div>`;
+        }
         if (c.kind === "return") {
             const where = c.guildName ? ` · ${esc(c.guildName)}` : "";
             const who = c.count ? `${c.count} in channel` : "nobody there now";
@@ -1267,7 +1321,7 @@ function renderCards(cards) {
                     <span class="t2">${who}</span>
                 </span>
                 ${memberRow(c)}
-                <span class="go">↩</span>
+                <span class="go"><svg class="" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9.7 5.3a1 1 0 0 1 0 1.4L7.4 9H14a6 6 0 0 1 0 12h-3a1 1 0 1 1 0-2h3a4 4 0 0 0 0-8H7.4l2.3 2.3a1 1 0 1 1-1.4 1.4l-4-4a1 1 0 0 1 0-1.4l4-4a1 1 0 0 1 1.4 0Z"/></svg></span>
                 <button class="x" data-dismiss="return" title="Dismiss">×</button>
             </div>`;
         }
@@ -1331,16 +1385,38 @@ elLeaveBtn.addEventListener("pointerdown", (e) => {
 for (const ev of ["pointerup", "pointercancel", "lostpointercapture"]) elLeaveBtn.addEventListener(ev, cancelLeave);
 elLeaveBtn.addEventListener("click", (e) => e.stopPropagation());
 
+// ─── Activity icon: hover shows a bigger tooltip (art + full status) ───
+let actTipTimer = null;
+// Moving between the icon's own parts (span > svg > path) fires mouseover /
+// mouseout too; only react when the pointer really enters or leaves the icon.
+const crossed = (e, sel) => {
+    const el = e.target.closest(sel);
+    if (!el) return null;
+    const other = e.relatedTarget && e.relatedTarget.closest ? e.relatedTarget.closest(sel) : null;
+    return other === el ? null : el;
+};
+elUsers.addEventListener("mouseover", (e) => {
+    const b = crossed(e, "[data-acttip]");
+    if (!b) return;
+    clearTimeout(actTipTimer);
+    actTipTimer = setTimeout(() => openTipAt("activity", b, b.getAttribute("data-acttip")), 250);
+});
+elUsers.addEventListener("mouseout", (e) => {
+    if (!crossed(e, "[data-acttip]")) return;
+    clearTimeout(actTipTimer);
+    closeTip();
+});
+
 // ─── My LIVE badge: hover shows a preview of what I stream + who watches ───
 let tipTimer = null;
 elUsers.addEventListener("mouseover", (e) => {
-    const b = e.target.closest("[data-mylive]");
+    const b = crossed(e, "[data-mylive]");
     if (!b) return;
     clearTimeout(tipTimer);
     tipTimer = setTimeout(() => openTipAt("mylive", b), 250);
 });
 elUsers.addEventListener("mouseout", (e) => {
-    if (!e.target.closest("[data-mylive]")) return;
+    if (!crossed(e, "[data-mylive]")) return;
     clearTimeout(tipTimer);
     closeTip();
 });

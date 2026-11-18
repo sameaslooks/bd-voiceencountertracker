@@ -17,6 +17,7 @@
     .head img { width: 28px; height: 28px; border-radius: 50%; background: #2b2d31; flex-shrink: 0; }
     .head .n { display: flex; flex-direction: column; min-width: 0; }
     .head .dn { color: #fff; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .head .un svg.mob { width: 10px; height: 10px; vertical-align: -1px; }
     .head .un { color: #949ba4; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .act {
         display: flex; gap: 6px; align-items: center;
@@ -71,23 +72,23 @@ function post(path, body) {
 function cmd(action, extra) { return post("/command", { action, userId: uid, ...(extra || {}) }); }
 function close() { post("/menu/close"); }
 
-const ACT_LABEL = { game: "Playing", spotify: "Listening to Spotify", listening: "Listening to", watching: "Watching", streaming: "Streaming", custom: "" };
+const ACT_LABEL = { game: "Playing", listening: "Listening to", watching: "Watching", streaming: "Streaming", custom: "" };
 
 function render() {
     const u = user;
     const a = u.activity;
     const actHtml = a ? `<div class="act">
-            ${a.icon ? `<img src="${esc(a.icon)}" onerror="this.remove()">` : ""}
+            ${(a.image || a.icon) ? `<img src="${esc(a.image || a.icon)}" onerror="this.remove()">` : ""}
             <span class="t">
-                <span class="a1">${esc(a.type === "custom" ? a.name : (ACT_LABEL[a.type] ? ACT_LABEL[a.type] + " " : "") + (a.type === "spotify" ? "" : a.name))}</span>
-                ${a.details ? `<span class="a2">${esc(a.details)}</span>` : ""}
+                <span class="a1">${esc(a.type === "custom" ? a.name : (ACT_LABEL[a.type] ? ACT_LABEL[a.type] + " " : "") + a.name)}</span>
+                ${(a.details || a.state) ? `<span class="a2">${esc([a.details, a.state].filter(Boolean).join(" — "))}</span>` : ""}
             </span>
         </div>` : "";
     const chk = (on) => `<span class="chk ${on ? "on" : ""}">${on ? "✓" : ""}</span>`;
     elMenu.innerHTML = `
         <div class="head">
             <img src="${avatarUrl(u)}">
-            <span class="n"><span class="dn">${esc(u.displayName || u.username)}</span><span class="un">@${esc(u.username)}${u.mobile ? " · 📱 phone" : ""}</span></span>
+            <span class="n"><span class="dn">${esc(u.displayName || u.username)}</span><span class="un">@${esc(u.username)}${u.mobile ? ` · <svg class="mob" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8 2h8a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm0 2v14h8V4H8Zm4 15.2a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z"/></svg> phone` : ""}</span></span>
         </div>
         ${actHtml}
         <div class="vol">
