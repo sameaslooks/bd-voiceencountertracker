@@ -1970,7 +1970,11 @@ module.exports = class VoiceEncounterTracker {
 
         if (action === "stop-stream") {
             vetLog("info", "stop-stream requested (viewer closed)");
-            this._stopFramePump();
+            // Queued behind any watch in progress, so a half-started watch never
+            // has its track released under it; pending watches are cancelled.
+            this._watchToken = (this._watchToken || 0) + 1;
+            const stop = () => this._stopFramePump();
+            this._watchChain = (this._watchChain || Promise.resolve()).then(stop, stop);
             return;
         }
 
@@ -2179,7 +2183,23 @@ module.exports = class VoiceEncounterTracker {
         }
     }
 
-    async _watchStream(userId, { reconnect = false } = {}) {
+    // Watch requests run one at a time: two overlapping watches (one holding
+    // Discord's native track while the other makes Discord rejoin the stream)
+    // crash Discord. A request that is superseded while waiting is dropped.
+    _watchStream(userId, opts = {}) {
+        const token = (this._watchToken = (this._watchToken || 0) + 1);
+        const run = async () => {
+            if (token !== this._watchToken) {
+                vetLog("info", "_watchStream: superseded, skipped");
+                return false;
+            }
+            return this._watchStreamImpl(userId, opts);
+        };
+        this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
+        return this._watchChain;
+    }
+
+    async _watchStreamImpl(userId, { reconnect = false } = {}) {
         try {
             const me = this.getCurrentUserId();
             const mySession = this.active.get(me);
@@ -2448,7 +2468,19 @@ module.exports = class VoiceEncounterTracker {
     }
 
     async _startWatchStreamPeer(stream) {
-        this._stopFramePump();
+        // Close only the previous peer. The native handle and user id were
+        // just set for THIS stream; releasing the handle here pulled Discord's
+        // track out from under the new peer.
+        const keepHandle = this._nativeStreamHandle;
+        const keepUser = this._watchedUserId;
+        const keepSid = this._sourceSid;
+        if (this._framePump) {
+            this._framePump.stop();
+            vetLog("info", "frame pump stopped (replaced)");
+        }
+        this._nativeStreamHandle = keepHandle;
+        this._watchedUserId = keepUser;
+        this._sourceSid = keepSid;
 
         const pc = new RTCPeerConnection({ iceServers: [] });
         this._watchPeer = pc;
