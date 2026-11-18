@@ -2696,6 +2696,50 @@ module.exports = class VoiceEncounterTracker {
         return true;
     }
 
+    // Confirmation dialog drawn inside the tracker window. Discord's own modal
+    // opens below it (the tracker sits at the top z-index), so it can't be used.
+    _vetConfirm(host, title, text, { confirmText = "OK", cancelText = "Cancel", danger = false, onConfirm } = {}) {
+        const back = document.createElement("div");
+        back.style.cssText = [
+            "position:absolute", "inset:0", "z-index:10", "background:rgba(0,0,0,0.55)",
+            "display:flex", "align-items:center", "justify-content:center"
+        ].join(";") + ";";
+        const box = document.createElement("div");
+        box.style.cssText = [
+            "background:#313338", "color:#dbdee1", "border-radius:8px", "width:min(440px,90vw)",
+            "box-shadow:0 8px 24px rgba(0,0,0,0.5)", "font-family:inherit", "overflow:hidden"
+        ].join(";") + ";";
+        const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+        const btn = "border:none;border-radius:4px;padding:8px 16px;font-size:14px;font-weight:500;cursor:pointer;";
+        box.innerHTML = `
+            <div style="padding:16px 16px 8px;font-size:18px;font-weight:600;color:#f2f3f5;">${esc(title)}</div>
+            <div style="padding:0 16px 20px;font-size:14px;line-height:1.4;">${esc(text)}</div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;background:#2b2d31;">
+                <button data-r="cancel" style="${btn}background:transparent;color:#dbdee1;">${esc(cancelText)}</button>
+                <button data-r="ok" style="${btn}background:${danger ? "#da373c" : "#5865f2"};color:#fff;">${esc(confirmText)}</button>
+            </div>`;
+        back.appendChild(box);
+        const done = (ok) => {
+            document.removeEventListener("keydown", onKey, true);
+            back.remove();
+            if (ok) { try { onConfirm?.(); } catch (e) { vetLog("error", "confirm action failed:", e); } }
+        };
+        // Capture phase so Escape/Enter don't reach the tracker (Escape closes it).
+        const onKey = (e) => {
+            if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); done(false); }
+            else if (e.key === "Enter") { e.preventDefault(); e.stopImmediatePropagation(); done(true); }
+        };
+        document.addEventListener("keydown", onKey, true);
+        back.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (e.target === back) return done(false);
+            const r = e.target.closest("[data-r]")?.getAttribute("data-r");
+            if (r) done(r === "ok");
+        });
+        host.appendChild(back);
+        box.querySelector("[data-r='ok']").focus();
+    }
+
     _stopFramePump() {
         if (this._framePump) {
             this._framePump.stop();
@@ -3462,7 +3506,7 @@ module.exports = class VoiceEncounterTracker {
 
         overlay.querySelector("[data-action='clear-all']").addEventListener("click", (e) => {
             e.preventDefault(); e.stopPropagation();
-            BdApi.UI.showConfirmationModal(
+            this._vetConfirm(overlay,
                 "Clear Encounters",
                 "Delete all stored voice encounter history? Blocked / ignored / muted users will be re-imported automatically.",
                 {
@@ -3520,7 +3564,7 @@ module.exports = class VoiceEncounterTracker {
                     const sel = this._vetMergeSel;
                     if (!sel || sel.userId !== userId || sel.idx.size < 2) return;
                     const idxs = [...sel.idx];
-                    BdApi.UI.showConfirmationModal(
+                    this._vetConfirm(overlay,
                         "Merge sessions",
                         `Merge ${idxs.length} sessions into one continuous session, as if you never left? ` +
                         `Gaps between them will count as time together. This cannot be undone.`,
