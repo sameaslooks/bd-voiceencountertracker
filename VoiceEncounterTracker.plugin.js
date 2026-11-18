@@ -2224,7 +2224,21 @@ module.exports = class VoiceEncounterTracker {
                 this._stopFramePump();
             }
 
-            const stream = await this._watchStreamByUserId(userId);
+            // The last pump on this user's stream sent no frames at all:
+            // Discord's own copy is frozen, so reusing it can't recover.
+            const frozen = this._frozenSource && this._frozenSource.userId === String(userId);
+            const lastRewatch = (this._lastRewatchAt ||= {})[userId] || 0;
+            const rewatch = frozen && Date.now() - lastRewatch > 30000;
+            if (rewatch) {
+                this._lastRewatchAt[userId] = Date.now();
+                this._stopFramePump();
+                // Let Discord's pipeline let go of the old track before it rejoins.
+                await new Promise(res => setTimeout(res, 1000));
+            }
+            const frozenSid = frozen ? this._frozenSource.sid : null;
+            this._frozenSource = null;
+
+            const stream = await this._watchStreamByUserId(userId, { rewatch, frozenSid });
             if (!stream) {
                 vetLog("warn", "_watchStream: no stream");
                 return false;
@@ -2239,7 +2253,10 @@ module.exports = class VoiceEncounterTracker {
         }
     }
 
-    async _watchStreamByUserId(userId, { timeout = 20000 } = {}) {
+    // rewatch: Discord's copy of the stream is frozen (still ACTIVE, no frames).
+    // Our pump is already stopped and its native handle released, so nothing
+    // of ours holds the old track when STREAM_WATCH makes Discord rejoin.
+    async _watchStreamByUserId(userId, { timeout = 20000, rewatch = false, frozenSid = null } = {}) {
         const me = this.getCurrentUserId();
         const mySession = this.active.get(me);
         if (!mySession) {
@@ -2247,7 +2264,7 @@ module.exports = class VoiceEncounterTracker {
             return null;
         }
 
-        if (this._watchedUserId === userId) {
+        if (!rewatch && this._watchedUserId === userId) {
             const existing = this._findLiveVideoForStream();
             if (existing) {
                 vetLog("info", "_watchStreamByUserId: already live, reusing");
@@ -2257,8 +2274,10 @@ module.exports = class VoiceEncounterTracker {
             }
         }
 
-        const reused = await this._reuseDiscordWatch(userId);
-        if (reused) return reused;
+        if (!rewatch) {
+            const reused = await this._reuseDiscordWatch(userId);
+            if (reused) return reused;
+        }
 
         const before = new Set(document.querySelectorAll("video"));
 
@@ -2274,9 +2293,22 @@ module.exports = class VoiceEncounterTracker {
                 channelId: mySession.channelId,
                 ownerId: userId,
             });
-            vetLog("info", "STREAM_WATCH dispatched for", userId);
+            vetLog("info", "STREAM_WATCH dispatched for", userId, rewatch ? "(rewatch, frozen sid " + frozenSid + ")" : "");
         } catch (e) {
             vetLog("error", "streamWatch failed:", e);
+            return null;
+        }
+
+        if (rewatch) {
+            // Take the track only once Discord has a new stream id; the frozen
+            // one is never picked up again.
+            const t0 = Date.now();
+            while (Date.now() - t0 < timeout) {
+                await new Promise(res => setTimeout(res, 1000));
+                const fresh = await this._reuseDiscordWatch(userId, { excludeSid: frozenSid });
+                if (fresh) return fresh;
+            }
+            vetLog("warn", "rewatch: no new stream id from Discord");
             return null;
         }
 
@@ -2297,6 +2329,7 @@ module.exports = class VoiceEncounterTracker {
                     const handle = nz(streamId);
                     if (handle && handle.stream) {
                         this._nativeStreamHandle = handle;
+                        this._sourceSid = String(streamId);
                         const nativeTrack = handle.stream.getVideoTracks()[0];
                         if (nativeTrack) {
                             vetLog("info", "native track:",
@@ -2338,7 +2371,7 @@ module.exports = class VoiceEncounterTracker {
 
     // If Discord already watches this user's stream, take its video without
     // dispatching STREAM_WATCH again (that makes Discord drop and rejoin the stream).
-    async _reuseDiscordWatch(userId) {
+    async _reuseDiscordWatch(userId, { excludeSid = null } = {}) {
         let active = [];
         try {
             const ass = BdApi.Webpack.getStore("ApplicationStreamingStore");
@@ -2356,6 +2389,10 @@ module.exports = class VoiceEncounterTracker {
             sid = vss?.getStreamId?.(userId, "stream") ?? null;
         } catch (e) {}
         if (!sid && active.length === 1 && this._streamIdByUser?.[userId]) sid = this._streamIdByUser[userId];
+        if (sid && excludeSid != null && String(sid) === String(excludeSid)) {
+            vetLog("info", "_reuseDiscordWatch: still the frozen stream id", sid);
+            return null;
+        }
         if (sid) {
             const nz = this._findNzFunction();
             if (typeof nz === "function") {
@@ -2364,6 +2401,7 @@ module.exports = class VoiceEncounterTracker {
                     const t = handle?.stream?.getVideoTracks?.()[0];
                     if (t) {
                         this._nativeStreamHandle = handle;
+                        this._sourceSid = String(sid);
                         vetLog("info", "_reuseDiscordWatch: native track via streamId", sid);
                         return new MediaStream([t]);
                     }
@@ -2372,6 +2410,7 @@ module.exports = class VoiceEncounterTracker {
         }
 
         // 2) Discord's own <video> element (only safe when exactly one stream is watched)
+        if (excludeSid != null) return null;
         if (active.length === 1) {
             const v = this._findLiveVideoForStream() || await this._waitForLiveVideo(3000);
             const t = v?.srcObject?.getVideoTracks?.()[0];
@@ -2486,6 +2525,9 @@ module.exports = class VoiceEncounterTracker {
         this._watchPeer = pc;
         let statsTimer = null;
         let statsPrevPackets = 0;
+        const pumpUserId = this._watchedUserId != null ? String(this._watchedUserId) : null;
+        const pumpSid = this._sourceSid || null;
+        const pumpStartedAt = Date.now();
 
         pc.onconnectionstatechange = () => {
             vetLog("info", "watch peer state:", pc.connectionState);
@@ -2603,6 +2645,15 @@ module.exports = class VoiceEncounterTracker {
                         const stats = await pc.getStats();
                         stats.forEach(r => {
                             if (r.type === "outbound-rtp" && r.kind === "video") {
+                                // Connected for 5 s and not one frame encoded: the
+                                // source itself gives nothing. Remember it so the
+                                // next watch of this user makes Discord rejoin.
+                                if (!r.framesEncoded && pc.connectionState === "connected" &&
+                                    Date.now() - pumpStartedAt > 5000 && pumpUserId &&
+                                    !(this._frozenSource && this._frozenSource.userId === pumpUserId)) {
+                                    this._frozenSource = { userId: pumpUserId, sid: pumpSid };
+                                    vetLog("warn", "watch source frozen (0 frames encoded), sid", pumpSid);
+                                }
                                 const pktPerSec = r.packetsSent - (statsPrevPackets || r.packetsSent);
                                 statsPrevPackets = r.packetsSent;
                                 vetLog("info", "[sender]", {
@@ -2655,6 +2706,7 @@ module.exports = class VoiceEncounterTracker {
             this._nativeStreamHandle = null;
         }
         this._watchedUserId = null;
+        this._sourceSid = null;
     }
 
     _setStreamSound(enabled) {
