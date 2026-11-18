@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    html, body {
+        margin: 0; padding: 0; background: transparent; overflow: hidden; height: 100%;
+        font-family: "gg sans", "Noto Sans", "Segoe UI", sans-serif; color: #dbdee1; font-size: 12px;
+    }
+    #win {
+        box-sizing: border-box; height: 100%; display: flex; flex-direction: column;
+        background: #1e1f22; border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; overflow: hidden;
+    }
+    .bar {
+        display: flex; align-items: center; gap: 8px; padding: 8px 10px; -webkit-app-region: drag;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .bar .t { font-weight: 600; color: #fff; font-size: 13px; flex: 1; }
+    .bar button, .bar label { -webkit-app-region: no-drag; }
+    .x { background: none; border: none; color: #949ba4; cursor: pointer; padding: 2px; display: flex; }
+    .x:hover { color: #fff; }
+    .x svg { width: 14px; height: 14px; }
+    label.sw { display: flex; align-items: center; gap: 6px; color: #b5bac1; cursor: pointer; }
+    .hint { padding: 8px 10px; color: #949ba4; line-height: 1.45; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    #list { flex: 1; overflow: auto; padding: 4px 0; }
+    #list::-webkit-scrollbar { width: 6px; }
+    #list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 3px; }
+    .row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; }
+    .row:hover { background: rgba(255,255,255,0.03); }
+    .row .n { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    .row .k { color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 6px; }
+    .row .s { color: #80848e; font-size: 11px; }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: #3ba55d; flex-shrink: 0; }
+    .row button.b {
+        background: rgba(255,255,255,0.06); border: none; color: #dbdee1; border-radius: 4px;
+        padding: 4px 8px; font-size: 11px; cursor: pointer; white-space: nowrap;
+    }
+    .row button.b:hover { background: rgba(255,255,255,0.12); }
+    .row button.b.pri { background: #5865f2; color: #fff; }
+    .row button.b.pri:hover { background: #4752c4; }
+    .row button.i { background: none; border: none; color: #80848e; cursor: pointer; padding: 2px; display: flex; }
+    .row button.i:hover { color: #ed4245; }
+    .row button.i svg { width: 13px; height: 13px; }
+    .empty { padding: 10px; color: #80848e; }
+</style>
+</head>
+<body>
+<div id="win">
+    <div class="bar">
+        <span class="t">Window layouts</span>
+        <label class="sw"><input type="checkbox" id="on"> Switch automatically</label>
+        <button class="x" id="close" title="Close"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M6.7 5.3 12 10.6l5.3-5.3 1.4 1.4-5.3 5.3 5.3 5.3-1.4 1.4-5.3-5.3-5.3 5.3-1.4-1.4 5.3-5.3-5.3-5.3z"/></svg></button>
+    </div>
+    <div class="hint">Place the overlay windows where you want them for a game, then press <b>Save current positions</b> on that game. The saved layout comes back whenever that game is in front; <b>Desktop</b> is used everywhere else. Games appear here once you've played them with the overlay running.</div>
+    <div id="list"></div>
+</div>
+<script>
+const API = "http://127.0.0.1:17842";
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const TRASH = `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-3 6h12l-1 12H7L6 9Z"/></svg>`;
+const ago = (t) => {
+    if (!t) return "";
+    const m = Math.round((Date.now() - t) / 60000);
+    if (m < 1) return "just now"; if (m < 60) return m + " min ago";
+    const h = Math.round(m / 60); if (h < 24) return h + " h ago";
+    return Math.round(h / 24) + " d ago";
+};
+let info = null;
+
+function render() {
+    document.getElementById("on").checked = info.enabled;
+    const el = document.getElementById("list");
+    el.innerHTML = info.items.length ? info.items.map(it => {
+        const name = it.key === "default" ? "Desktop" : it.key;
+        const status = it.saved ? `saved ${ago(it.savedAt)} · ${it.windows} window${it.windows === 1 ? "" : "s"}` : "not saved — uses the current positions";
+        return `<div class="row" data-key="${esc(it.key)}">
+            <div class="n">
+                <span class="k">${it.key === info.current ? `<span class="dot" title="In front now"></span>` : ""}${esc(name)}</span>
+                <span class="s">${esc(status)}</span>
+            </div>
+            ${it.saved ? `<button class="b" data-do="apply" title="Move the windows there now">Apply now</button>` : ""}
+            <button class="b pri" data-do="save">Save current positions</button>
+            ${it.key === "default" ? "" : `<button class="i" data-do="${it.saved ? "delete" : "forget"}" title="${it.saved ? "Delete this layout" : "Remove from the list"}">${TRASH}</button>`}
+        </div>`;
+    }).join("") : `<div class="empty">No layouts yet.</div>`;
+}
+
+async function call(what, body) {
+    try {
+        const r = await fetch(API + "/layouts/" + what, { method: "POST", body: JSON.stringify(body || {}) });
+        info = await r.json(); render();
+    } catch (e) {}
+}
+async function load() {
+    try { info = await (await fetch(API + "/layouts", { cache: "no-store" })).json(); render(); } catch (e) {}
+}
+
+document.getElementById("list").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-do]");
+    if (!b) return;
+    const key = b.closest(".row").getAttribute("data-key");
+    call(b.getAttribute("data-do"), { key });
+});
+document.getElementById("on").addEventListener("change", (e) => call("enabled", { on: e.target.checked }));
+document.getElementById("close").addEventListener("click", () => call("close"));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") call("close"); });
+
+const es = new EventSource(API + "/events");
+es.addEventListener("layouts", (e) => { try { info = JSON.parse(e.data); render(); } catch (err) {} });
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

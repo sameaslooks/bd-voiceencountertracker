@@ -34,7 +34,6 @@ const HEIGHT_EMPTY_VC  = 60;
 const ROW_HEIGHT       = 32;
 const CARD_HEIGHT      = 40;
 const NOTE_HEIGHT      = 34;
-const STATS_HEIGHT     = 54;
 
 const NET_BANNER_HEIGHT = 30;
 
@@ -442,7 +441,9 @@ function startCursorWatchdog() {
             const sig = `pid=${info.pid} own=${own} cursorHidden=${cursorHidden} fullscreen=${isFullscreen} clipped=${!!info.clipped} rect=${JSON.stringify(info.rect)}`;
             if (sig !== _lastFgSig) { _lastFgSig = sig; videoLog("[click-through check]", sig, "state=" + _clickThroughState); }
             if (own) return;
-            noteForegroundForProfiles(info.pid, isFullscreen || (cursorHidden && !!info.clipped));
+            // A game = the app owns the mouse (cursor hidden) and is fullscreen or
+            // has the cursor locked to it. A maximized browser is not a game.
+            noteForegroundForProfiles(info.pid, cursorHidden && (isFullscreen || !!info.clipped));
 
             // Click-through (any voice/stream state) when the cursor is hidden AND
             // a game owns the mouse: the foreground window covers a monitor, or
@@ -1206,6 +1207,26 @@ function startServer() {
             jsonReply(res, 200, { ok: true });
             return;
         }
+        if (req.method === "GET" && url === "/layouts") {
+            jsonReply(res, 200, layoutsInfo());
+            return;
+        }
+        if (req.method === "POST" && url.startsWith("/layouts/")) {
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                const key = d.key ? String(d.key).toLowerCase() : null;
+                const what = url.slice("/layouts/".length);
+                if (what === "save" && key) saveLayoutProfile(key);
+                else if (what === "apply" && key && layoutProfiles()[key]) applyLayoutProfile(layoutProfiles()[key]);
+                else if (what === "delete" && key) { delete layoutProfiles()[key]; saveSettingsSoon(); }
+                else if (what === "forget" && key && settings.seenGames) { delete settings.seenGames[key]; delete layoutProfiles()[key]; saveSettingsSoon(); }
+                else if (what === "enabled") { settings.layoutProfilesEnabled = !!d.on; saveSettingsSoon(); }
+                else if (what === "open") openLayoutsWindow();
+                else if (what === "close") { if (layoutsWindow && !layoutsWindow.isDestroyed()) layoutsWindow.close(); }
+            } catch (e) {}
+            jsonReply(res, 200, layoutsInfo());
+            return;
+        }
         if (req.method === "POST" && url === "/menu/open") {
             try {
                 const d = JSON.parse(await readBody(req) || "{}");
@@ -1677,23 +1698,74 @@ function exeForPid(pid) {
     });
 }
 
+// Apps that can go fullscreen with a hidden cursor but aren't games.
+const NOT_GAMES = /^(chrome|msedge|firefox|opera|opera_gx|brave|vivaldi|yandex|browser|discord|discordptb|discordcanary|explorer|vlc|mpc-hc64|mpc-hc|mpc-be64|potplayermini64|potplayermini|mpv|wmplayer|video\.ui|microsoft\.media\.player|applicationframehost|electron|code|telegram|spotify|obs64|steamwebhelper)$/i;
+
+// Profiles are saved only from the Window layouts window (in a game there's
+// no cursor to move anything, and alt-tabbing out switches to "default").
+// Switching between saved profiles is automatic.
 async function noteForegroundForProfiles(pid, gameLike) {
     if (!pid) return;
     let key = "default";
     if (gameLike) {
         const exe = await exeForPid(pid);
         if (!exe) return;
-        key = exe;
+        if (!NOT_GAMES.test(exe)) { key = exe; noteSeenGame(exe); }
     }
     if (key === _profileKey) return;
     const prev = _profileKey;
     _profileKey = key;
+    sseBroadcast("layouts", layoutsInfo());
+    if (settings.layoutProfilesEnabled === false) return;
     const profiles = layoutProfiles();
-    // First switch away from a context without a profile: keep where things
-    // were, so coming back restores it.
-    if (!profiles[prev]) saveLayoutProfile(prev);
     if (profiles[key]) applyLayoutProfile(profiles[key]);
-    videoLog("[layout] profile", prev, "->", key, profiles[key] ? "(applied)" : "(none yet)");
+    videoLog("[layout] profile", prev, "->", key, profiles[key] ? "(applied)" : "(none saved)");
+}
+
+function noteSeenGame(exe) {
+    if (!settings.seenGames || typeof settings.seenGames !== "object") settings.seenGames = {};
+    const had = settings.seenGames[exe];
+    settings.seenGames[exe] = Date.now();
+    const keys = Object.keys(settings.seenGames);
+    if (keys.length > 30) {
+        keys.sort((a, b) => settings.seenGames[a] - settings.seenGames[b]).slice(0, keys.length - 30)
+            .forEach(k => { delete settings.seenGames[k]; });
+    }
+    if (!had || Date.now() - had > 60_000) saveSettingsSoon();
+}
+
+function layoutsInfo() {
+    const profiles = layoutProfiles();
+    const seen = settings.seenGames || {};
+    const keys = new Set(["default", ...Object.keys(profiles), ...Object.keys(seen)]);
+    return {
+        enabled: settings.layoutProfilesEnabled !== false,
+        current: _profileKey,
+        items: [...keys].map(k => ({
+            key: k,
+            saved: !!profiles[k],
+            savedAt: profiles[k]?.savedAt || 0,
+            windows: profiles[k] ? Object.keys(profiles[k].windows || {}).length : 0,
+            lastSeen: k === "default" ? Infinity : (seen[k] || 0)
+        })).sort((a, b) => (a.key === "default" ? -1 : b.key === "default" ? 1 : (b.lastSeen - a.lastSeen)))
+    };
+}
+
+let layoutsWindow = null;
+function openLayoutsWindow() {
+    if (layoutsWindow && !layoutsWindow.isDestroyed()) { layoutsWindow.show(); layoutsWindow.focus(); return; }
+    const wa = screen.getPrimaryDisplay().workArea;
+    layoutsWindow = new BrowserWindow({
+        width: 380, height: 420, x: Math.round(wa.x + (wa.width - 380) / 2), y: Math.round(wa.y + (wa.height - 420) / 2),
+        frame: false, transparent: true, backgroundColor: "#00000000",
+        alwaysOnTop: true, resizable: false, skipTaskbar: false, hasShadow: true,
+        focusable: true, show: false, title: "Window layouts",
+        webPreferences: { nodeIntegration: false, contextIsolation: true, backgroundThrottling: false }
+    });
+    layoutsWindow.setAlwaysOnTop(true, "screen-saver");
+    layoutsWindow.loadFile(path.join(__dirname, "layouts.html"));
+    layoutsWindow.once("ready-to-show", () => { layoutsWindow.show(); layoutsWindow.focus(); });
+    layoutsWindow.on("closed", () => { layoutsWindow = null; });
 }
 
 function layoutProfiles() {
@@ -1702,7 +1774,7 @@ function layoutProfiles() {
 }
 
 function saveLayoutProfile(key) {
-    const p = { windows: {} };
+    const p = { windows: {}, savedAt: Date.now() };
     for (const rec of windows.values()) {
         if (!rec.win || rec.win.isDestroyed()) continue;
         const [x, y] = rec.win.getPosition();
@@ -1870,7 +1942,8 @@ function computeTargetHeight() {
         if (state.channelId) cards = Array.isArray(state.departures) ? Math.min(state.departures.length, 3) : 0;
         else if (state.returnTo) cards = 1;
     }
-    const statsExtra = (alive && !state.channelId && state.leaveStats) ? STATS_HEIGHT : 0;
+    const statsRows = state.leaveStats ? 2 + Math.min(5, (state.leaveStats.people || []).length) : 0;   // header + you + people
+    const statsExtra = (alive && !state.channelId && state.leaveStats) ? 20 + statsRows * 16 : 0;
     const cardsExtra = cards ? cards * CARD_HEIGHT + 4 : 0;
     const noteExtra = (alive && state.channelId && (noteEditing || (sessionNote && sessionNote.channelId === state.channelId))) ? NOTE_HEIGHT : 0;
     return Math.min(MAX_HEIGHT, baseHeight + netExtra + cardsExtra + noteExtra + statsExtra);
@@ -1961,7 +2034,6 @@ function createWindowFromRecord(record) {
             if (d) rec.monitor = displayToMonitorRecord(d);
             scheduleSaveWindows();
             positionNotifyWindow();
-            if (!_applyingProfile) saveLayoutProfile(_profileKey);
         } catch (e) {}
     });
 
@@ -2195,6 +2267,7 @@ function rebuildTrayMenu() {
                 }
             ]
         },
+        { label: "Window layouts…", click: () => openLayoutsWindow() },
         { label: "Close window", submenu: closeSubmenu },
         { label: "Show / Hide all", accelerator: "Ctrl+Alt+H", click: () => toggleAllWindows() },
         { type: "separator" },

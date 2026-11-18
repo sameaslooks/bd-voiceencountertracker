@@ -62,7 +62,7 @@ async function renderPing() {
     if (!pts.length) { el.innerHTML = `<span class="muted">No ping data</span>`; return report(); }
     const vals = pts.map(p => p.v);
     const max = Math.max(...vals), avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-    const W = Math.max(160, el.clientWidth - 16), H = 46, t0 = d.now - 10 * 60_000;
+    const W = 300, H = 46, t0 = d.now - 10 * 60_000;   // drawn in a fixed box, stretched to the tip's width
     const top = Math.max(100, max * 1.1);
     const x = (t) => Math.max(0, (t - t0) / (10 * 60_000) * W);
     const y = (v) => H - Math.min(H, v / top * H);
@@ -71,10 +71,10 @@ async function renderPing() {
     const l200 = y(200);
     el.innerHTML = `
         <div class="row"><span>Now <b>${Math.round(vals[vals.length - 1])} ms</b></span><span>avg <b>${Math.round(avg)}</b> · max <b>${Math.round(max)}</b></span></div>
-        <svg width="${W}" height="${H}">
+        <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none" style="display:block">
             <rect width="${W}" height="${H}" fill="rgba(255,255,255,0.03)" rx="3"/>
-            ${l200 > 0 ? `<line x1="0" x2="${W}" y1="${l200}" y2="${l200}" stroke="#faa61a" stroke-opacity="0.35" stroke-dasharray="3 3"/>` : ""}
-            <path d="${path}" fill="none" stroke="#3ba55d" stroke-width="1.5"/>
+            ${l200 > 0 ? `<line x1="0" x2="${W}" y1="${l200}" y2="${l200}" stroke="#faa61a" stroke-opacity="0.35" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/>` : ""}
+            <path d="${path}" fill="none" stroke="#3ba55d" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
         </svg>
         <div class="row muted"><span>10 min ago</span><span>now</span></div>`;
     report();

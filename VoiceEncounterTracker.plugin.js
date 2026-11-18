@@ -82,6 +82,7 @@ module.exports = class VoiceEncounterTracker {
         this.RETURN_MAX_AGE_MS   = 30 * 60_000;     // offer to rejoin only this soon after
         this.DAY_GAP_MS          = 8 * 60 * 60_000; // "today" = since the last voice pause this long
         this.LEAVE_STATS_MS      = 90_000;          // how long the stats card shows after leaving
+        this.STRANGER_VIEWER_MS  = 3 * 60_000;      // joined during my stream and opened it this soon = unexpected
         this.COMMAND_POLL_MS     = 1_000;
         this.MAX_SESSIONS        = 500;
         this.MAX_EVENTS_PER_SESSION = 300;
@@ -1862,7 +1863,7 @@ module.exports = class VoiceEncounterTracker {
                 const kind = isSelf ? "known" : this.getBadgeKind(userId);
                 const user = (this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore"))?.getUser?.(userId);
                 const rec = this.encounters.get(userId);
-                if (isSelf && !s.streaming) { this._knownViewers = null; this._streamStartedAt = 0; }
+                if (isSelf && !s.streaming) { this._knownViewers = null; this._viewerSince = null; this._streamStartedAt = 0; }
 
                 users.push({
                     userId,
@@ -3121,8 +3122,8 @@ module.exports = class VoiceEncounterTracker {
         try {
             const ch = this._getChannel(channelId);
             const g = ch?.guild_id ?? guildId ?? "@me";
-            const nav = BdApi.Webpack.getByKeys("transitionTo", { searchExports: true });
-            if (typeof nav?.transitionTo === "function") nav.transitionTo(`/channels/${g}/${channelId}`);
+            const go = this._transitionTo();
+            if (go) go(`/channels/${g}/${channelId}`);
             else vetLog("warn", "transitionTo not found");
             try { window.DiscordNative?.window?.focus?.(); } catch (e) {}
             try { window.focus(); } catch (e) {}
@@ -3199,18 +3200,42 @@ module.exports = class VoiceEncounterTracker {
         } catch (e) { return false; }
     }
 
-    // 0..200 (100 = default), like Discord's own slider
+    // Discord stores user volume as an amplitude, while its slider shows a
+    // perceptual scale (50 on the slider is ~25 amplitude). Use Discord's own
+    // converters when they're there; otherwise the same dB curve.
+    _volConv() {
+        if (this._volConvMod !== undefined) return this._volConvMod;
+        try { this._volConvMod = BdApi.Webpack.getByKeys("amplitudeToPerceptual", "perceptualToAmplitude", { searchExports: true }) || null; }
+        catch (e) { this._volConvMod = null; }
+        return this._volConvMod;
+    }
+    _toPerceptual(a) {
+        const m = this._volConv();
+        if (m) { try { return m.amplitudeToPerceptual(a); } catch (e) {} }
+        if (!(a > 0)) return 0;
+        const db = 20 * Math.log10(a / 100);                // 0 dB at 100
+        return a <= 100 ? Math.max(0, 100 + db * 10 / 3) : 100 + db / 6 * 100;   // -30 dB floor
+    }
+    _toAmplitude(p) {
+        const m = this._volConv();
+        if (m) { try { return m.perceptualToAmplitude(p); } catch (e) {} }
+        if (!(p > 0)) return 0;
+        const db = p <= 100 ? (p - 100) * 0.3 : (p - 100) / 100 * 6;
+        return 100 * Math.pow(10, db / 20);
+    }
+
+    // 0..200 on Discord's slider scale (100 = default)
     _localVolume(userId) {
         try {
             const mes = this._sc?.MediaEngineStore ?? BdApi.Webpack.getStore("MediaEngineStore");
             const v = mes?.getLocalVolume?.(String(userId));
-            return Number.isFinite(v) ? Math.round(v) : 100;
+            return Number.isFinite(v) ? Math.round(this._toPerceptual(v)) : 100;
         } catch (e) { return 100; }
     }
 
     _setLocalVolume(userId, v) {
         if (!Number.isFinite(v)) return;
-        v = Math.max(0, Math.min(200, v));
+        v = this._toAmplitude(Math.max(0, Math.min(200, v)));
         try {
             const mod = BdApi.Webpack.getByKeys("setLocalVolume", { searchExports: true });
             if (typeof mod?.setLocalVolume !== "function") { vetLog("warn", "setLocalVolume not found"); return; }
@@ -3224,13 +3249,32 @@ module.exports = class VoiceEncounterTracker {
         try { window.focus(); } catch (e) {}
     }
 
+    // Discord's router function. It isn't exported under a stable name, so find
+    // it by the line it logs.
+    _transitionTo() {
+        if (this._navFn) return this._navFn;
+        try {
+            let fn = BdApi.Webpack.getByStrings("transitionTo - Transitioning to", { searchExports: true });
+            if (typeof fn !== "function") {
+                const mod = BdApi.Webpack.getByKeys("transitionTo", { searchExports: true });
+                fn = typeof mod?.transitionTo === "function" ? mod.transitionTo.bind(mod) : null;
+            }
+            this._navFn = typeof fn === "function" ? fn : null;
+        } catch (e) { this._navFn = null; }
+        return this._navFn;
+    }
+
+    // Same as Discord's own "Message" button: opens (or creates) the DM.
     _openDM(userId) {
         try {
-            const cid = this._dmChannelId(userId);
-            if (cid) { this._openChannel(cid, "@me"); return; }
             const mod = BdApi.Webpack.getByKeys("openPrivateChannel", { searchExports: true });
-            if (typeof mod?.openPrivateChannel === "function") mod.openPrivateChannel(String(userId));
-            else vetLog("warn", "openPrivateChannel not found");
+            if (typeof mod?.openPrivateChannel === "function") {
+                mod.openPrivateChannel(String(userId));
+            } else {
+                const cid = this._dmChannelId(userId);
+                if (cid) { this._openChannel(cid, "@me"); return; }
+                vetLog("warn", "openPrivateChannel not found");
+            }
             this._focusDiscord();
         } catch (e) { vetLog("error", "_openDM:", e); }
     }
@@ -3333,7 +3377,7 @@ module.exports = class VoiceEncounterTracker {
             const ass = BdApi.Webpack.getStore("ApplicationStreamingStore");
             const me = this.getCurrentUserId();
             const st = ass?.getCurrentUserActiveStream?.() || ass?.getActiveStreamForUser?.(me, mySession?.guildId);
-            if (!st) { this._knownViewers = null; this._streamStartedAt = 0; return []; }
+            if (!st) { this._knownViewers = null; this._viewerSince = null; this._streamStartedAt = 0; return []; }
             let ids = [];
             try { ids = ass.getViewerIds?.(st) || []; } catch (e) {}
             if (!ids.length) { try { ids = ass.getViewerIds?.(st.streamKey || this._streamKeyOf(st)) || []; } catch (e) {} }
@@ -3341,13 +3385,20 @@ module.exports = class VoiceEncounterTracker {
             const us = this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore");
             const now = Date.now();
             this._knownViewers ||= new Set();
+            this._viewerSince ||= new Map();      // userId -> when I first saw them watching
             this._streamStartedAt ||= now;
             const out = ids.map(id => {
                 const u = us?.getUser?.(id);
-                // "Stranger": not known/favorite, or only just came into the channel.
+                // Unexpected viewer: came into the channel while my stream was
+                // already running and opened it within a few minutes of coming in.
+                // People who were there before the stream, or sat in the channel a
+                // while first, are not.
+                if (!this._viewerSince.has(id)) this._viewerSince.set(id, now);
+                const watchFrom = this._viewerSince.get(id);
                 const sess = this.active.get(id);
-                const fresh = sess && sess.channelId === mySession?.channelId && sess.startedAt && now - sess.startedAt < 2 * 60_000;
-                const stranger = !this._favorites?.has(id) && (this.getBadgeKind(id) === "stranger" || !!fresh);
+                const joinedAt = sess && sess.channelId === mySession?.channelId ? (sess.startedAt || 0) : 0;
+                const stranger = !this._favorites?.has(id) && joinedAt > this._streamStartedAt &&
+                    watchFrom - joinedAt < this.STRANGER_VIEWER_MS;
                 return { userId: id, name: this.getDisplayName(id, mySession?.guildId) || u?.username || id, avatar: u?.avatar ?? null, stranger };
             });
             // Warn once per viewer when someone unexpected starts watching after
@@ -3593,7 +3644,10 @@ module.exports = class VoiceEncounterTracker {
         if (mine?.channelId) {
             if (!this._mySess || this._mySess.channelId !== mine.channelId) {
                 if (this._mySess) this._endOwnSession(now, false);   // moved: one session per channel
-                this._mySess = { start: mine.startedAt || now, channelId: mine.channelId, guildId: mine.guildId ?? null };
+                this._mySess = {
+                    start: mine.startedAt || now, channelId: mine.channelId, guildId: mine.guildId ?? null,
+                    channelName: this.getChannelName(mine.channelId), guildName: this.getGuildName(mine.guildId, mine.channelId)
+                };
             }
             return;
         }
@@ -3604,8 +3658,13 @@ module.exports = class VoiceEncounterTracker {
         const sess = this._mySess;
         this._mySess = null;
         if (!sess || end - sess.start < 5000) return;
-        const list = this._loadMyVoice().filter(x => x.end > end - 14 * 86400_000);
-        list.push({ start: sess.start, end, channelId: sess.channelId });
+        // My own voice log (with or without anyone else there), kept for a year.
+        const list = this._loadMyVoice().filter(x => x.end > end - 365 * 86400_000);
+        list.push({
+            start: sess.start, end, channelId: sess.channelId, guildId: sess.guildId,
+            channelName: sess.channelName || this.getChannelName(sess.channelId),
+            guildName: sess.guildName || this.getGuildName(sess.guildId, sess.channelId)
+        });
         try { BdApi.Data.save(this.meta.name, "myVoice", list); } catch (e) {}
         if (!left) return;
         // People's sessions are written when I leave; read them a moment later.
@@ -3649,12 +3708,67 @@ module.exports = class VoiceEncounterTracker {
     _buildLeaveStats(start, end, list) {
         const dayFrom = this._dayStart(list, end);
         const todayMs = list.filter(x => x.end > dayFrom).reduce((a, x) => a + (x.end - Math.max(x.start, dayFrom)), 0);
+        // People: anyone in the top of the session or of today, with both numbers.
+        const sess = this._topPeople(start, end, 5);
+        const today = this._topPeople(dayFrom, end, 5);
+        const byId = new Map();
+        for (const p of today) byId.set(p.userId, { ...p, sessionMs: 0, todayMs: p.ms });
+        for (const p of sess) {
+            const cur = byId.get(p.userId) || { ...p, sessionMs: 0, todayMs: this._topPeopleFor(p.userId, dayFrom, end) };
+            cur.sessionMs = p.ms;
+            byId.set(p.userId, cur);
+        }
+        const people = [...byId.values()]
+            .sort((a, b) => b.sessionMs - a.sessionMs || b.todayMs - a.todayMs)
+            .slice(0, 5)
+            .map(({ userId, name, avatar, sessionMs, todayMs }) => ({ userId, name, avatar, sessionMs, todayMs }));
+        return { until: Date.now() + this.LEAVE_STATS_MS, sessionMs: end - start, todayMs, people };
+    }
+
+    _topPeopleFor(userId, from, to) {
+        let ms = 0;
+        for (const sn of this.encounters.get(userId)?.sessions || []) {
+            const a = Math.max(sn.startedAt, from), b = Math.min(sn.endedAt, to);
+            if (b > a) ms += b - a;
+        }
+        return ms;
+    }
+
+    // My voice time for the tracker window: per-day totals and per server /
+    // channel totals since `from` (null = everything). Includes the session
+    // that's running right now.
+    myVoiceSummary(from = null) {
+        const now = Date.now();
+        const list = this._loadMyVoice().slice();
+        if (this._mySess) list.push({ ...this._mySess, end: now, live: true });
+        const inRange = from ? list.filter(x => x.end > from) : list;
+        const clip = (x) => x.end - Math.max(x.start, from || 0);
+        const total = inRange.reduce((a, x) => a + clip(x), 0);
+        const servers = new Map();
+        for (const x of inRange) {
+            const gk = x.guildId || "dm";
+            const g = servers.get(gk) || { name: x.guildId ? (x.guildName || this.getGuildName(x.guildId, x.channelId) || "Server") : "Calls / DMs", ms: 0, channels: new Map() };
+            g.ms += clip(x);
+            const ck = x.channelId || "?";
+            const c = g.channels.get(ck) || { name: x.channelName || this.getChannelName(x.channelId) || "channel", ms: 0 };
+            c.ms += clip(x);
+            g.channels.set(ck, c);
+            servers.set(gk, g);
+        }
+        // per calendar day, last 30 days (split sessions across midnight)
+        const days = [];
+        const d0 = new Date(now); d0.setHours(0, 0, 0, 0);
+        for (let i = 29; i >= 0; i--) {
+            const a = d0.getTime() - i * 86400_000, b = a + 86400_000;
+            let ms = 0;
+            for (const x of list) { const s1 = Math.max(x.start, a), e1 = Math.min(x.end, b); if (e1 > s1) ms += e1 - s1; }
+            days.push({ day: a, ms });
+        }
         return {
-            until: Date.now() + this.LEAVE_STATS_MS,
-            sessionMs: end - start,
-            todayMs,
-            topSession: this._topPeople(start, end),
-            topToday: this._topPeople(dayFrom, end)
+            total, sessions: inRange.length, days,
+            servers: [...servers.values()].sort((a, b) => b.ms - a.ms).map(g => ({
+                name: g.name, ms: g.ms, channels: [...g.channels.values()].sort((a, b) => b.ms - a.ms)
+            }))
         };
     }
 
@@ -3985,6 +4099,26 @@ module.exports = class VoiceEncounterTracker {
                     display: flex; gap: 6px;
                     margin-bottom: 14px;
                 }
+                .vet-me {
+                    margin-bottom: 14px; padding: 10px 12px;
+                    border: 1px solid var(--background-modifier-accent, #3f4147);
+                    border-radius: 4px; background: var(--background-secondary, #2b2d31);
+                }
+                .vet-me-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+                .vet-me-head .tot { font-size: 13px; opacity: .85; }
+                .vet-me-head .tot b { font-size: 15px; opacity: 1; }
+                .vet-seg { display: inline-flex; border: 1px solid var(--background-modifier-accent, #444); border-radius: 4px; overflow: hidden; margin-left: auto; }
+                .vet-seg button { background: none; border: none; color: inherit; padding: 3px 9px; cursor: pointer; font-size: 12px; opacity: .7; }
+                .vet-seg button.on { background: rgba(88,101,242,0.35); opacity: 1; }
+                .vet-me-chart { margin: 8px 0 6px; }
+                .vet-me-chart .bar { fill: #5865f2; opacity: .75; }
+                .vet-me-chart .bar.today { opacity: 1; }
+                .vet-me-chart text { fill: currentColor; opacity: .5; font-size: 10px; }
+                .vet-me-list { display: grid; grid-template-columns: 1fr auto; gap: 2px 14px; font-size: 13px; }
+                .vet-me-list .g { font-weight: 600; }
+                .vet-me-list .c { padding-left: 14px; opacity: .75; }
+                .vet-me-list .t { text-align: right; font-variant-numeric: tabular-nums; opacity: .85; }
+                .vet-me-list .more { padding-left: 14px; opacity: .5; font-size: 12px; }
                 .vet-time {
                     margin-bottom: 14px; padding: 10px 12px;
                     border: 1px solid var(--background-modifier-accent, #3f4147);
@@ -4297,6 +4431,20 @@ module.exports = class VoiceEncounterTracker {
                         <button type="button" class="vet-btn" data-action="search-clear">Clear</button>
                     </div>
 
+                    <div class="vet-me">
+                        <div class="vet-me-head">
+                            <span class="vet-manual-title" style="margin:0">My voice time</span>
+                            <span class="tot" data-role="me-total"></span>
+                            <span class="vet-seg" data-role="me-range">
+                                <button type="button" data-range="7">7 days</button>
+                                <button type="button" data-range="30">30 days</button>
+                                <button type="button" data-range="all">All</button>
+                            </span>
+                        </div>
+                        <div class="vet-me-chart" data-role="me-chart"></div>
+                        <div class="vet-me-list" data-role="me-list"></div>
+                    </div>
+
                     <div class="vet-time">
                         <div class="vet-manual-title">Who was in voice with me</div>
                         <div class="vet-time-row">
@@ -4572,6 +4720,45 @@ module.exports = class VoiceEncounterTracker {
             jumpTo(row.getAttribute("data-jump"), idx === "" || idx == null ? null : Number(idx));
         });
         renderTimeChips();
+
+        // ── My voice time ──
+        const meRange = overlay.querySelector("[data-role='me-range']");
+        const renderMe = () => {
+            const key = this._vetMeRange || "7";
+            meRange.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.getAttribute("data-range") === key));
+            const from = key === "all" ? null : Date.now() - Number(key) * 86400_000;
+            const sum = this.myVoiceSummary(from);
+            overlay.querySelector("[data-role='me-total']").innerHTML =
+                `<b>${this.formatDuration(sum.total)}</b> in ${sum.sessions} session${sum.sessions === 1 ? "" : "s"}`;
+            // last 30 days, one bar per day
+            const W = 600, H = 70, n = sum.days.length, bw = W / n;
+            const max = Math.max(3600_000, ...sum.days.map(d => d.ms));
+            const bars = sum.days.map((d, i) => {
+                const h = d.ms ? Math.max(2, d.ms / max * (H - 14)) : 0;
+                const dt = new Date(d.day);
+                const tip = `${dt.toLocaleDateString()} — ${this.formatDuration(d.ms)}`;
+                return `<rect class="bar${i === n - 1 ? " today" : ""}" x="${(i * bw + 1).toFixed(1)}" y="${(H - 14 - h).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${h.toFixed(1)}" rx="1.5"><title>${tip}</title></rect>`;
+            }).join("");
+            const lbl = (i) => { const dt = new Date(sum.days[i].day); return `${dt.getDate()}.${String(dt.getMonth() + 1).padStart(2, "0")}`; };
+            overlay.querySelector("[data-role='me-chart']").innerHTML =
+                `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">${bars}
+                    <text x="0" y="${H - 2}">${lbl(0)}</text><text x="${W / 2}" y="${H - 2}" text-anchor="middle">${lbl(Math.floor(n / 2))}</text>
+                    <text x="${W}" y="${H - 2}" text-anchor="end">today</text></svg>`;
+            overlay.querySelector("[data-role='me-list']").innerHTML = sum.servers.length
+                ? sum.servers.slice(0, 8).map(g =>
+                    `<span class="g">${esc(g.name)}</span><span class="t">${this.formatDuration(g.ms)}</span>` +
+                    g.channels.slice(0, 4).map(c => `<span class="c">#${esc(c.name)}</span><span class="t">${this.formatDuration(c.ms)}</span>`).join("") +
+                    (g.channels.length > 4 ? `<span class="more">+${g.channels.length - 4} more</span><span></span>` : "")).join("")
+                : `<span style="opacity:.6">No voice time recorded yet.</span><span></span>`;
+        };
+        meRange.addEventListener("click", (e) => {
+            const b = e.target.closest("[data-range]");
+            if (!b) return;
+            e.preventDefault(); e.stopPropagation();
+            this._vetMeRange = b.getAttribute("data-range");
+            renderMe();
+        });
+        renderMe();
 
         overlay.querySelector("[data-role='tbody']").addEventListener("click", (e) => {
             const btn = e.target.closest("[data-action]");
