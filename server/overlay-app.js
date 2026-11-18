@@ -906,9 +906,11 @@ function startServer() {
         }
         if (req.method === "POST" && url === "/video/reconnect") {
             const live = isVideoStreamLive(_videoUserId);
+            let attempt = 0;
+            try { attempt = Number(JSON.parse(await readBody(req) || "{}").attempt) || 0; } catch (e) {}
             if (live) {
-                videoLog("reconnect requested by viewer for", _videoUserId);
-                queuePluginCommand("watch-stream", _videoUserId, "reconnect");
+                videoLog("reconnect requested by viewer for", _videoUserId, "attempt", attempt);
+                reopenVideoStream(attempt);
             }
             jsonReply(res, 200, { ok: true, live, pluginAlive: isPluginAlive() });
             return;
@@ -1708,6 +1710,27 @@ function wireVideoWindowIpc(win) {
     win.webContents._vetIpcChannel = ch;
 }
 
+let _videoParams = {};
+let _videoReopenAttempts = 0;
+
+// Reconnect = the same thing as closing and reopening the viewer, minus
+// recreating the window: drop the plugin's capture, forget the old WebRTC
+// handshake, reload the page and ask the plugin to watch from scratch.
+function reopenVideoStream(attempt) {
+    if (!videoWindow || videoWindow.isDestroyed() || !_videoUserId) return;
+    const userId = _videoUserId;
+    queuePluginCommand("stop-stream", userId);
+    _webrtcOffer = null;
+    _webrtcOfferCandidates = [];
+    _webrtcAnswer = null;
+    _webrtcAnswerCandidates = [];
+    _webrtcIceForSender = [];
+    _webrtcIceForReceiver = [];
+    _videoReopenAttempts = Math.max(1, attempt || 1);
+    try { videoWindow.webContents.reload(); } catch (e) {}
+    queuePluginCommand("watch-stream", userId);
+}
+
 function openVideoWindow(params) {
     if (params && params.userId) { _videoUserId = String(params.userId); _videoNotLiveSince = 0; }
     if (videoWindow && !videoWindow.isDestroyed()) {
@@ -1743,11 +1766,17 @@ function openVideoWindow(params) {
     videoWindow.on("move", saveVideoBoundsSoon);
     videoWindow.on("resize", saveVideoBoundsSoon);
 
-    videoWindow.webContents.once("did-finish-load", () => {
+    _videoParams = params || {};
+    // Runs on every load, including reloads done by reopenVideoStream().
+    videoWindow.webContents.on("did-finish-load", () => {
         try {
+            if (!videoWindow || videoWindow.isDestroyed()) return;
             const ch = videoWindow.webContents._vetIpcChannel;
+            const resume = _videoReopenAttempts;
+            _videoReopenAttempts = 0;
             videoWindow.webContents.executeJavaScript(
-                `window.__vetStreamParams = ${JSON.stringify(params || {})};` +
+                `window.__vetStreamParams = ${JSON.stringify(_videoParams || {})};` +
+                (resume ? `if (window.__vetResumeReconnect) window.__vetResumeReconnect(${resume});` : "") +
                 `if (window.vetWebRTC) window.vetWebRTC.setChannel(${JSON.stringify(ch)});`
             );
         } catch (e) {}

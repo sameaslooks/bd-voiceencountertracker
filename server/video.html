@@ -65,6 +65,12 @@
     #alpha-range { width: 120px; accent-color: #5865f2; }
     #alpha-val { width: 32px; text-align: right; font-variant-numeric: tabular-nums; opacity: 0.8; }
 
+    #last-frame {
+        position: absolute; inset: 0; width: 100%; height: 100%;
+        object-fit: contain; background: #000;
+        display: none; pointer-events: none; z-index: 4;
+    }
+    #last-frame.show { display: block; }
     #reconnect {
         position: absolute; inset: 0;
         display: flex; align-items: center; justify-content: center;
@@ -112,6 +118,7 @@
 <body>
 <div id="root">
     <canvas id="view"></canvas>
+    <img id="last-frame" alt="">
     <div id="controls">
         <button class="btn" id="btn-alpha" title="Opacity">
             <svg viewBox="0 0 24 24" fill="currentColor">
@@ -462,7 +469,7 @@ function startStatsLog() {
 // it closes this window on its own.
 // ---------------------------------------------------------------------
 const STALL_MS = 3000;
-const RECONNECT_EVERY_MS = 8000;
+const RECONNECT_EVERY_MS = 12000;   // each attempt reloads this page and re-watches from scratch
 let lastFrameAt = 0;
 let reconnecting = false;
 let reconnectSince = 0;
@@ -481,18 +488,46 @@ function startReconnect(reason) {
     }
 }
 
+// The last frame survives the page reload done on reconnect (sessionStorage
+// lives as long as the window), so the viewer never goes blank.
+const LAST_FRAME_KEY = "vet:lastFrame";
+const elLastFrame = document.getElementById("last-frame");
+function saveLastFrame() {
+    if (!lastFrameAt || !elView.width || !elView.height) return;
+    try { sessionStorage.setItem(LAST_FRAME_KEY, elView.toDataURL("image/jpeg", 0.85)); } catch (e) {}
+}
+function showSavedFrame() {
+    let url = null;
+    try { url = sessionStorage.getItem(LAST_FRAME_KEY); } catch (e) {}
+    if (!url) return;
+    elLastFrame.src = url;
+    elLastFrame.classList.add("show");
+}
+function hideSavedFrame() {
+    if (!elLastFrame.classList.contains("show")) return;
+    elLastFrame.classList.remove("show");
+    elLastFrame.removeAttribute("src");
+    try { sessionStorage.removeItem(LAST_FRAME_KEY); } catch (e) {}
+}
+
 function endReconnect() {
     reconnecting = false;
+    hideSavedFrame();
     elReconnect.classList.remove("show");
     log("stream resumed after", Math.round(performance.now() - reconnectSince), "ms,", reconnectAttempts, "attempt(s)");
 }
 
 async function requestReconnect() {
+    // Only grab the canvas while it still holds a real frame (first attempt);
+    // after a reload it is blank and the stored frame is kept.
+    if (!elLastFrame.classList.contains("show")) saveLastFrame();
     lastReconnectReq = performance.now();
     reconnectAttempts++;
     elReconnectSub.textContent = reconnectAttempts > 1 ? "Attempt " + reconnectAttempts : "";
     try {
-        const r = await fetch(API_BASE + "/video/reconnect", { method: "POST" });
+        const r = await fetch(API_BASE + "/video/reconnect", {
+            method: "POST", body: JSON.stringify({ attempt: reconnectAttempts })
+        });
         const d = await r.json();
         log("reconnect request #" + reconnectAttempts, JSON.stringify(d));
         if (d && d.pluginAlive === false) elReconnectSub.textContent = "Discord plugin not responding";
@@ -501,6 +536,18 @@ async function requestReconnect() {
         log("reconnect request failed:", e.message);
     }
 }
+
+// Called by the overlay after it reloaded this page for a reconnect: keep
+// the spinner up and keep retrying until frames come back.
+window.__vetResumeReconnect = (attempts) => {
+    const now = performance.now();
+    showSavedFrame();
+    startReconnect("page reloaded for reconnect");
+    reconnectAttempts = attempts || 1;
+    elReconnectSub.textContent = reconnectAttempts > 1 ? "Attempt " + reconnectAttempts : "";
+    lastFrameAt = now - STALL_MS - 1;
+    lastReconnectReq = now;
+};
 
 setInterval(() => {
     if (!lastFrameAt) return;           // never started yet
