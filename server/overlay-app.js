@@ -366,6 +366,7 @@ function setClickThrough(enabled) {
     if (_clickThroughState === enabled) return;
     _clickThroughState = enabled;
     console.log("[click-through]", enabled ? "ON" : "OFF");
+    videoLog("[click-through]", enabled ? "ON" : "OFF");
 
     for (const rec of windows.values()) {
         if (!rec.win || rec.win.isDestroyed()) continue;
@@ -380,6 +381,7 @@ function setClickThrough(enabled) {
     }
 }
 
+let _lastFgSig = "";
 function startCursorWatchdog() {
     setInterval(async () => {
         try {
@@ -390,8 +392,14 @@ function startCursorWatchdog() {
             }
 
             const info = await checkForegroundAndCursor();
+            // Our own windows (stream viewer, overlay) in the foreground say nothing
+            // about the game: keep the current state instead of turning it off.
+            const own = info.pid === process.pid;
             const cursorHidden = info.cursorShowing === 0;
             const isFullscreen = rectCoversAnyMonitor(info.rect);
+            const sig = `pid=${info.pid} own=${own} cursorHidden=${cursorHidden} fullscreen=${isFullscreen} rect=${JSON.stringify(info.rect)}`;
+            if (sig !== _lastFgSig) { _lastFgSig = sig; videoLog("[click-through check]", sig, "state=" + _clickThroughState); }
+            if (own) return;
 
             // Click-through только когда:
             //  1) курсор скрыт системой,
