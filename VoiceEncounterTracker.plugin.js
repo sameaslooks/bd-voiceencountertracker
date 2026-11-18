@@ -2,7 +2,7 @@
  * @name VoiceEncounterTracker
  * @author sameaslooks
  * @authorLink https://github.com/sameaslooks
- * @version 1.2.0
+ * @version 1.3.0
  * @description Marks users you've shared a voice channel with, keeps encounter history, and drives a desktop overlay.
  * @source https://github.com/sameaslooks/bd-voiceencountertracker
  * @website https://github.com/sameaslooks
@@ -653,6 +653,22 @@ module.exports = class VoiceEncounterTracker {
                     }
                     try { self._rememberOwnChannel(); } catch (e) {}
                     try { self._trackOwnSession(); } catch (e) {}
+                    // I came into a channel: Discord sends no updates for the people
+                    // already there (they're only in its store), so read them now
+                    // and push the full list right away.
+                    try {
+                        const me = self.getCurrentUserId();
+                        const myCh = me ? (self.active.get(me)?.channelId ?? null) : null;
+                        if (myCh !== self._lastMyChannel) {
+                            self._lastMyChannel = myCh;
+                            if (myCh) {
+                                self.syncActiveFromStore();
+                                self.pushStateToOverlay();
+                                // the store can lag a moment behind the join
+                                self._addTimer(setTimeout(() => { try { self.syncActiveFromStore(); self.pushStateToOverlay(); } catch (e) {} }, 600));
+                            }
+                        }
+                    } catch (e) {}
                     if (self._injectDebounce) clearTimeout(self._injectDebounce);
                     self._injectDebounce = self._addTimer(setTimeout(() => {
                         try { self.injectBadges(); } catch (e) {}
@@ -1897,6 +1913,7 @@ module.exports = class VoiceEncounterTracker {
                     serverMuteAt: s.serverMuteAt || 0,
                     serverDeafAt: s.serverDeafAt || 0,
                     unreadDM: isSelf ? 0 : this._unreadDMCount(userId),
+                    since: s.startedAt || 0,        // when they came into the channel (as far as we know)
                     activity: this._activityFor(userId),
                     mobile: this._isOnMobile(userId),
                     volume: isSelf ? null : this._localVolume(userId),
@@ -2064,7 +2081,16 @@ module.exports = class VoiceEncounterTracker {
             // has its track released under it; a pending watch of the same
             // viewer is cancelled.
             if (key) this._bumpWatchToken(key);
-            const stop = () => this._stopFramePump(key);
+            // Viewer closed for good: after our handle is released, stop watching
+            // that stream in Discord as well (others' streams only).
+            const leaveDiscord = cmd.name === "closed" && key && /^\d+$/.test(key);
+            const stop = async () => {
+                this._stopFramePump(key);
+                if (leaveDiscord) {
+                    await new Promise(res => setTimeout(res, 300));
+                    if (!this._pumps.has(key)) this._stopWatchingInDiscord(key);
+                }
+            };
             this._watchChain = (this._watchChain || Promise.resolve()).then(stop, stop);
             return;
         }
@@ -3492,6 +3518,39 @@ module.exports = class VoiceEncounterTracker {
                 || (ass?.getAllActiveStreams?.() || []).find(x => String(x?.ownerId) === String(userId));
             return !!st && (st.state === "PAUSED" || st.paused === true);
         } catch (e) { return false; }
+    }
+
+    // Same as "Stop watching" in Discord.
+    _stopWatchingInDiscord(userId) {
+        try {
+            const me = this.getCurrentUserId();
+            const mine = me ? this.active.get(me) : null;
+            if (!mine?.channelId) return;
+            const streamKey = mine.guildId ? `guild:${mine.guildId}:${mine.channelId}:${userId}` : `call:${mine.channelId}:${userId}`;
+            // Discord's closeStream isn't exported under a stable name: find it by
+            // what it does (dispatch STREAM_CLOSE); else dispatch that ourselves.
+            let fn = null;
+            try {
+                const mod = BdApi.Webpack.getByKeys("closeStream", { searchExports: true });
+                if (typeof mod?.closeStream === "function") fn = mod.closeStream.bind(mod);
+            } catch (e) {}
+            if (!fn) {
+                try {
+                    const f = BdApi.Webpack.getByStrings("STREAM_CLOSE", "streamKey", { searchExports: true });
+                    if (typeof f === "function") fn = f;
+                } catch (e) {}
+            }
+            if (fn) {
+                fn(streamKey, false);
+                vetLog("info", "stopped watching in Discord:", streamKey);
+                return;
+            }
+            const d = this.getDispatcher();
+            if (d?.dispatch) {
+                d.dispatch({ type: "STREAM_CLOSE", streamKey, canShowFeedback: false });
+                vetLog("info", "stopped watching in Discord (dispatch):", streamKey);
+            } else vetLog("warn", "closeStream not found");
+        } catch (e) { vetLog("error", "_stopWatchingInDiscord:", e); }
     }
 
     _streamKeyOf(st) {

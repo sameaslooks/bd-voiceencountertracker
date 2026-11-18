@@ -1083,7 +1083,7 @@ function startServer() {
         if (req.method === "POST" && url === "/video/reconnect") {
             let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
             const v = viewerFor(d.key);
-            const live = !!v && isViewerLive(v);
+            const live = !!v && isViewerLive(v) && !v.paused;
             const attempt = Number(d.attempt) || 0;
             if (live) {
                 videoLog("reconnect requested by viewer for", v.key, "attempt", attempt);
@@ -1180,8 +1180,8 @@ function startServer() {
                 lastPluginSeen = Date.now();
                 noteVoiceForReturn(gap);
                 jsonReply(res, 200, { ok: true });
+                applyAutoResizeAll();      // grow the window first, then draw into it
                 broadcastState();
-                applyAutoResizeAll();
                 checkVideoAutoClose();
                 if (state.streamSound !== prevSound) {
                     try { rebuildTrayMenu(); } catch (e) {}
@@ -1907,6 +1907,48 @@ function layoutProfiles() {
     return settings.layoutProfiles;
 }
 
+// Dragging a window by hand updates the layout that's active right now (the
+// game in front, or Desktop): overlay windows by id, stream windows by their
+// number (#1 main / preview place, #2+ extra places). Programmatic moves don't
+// count. Setup has its own saving.
+let _layoutUpdateTimer = null;
+function updateActiveLayoutSoon() {
+    if (setupMode || settings.layoutProfilesEnabled === false) return;
+    clearTimeout(_layoutUpdateTimer);
+    _layoutUpdateTimer = setTimeout(() => {
+        const key = _profileKey;
+        if (!key || key === "__setup__") return;
+        const profiles = layoutProfiles();
+        const p = profiles[key] || { windows: {}, video: null, notify: null };
+        p.windows = p.windows || {};
+        for (const rec of windows.values()) {
+            if (!rec.win || rec.win.isDestroyed()) continue;
+            const [x, y] = rec.win.getPosition();
+            p.windows[rec.id] = { x, y };
+        }
+        const list = [...viewers.values()].filter(v => v.win && !v.win.isDestroyed());
+        if (list.length) {
+            const vid = { ...(p.video || {}) };
+            vid.extra = Array.isArray(vid.extra) ? vid.extra.slice() : [];
+            list.forEach((v, i) => {
+                const b = v.win.getBounds();
+                if (i === 0) { if (v.preview) vid.previewBounds = b; else vid.bounds = b; }
+                else vid.extra[i - 1] = b;
+            });
+            p.video = vid;
+            const vp = videoPrefs();
+            if (vid.bounds) vp.bounds = vid.bounds;
+            if (vid.previewBounds) vp.previewBounds = vid.previewBounds;
+            vp.extraBounds = vid.extra;
+        }
+        p.savedAt = Date.now();
+        profiles[key] = p;
+        saveSettingsSoon();
+        videoLog("[layout] updated by drag:", key);
+        sseBroadcast("layouts", layoutsInfo());
+    }, 400);
+}
+
 function saveLayoutProfile(key) {
     const prev = layoutProfiles()[key] || {};
     const p = { windows: {}, savedAt: Date.now(), video: prev.video || null, notify: prev.notify || null };
@@ -1955,6 +1997,7 @@ function applyLayoutProfile(p) {
                 const b = i === 0 ? (v.preview ? p.video.previewBounds : p.video.bounds) : (p.video.extra || [])[i - 1];
                 if (b && boundsOnScreen(b)) {
                     if (i === 0 && !v.preview) v.savedBounds = b;
+                    v.place = b;
                     v.win.setBounds(fitToAspect(b, v.aspect));
                 }
             });
@@ -1983,6 +2026,9 @@ function openSetupFrames(key) {
         ? { x: prof.notify.x, y: prof.notify.y, width: prof.notify.width, height: 110 }
         : { x: ab ? ab.x : wa.x + 20, y: ab ? ab.y + ab.height + 4 : wa.y + 200, width: ab ? ab.width : WINDOW_WIDTH, height: 110 };
     const make = _setupFrameMake = (kind, b, resizable) => {
+        // Stream frames are 16:9 and resize proportionally from any edge.
+        const isStream = kind.startsWith("stream");
+        if (isStream) b = { ...b, height: Math.round(b.width * 9 / 16) };
         const w = new BrowserWindow({
             ...b, frame: false, transparent: true, backgroundColor: "#00000000",
             alwaysOnTop: true, resizable, skipTaskbar: true, hasShadow: false,
@@ -1990,6 +2036,7 @@ function openSetupFrames(key) {
             webPreferences: { nodeIntegration: false, contextIsolation: true }
         });
         w.setAlwaysOnTop(true, "screen-saver");
+        if (isStream) { try { w.setAspectRatio(16 / 9); } catch (e) {} }
         w.loadFile(path.join(__dirname, "placeholder.html"), { query: { kind } });
         w.on("move", () => setupMoved());
         w.once("ready-to-show", () => { try { w.showInactive(); } catch (e) {} });
@@ -2165,7 +2212,7 @@ function returnCardFromOverlay() {
     if (!returnOffer || state.channelId) return null;
     if (Date.now() - returnOffer.at > RETURN_OFFER_MS) { returnOffer = null; return null; }
     return { channelId: returnOffer.channelId, channelName: returnOffer.channelName,
-             guildName: returnOffer.guildName, count: 0, members: [] };
+             guildName: returnOffer.guildName, count: 0, members: [], pending: true };   // who's there comes from the plugin
 }
 
 function buildStateResponse() {
@@ -2212,7 +2259,7 @@ function computeTargetHeight() {
     let cards = 0;
     if (alive) {
         if (state.channelId) cards = Array.isArray(state.departures) ? Math.min(state.departures.length, 3) : 0;
-        else if (state.returnTo) cards = 1;
+        else if (state.returnTo || returnCardFromOverlay()) cards = 1;   // the overlay's own offer counts too
     }
     const statsRows = state.leaveStats ? 2 + Math.min(5, (state.leaveStats.people || []).length) : 0;   // header + you + people
     const statsExtra = (alive && !state.channelId && state.leaveStats) ? 20 + statsRows * 16 : 0;
@@ -2298,6 +2345,7 @@ function createWindowFromRecord(record) {
     };
     windows.set(rec.id, rec);
 
+    win.on("will-move", () => { rec._userMove = true; });
     win.on("moved", () => {
         try {
             const [x, y] = win.getPosition();
@@ -2307,6 +2355,8 @@ function createWindowFromRecord(record) {
             scheduleSaveWindows();
             positionNotifyWindow();
             if (setupMode) setupMoved();
+            else if (rec._userMove) updateActiveLayoutSoon();
+            rec._userMove = false;
         } catch (e) {}
     });
 
@@ -2740,6 +2790,7 @@ function reflowViewers(fromIndex) {
         const pl = placeForIndex(i);
         if (!pl.bounds) return;
         if (i === 0 && pl.preview !== v.preview) v.preview = pl.preview;
+        v.place = pl.bounds;
         try { v.win.setBounds(fitToAspect(pl.bounds, v.aspect)); } catch (e) {}
         try { v.win.webContents.executeJavaScript(`window.__vetSetPreview && window.__vetSetPreview(${v.preview});`).catch(() => {}); } catch (e) {}
     });
@@ -2778,6 +2829,7 @@ function openVideoWindow(params) {
         key, userId, win, params: { ...params, key },
         local: !!params.local, camera: !!params.camera, own: !!params.own, sourceId: params.sourceId || null,
         preview, savedBounds: boundsOnScreen(vp.bounds) ? vp.bounds : null,
+        place: startBounds || null,     // the layout's spot; sizing works from this, not from current bounds
         aspect: 0, notLiveSince: 0, reopenAttempts: 0,
         offer: null, offerCandidates: [], answer: null, answerCandidates: []
     };
@@ -2793,6 +2845,12 @@ function openVideoWindow(params) {
     wireVideoWindowLogging(win);
     win.on("move", () => saveVideoBoundsSoon(v));
     win.on("resize", () => saveVideoBoundsSoon(v));
+    // Moved / resized by hand: it stays where you put it.
+    win.on("will-move", () => { v.place = null; v._userMove = true; });
+    win.on("will-resize", () => { v.place = null; v._userMove = true; });
+    const userDone = () => { if (v._userMove) { v._userMove = false; updateActiveLayoutSoon(); } };
+    win.on("moved", userDone);
+    win.on("resized", userDone);
 
     // Runs on every load, including reloads done by reopenVideoStream().
     win.webContents.on("did-finish-load", () => {
@@ -2801,8 +2859,10 @@ function openVideoWindow(params) {
             const ch = win.webContents._vetIpcChannel;
             const resume = v.reopenAttempts;
             v.reopenAttempts = 0;
-            // A reload brings the window back onto the taskbar on Windows.
+            // A reload brings the window back onto the taskbar on Windows, and
+            // a call right at load time doesn't always stick: repeat it.
             try { win.setSkipTaskbar(true); } catch (e) {}
+            setTimeout(() => { try { if (!win.isDestroyed()) win.setSkipTaskbar(true); } catch (e) {} }, 600);
             v.paused = false;               // the page starts fresh; the next state re-sends it
             win.webContents.executeJavaScript(
                 `window.__vetStreamParams = ${JSON.stringify(v.params)};` +
@@ -2817,7 +2877,17 @@ function openVideoWindow(params) {
 
     // Don't steal focus from the game: a focused viewer stops the overlay's
     // fullscreen click-through/transparency.
-    win.once("ready-to-show", () => { try { win.showInactive(); win.setSkipTaskbar(true); } catch (e) {} });
+    // Windows may nudge the size at creation (DPI scaling); put it exactly in
+    // its place before showing.
+    win.once("ready-to-show", () => {
+        try {
+            if (v.place) win.setBounds(fitToAspect(v.place, v.aspect));
+            win.showInactive();
+            win.setSkipTaskbar(true);
+            // ...and once more after Windows has settled the new window
+            setTimeout(() => { try { if (v.place && !win.isDestroyed()) win.setBounds(fitToAspect(v.place, v.aspect)); } catch (e) {} }, 300);
+        } catch (e) {}
+    });
 
     win.on("closed", () => {
         if (viewers.get(key) === v) {
@@ -2825,7 +2895,8 @@ function openVideoWindow(params) {
             viewers.delete(key);
             if (!v._swapped) reflowViewers(idx);
         }
-        if (!v.local) queuePluginCommand("stop-stream", key);
+        // "closed": the window is gone for good (not a reconnect), so Discord can stop watching too
+        if (!v.local) queuePluginCommand("stop-stream", key, v._swapped ? "" : "closed");
     });
 }
 
@@ -2979,6 +3050,13 @@ function isViewerLive(v) {
     return !!u && (v.camera ? !!u.video : !!u.streaming);
 }
 
+// Keep stream viewers off the taskbar whatever Windows does after reloads.
+setInterval(() => {
+    for (const v of viewers.values()) {
+        try { if (v.win && !v.win.isDestroyed()) v.win.setSkipTaskbar(true); } catch (e) {}
+    }
+}, 2000);
+
 // Streamer's window minimized (Discord pauses the stream): the viewer shows a
 // calm "paused" card instead of reconnecting.
 function updateViewerPaused() {
@@ -2989,6 +3067,7 @@ function updateViewerPaused() {
         const paused = !!(u && u.streaming && u.streamPaused);
         if (paused === !!v.paused) continue;
         v.paused = paused;
+        if (paused) v.reopenAttempts = 0;
         videoLog("stream", paused ? "paused" : "resumed", v.key);
         try { v.win.webContents.executeJavaScript(`window.__vetSetPaused && window.__vetSetPaused(${paused}, ${!!v.own});`).catch(() => {}); } catch (e) {}
     }
@@ -3053,7 +3132,7 @@ function applyVideoAspect(v, w, h) {
     v.aspect = aspect;
     try {
         v.win.setAspectRatio(aspect);
-        v.win.setBounds(fitToAspect(v.win.getBounds(), aspect));
+        v.win.setBounds(fitToAspect(v.place || v.win.getBounds(), aspect));
     } catch (e) {}
     videoLog("aspect locked", v.key, w + "x" + h);
 }
@@ -3070,12 +3149,13 @@ function toggleVideoPreview(v) {
             : { x: cur.x + cur.width - 320, y: cur.y, width: 320, height: 180 };
         // keep the stream's proportions in preview too
         v.preview = true;
+        v.place = target;
         v.win.setBounds(fitToAspect(target, v.aspect));
     } else {
         if (first) p.previewBounds = cur;
         const target = first && boundsOnScreen(p.bounds) ? p.bounds : v.savedBounds;
         v.preview = false;
-        if (target) v.win.setBounds(fitToAspect(target, v.aspect));
+        if (target) { v.place = target; v.win.setBounds(fitToAspect(target, v.aspect)); }
     }
     if (first) { p.preview = v.preview; saveSettings(); }
     try {

@@ -326,7 +326,11 @@ const zoom = { z: 1, cx: 0.5, cy: 0.5 };   // centre in 0..1 of the shown frame
 const ZOOM_MAX = 4;
 const elZoomBadge = document.getElementById("zoom-badge");
 
-function zoomAllowed() { return !window.__vetPreview; }
+// By the window's real size, not the preview flag: any stream window big
+// enough to look into can zoom (the first one may sit in the preview place).
+const ZOOM_MIN_WIDTH = 300;
+function zoomAllowed() { return window.innerWidth >= ZOOM_MIN_WIDTH; }
+window.addEventListener("resize", () => refreshZoomable());
 
 // canvas pixel -> 0..1 position in the shown (cropped) frame at zoom 1
 function frameFraction(clientX, clientY) {

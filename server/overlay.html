@@ -1095,10 +1095,17 @@ function renderState(data) {
 
     applyPendingEdits(users);
 
-    users.forEach((u, i) => {
-        if (knownJoinTime.has(u.userId)) return;
-        // keep the incoming order; old enough not to flash
-        knownJoinTime.set(u.userId, entering ? now - 60_000 + i : now);
+    // Join times (for the flash only): coming in myself, the ones already there
+    // count as old; anyone after that is new.
+    if (entering) {
+        const others = users.filter(u => !u.isSelf)
+            .sort((a, b) => (a.since || Infinity) - (b.since || Infinity) || users.indexOf(a) - users.indexOf(b));
+        others.forEach((u, i) => knownJoinTime.set(u.userId, now - 60_000 + i));
+        const me = users.find(u => u.isSelf);
+        if (me) knownJoinTime.set(me.userId, now - 60_000 + others.length);
+    }
+    users.forEach(u => {
+        if (!knownJoinTime.has(u.userId)) knownJoinTime.set(u.userId, now);
     });
     if (entering) selfEnteredAt = now;
     const present = new Set(users.map(u => u.userId));
@@ -1106,11 +1113,12 @@ function renderState(data) {
         if (!present.has(id)) knownJoinTime.delete(id);
     }
 
-    users.sort((a, b) => {
-        const ta = knownJoinTime.get(a.userId) ?? 0;
-        const tb = knownJoinTime.get(b.userId) ?? 0;
-        return ta - tb;
-    });
+    // Same order as Discord's voice channel list: alphabetical by the shown name
+    // (server nickname / display name), case-insensitive. Join time only drives
+    // the join flash.
+    const shown = (u) => (u.displayName || u.username || "").trim();
+    users.sort((a, b) => shown(a).localeCompare(shown(b), undefined, { sensitivity: "base", numeric: true })
+        || String(a.userId).localeCompare(String(b.userId)));
 
     elChannelName.innerHTML = data.isDM
         ? `<svg class="hdr-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.6 10.8a15.2 15.2 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.6a1 1 0 0 1-.25 1l-2.2 2.2Z"/></svg>${esc(data.channelName || "DM call")}`
@@ -1346,7 +1354,7 @@ function renderCards(cards) {
         }
         if (c.kind === "return") {
             const where = c.guildName ? ` · ${esc(c.guildName)}` : "";
-            const who = c.count ? `${c.count} in channel` : "nobody there now";
+            const who = c.pending ? "checking who's there…" : c.count ? `${c.count} in channel` : "nobody there now";
             return `<div class="vcard ret" data-card="return" data-cid="${esc(c.channelId)}" title="Rejoin #${esc(c.channelName || "")}">
                 <span class="txt">
                     <span class="t1">Return to <b>#${esc(c.channelName || "channel")}</b>${where}</span>
