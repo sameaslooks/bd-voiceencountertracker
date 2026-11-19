@@ -12,6 +12,12 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { execFile, spawn } = require("child_process");
 
+// Last-resort logging: an exception or rejected promise nobody caught is written
+// to video.log and the overlay keeps running instead of exiting silently.
+// (videoLog is a hoisted function; it guards its own use of the log dir.)
+process.on("uncaughtException", (e) => { try { videoLog("[fatal] " + ((e && e.stack) || e)); } catch (_) {} });
+process.on("unhandledRejection", (e) => { try { videoLog("[fatal] unhandledRejection " + ((e && e.stack) || e)); } catch (_) {} });
+
 // ─── Chromium flags: kill occlusion detection + background throttling ───
 app.commandLine.appendSwitch("disable-features",
     "CalculateNativeWinOcclusion,CalculateNativeWinOcclusionOnScreen");
@@ -1110,13 +1116,13 @@ function startServer() {
         }
         if (req.method === "POST" && url === "/video/own-local") {
             let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
-            ownStreamToLocal(d.inst);
+            try { ownStreamToLocal(d.inst); } catch (e) { videoLog("[video] own-local failed", String((e && e.stack) || e)); }
             jsonReply(res, 200, { ok: true });
             return;
         }
         if (req.method === "POST" && url === "/video/own") {
             let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
-            openOwnStream(d.winId);
+            try { openOwnStream(d.winId); } catch (e) { videoLog("[video] own failed", String((e && e.stack) || e)); }
             jsonReply(res, 200, { ok: true });
             return;
         }
@@ -2130,18 +2136,20 @@ function followAttached(targetId, seen) {
     seen = seen || new Set();
     if (seen.has(targetId)) return;
     seen.add(targetId);
-    const t = winForId(targetId);
-    if (!t) return;
-    const tb = t.getBounds();
-    for (const [selfId, touch] of [...attachments]) {
-        if (!touch || touch.id !== targetId) continue;
-        const self = winForId(selfId);
-        if (!self) continue;
-        const sb = self.getBounds();
-        const nb = attachedBounds(sb, tb, touch);
-        if (nb.x !== sb.x || nb.y !== sb.y) { setBoundsQuiet(self, nb); afterMove(selfId, nb); }
-        followAttached(selfId, seen);
-    }
+    try {
+        const t = winForId(targetId);          // null when destroyed
+        if (!t) return;
+        const tb = t.getBounds();
+        for (const [selfId, touch] of [...attachments]) {
+            if (!touch || touch.id !== targetId) continue;
+            const self = winForId(selfId);
+            if (!self) continue;
+            const sb = self.getBounds();
+            const nb = attachedBounds(sb, tb, touch);
+            if (nb.x !== sb.x || nb.y !== sb.y) { setBoundsQuiet(self, nb); afterMove(selfId, nb); }
+            followAttached(selfId, seen);
+        }
+    } catch (e) { videoLog("[snap] followAttached failed", targetId, String((e && e.stack) || e)); }
 }
 
 // A window the user just let go of: snap it, record what it touches, pull its attached windows along.
@@ -3310,17 +3318,19 @@ function layoutSmalls(n, block, w, h, side) {
 function retile(group, p) {
     if (p === undefined) p = tilingProfile();
     group = String(group || "");
-    const list = aliveIn(group);
-    if (isTiled(p) && list.length) {
-        const rects = tileRects(group, p);
-        list.forEach((v, i) => {
-            if (!rects[i]) return;
-            v.place = null;
-            setBoundsQuiet(v.win, rects[i]);
-            followAttached("v:" + v.key);
-        });
-    }
-    list.forEach(v => sendTileFlags(v, p, list));
+    try {
+        const list = aliveIn(group);           // live windows only
+        if (isTiled(p) && list.length) {
+            const rects = tileRects(group, p);
+            list.forEach((v, i) => {
+                if (!v.win || v.win.isDestroyed() || !rects[i]) return;
+                v.place = null;
+                setBoundsQuiet(v.win, rects[i]);
+                followAttached("v:" + v.key);
+            });
+        }
+        list.forEach(v => sendTileFlags(v, p, list));
+    } catch (e) { videoLog("[tile] retile failed", group, String((e && e.stack) || e)); }
 }
 function retileAll(p) {
     if (p === undefined) p = tilingProfile();
@@ -3330,15 +3340,15 @@ function retileAll(p) {
 
 // window.__vetSetTile({tiled, isMain}): isMain = one of the main slots.
 function sendTileFlags(v, p, list) {
-    if (!v.win || v.win.isDestroyed()) return;
-    const t = tilingOf(p);
-    const tiled = t.mode === "tiled";
-    const M = Math.min(t.mains, list.length);
-    const idx = list.indexOf(v);
-    const st = { tiled, isMain: tiled && idx >= 0 && idx < M };
     try {
+        if (!v || !v.win || v.win.isDestroyed()) return;
+        const t = tilingOf(p);
+        const tiled = t.mode === "tiled";
+        const M = Math.min(t.mains, list.length);
+        const idx = list.indexOf(v);
+        const st = { tiled, isMain: tiled && idx >= 0 && idx < M };
         v.win.webContents.executeJavaScript(`window.__vetSetTile && window.__vetSetTile(${JSON.stringify(st)});`).catch(() => {});
-    } catch (e) {}
+    } catch (e) { videoLog("[tile] sendTileFlags failed", String((e && e.stack) || e)); }
 }
 
 // Remembers an anchor rect: the main group's saved place, or another overlay's own anchor.
@@ -3487,13 +3497,15 @@ function openVideoWindow(params) {
     win.on("will-move", () => { v.place = null; v._userMove = true; });
     win.on("will-resize", () => { v.place = null; v._userMove = true; });
     const userDone = (what) => {
-        const user = !!v._userMove;
-        v._userMove = false;
-        // Tiled layouts: the drag swaps, moves the anchor or snaps back; no edge snapping.
-        if (user && tileUserMove(v, what)) { updateActiveLayoutSoon(); return; }
-        if (user && what === "moved") settleDrop("v:" + key);
-        else followAttached("v:" + key);
-        if (user) updateActiveLayoutSoon();
+        try {
+            const user = !!v._userMove;
+            v._userMove = false;
+            // Tiled layouts: the drag swaps, moves the anchor or snaps back; no edge snapping.
+            if (user && tileUserMove(v, what)) { updateActiveLayoutSoon(); return; }
+            if (user && what === "moved") settleDrop("v:" + key);
+            else followAttached("v:" + key);
+            if (user) updateActiveLayoutSoon();
+        } catch (e) { videoLog("[video] move handler failed", key, String((e && e.stack) || e)); }
     };
     win.on("moved", () => userDone("moved"));
     win.on("resized", () => userDone("resized"));
@@ -3518,7 +3530,7 @@ function openVideoWindow(params) {
                 `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((videoPrefs().zoom || {})[v.key] || null)});` +
                 (v.local ? `if (window.__vetStartLocal) window.__vetStartLocal(${JSON.stringify(v.sourceId)});`
                          : `if (window.vetWebRTC) window.vetWebRTC.setChannel(${JSON.stringify(ch)});`)
-            );
+            ).catch(() => {});
         } catch (e) {}
     });
 
@@ -3536,19 +3548,22 @@ function openVideoWindow(params) {
         } catch (e) {}
     });
 
+    // Runs after the window is destroyed: touches no BrowserWindow, only the maps.
     win.on("closed", () => {
-        const cur = viewers.get(key);
-        if (!cur || cur === v) dropAttachments("v:" + key);
-        if (viewers.get(key) === v) {
-            const g = groupOf(v.main, v.inst);
-            const idx = viewersIn(g).indexOf(v);
-            viewers.delete(key);
-            orderRemove(g, key);
-            if (!aliveIn(g).length) tileAnchors.delete(g);
-            if (!v._swapped) { if (isTiled(tilingProfile())) retile(g); else reflowViewers(g, idx); }
-        }
-        // "closed": the window is gone for good (not a reconnect), so Discord can stop watching too
-        if (!v.local) queuePluginCommand("stop-stream", key, v._swapped ? "" : "closed", v.inst);
+        try {
+            const cur = viewers.get(key);
+            if (!cur || cur === v) dropAttachments("v:" + key);
+            if (viewers.get(key) === v) {
+                const g = groupOf(v.main, v.inst);
+                const idx = viewersIn(g).indexOf(v);
+                viewers.delete(key);
+                orderRemove(g, key);
+                if (!aliveIn(g).length) tileAnchors.delete(g);
+                if (!v._swapped) { if (isTiled(tilingProfile())) retile(g); else reflowViewers(g, idx); }
+            }
+            // "closed": the window is gone for good (not a reconnect), so Discord can stop watching too
+            if (!v.local) queuePluginCommand("stop-stream", key, v._swapped ? "" : "closed", v.inst);
+        } catch (e) { videoLog("[video] closed handler failed", key, String((e && e.stack) || e)); }
     });
 }
 
