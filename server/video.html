@@ -25,9 +25,15 @@
         background: #000;
         display: block;
     }
-    #view.zoomable { cursor: zoom-in; }
-    #view.zoomed { cursor: zoom-out; }
-    #view.panning { cursor: grabbing; }
+    #view.off { display: none; }
+    /* Video render mode: stage (takes the pointer) > picture clip (rect of the cropped frame) > <video> with the zoom transform. */
+    #vwrap { position: absolute; inset: 0; background: #000; overflow: hidden; display: none; }
+    #vwrap.on { display: block; }
+    #vpic { position: absolute; overflow: hidden; background: #000; }
+    #vview { position: absolute; left: 0; top: 0; width: 100%; height: 100%; object-fit: contain; background: #000; display: block; transform-origin: 0 0; }
+    #view.zoomable, #vwrap.zoomable { cursor: zoom-in; }
+    #view.zoomed, #vwrap.zoomed { cursor: zoom-out; }
+    #view.panning, #vwrap.panning { cursor: grabbing; }
     #zoom-badge {
         position: absolute; left: 6px; bottom: 6px; z-index: 7;
         background: rgba(0,0,0,0.6); color: #fff; font-size: 10px; font-weight: 600;
@@ -37,6 +43,7 @@
     #controls {
         position: absolute; top: 0; left: 0; right: 0; height: 28px;
         display: flex; align-items: center; justify-content: flex-end; gap: 4px;
+        flex-wrap: nowrap; overflow: hidden;
         padding: 0 6px;
         background: linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0));
         -webkit-app-region: drag;
@@ -59,6 +66,10 @@
     #btn-main { color: #b5bac1; }
     #btn-main:hover { color: #fff; }
     #btn-main[hidden] { display: none; }
+    #btn-max { color: #b5bac1; }
+    #btn-max:hover { color: #fff; }
+    #btn-max[hidden] { display: none; }
+    #btn-pin[hidden] { display: none; }
 
     #alpha-pop {
         position: absolute; top: 28px; right: 34px;
@@ -102,42 +113,79 @@
         box-shadow: 0 4px 18px rgba(0,0,0,0.45);
         max-width: calc(100% - 24px);
     }
-    #reconnect.paused .spinner { display: none; }
+    #reconnect.paused .spin-ico { display: none; }
     #reconnect .pause-ico { display: none; width: 18px; height: 18px; color: #b5bac1; flex-shrink: 0; }
-    #reconnect.paused .pause-ico { display: block; }
-    #reconnect .spinner {
-        flex: none;
-        width: 18px; height: 18px;
-        border: 2px solid rgba(255,255,255,0.15);
-        border-top-color: #5865f2;
-        border-radius: 50%;
-        animation: vet-spin 0.8s linear infinite;
-    }
+    #reconnect.paused .pause-ico { display: block; width: 40px; height: 40px; }
+    #reconnect.paused .card { flex-direction: column; gap: 8px; padding: 0; background: none; border: none; box-shadow: none; }
+    #reconnect.paused .text { align-items: center; }
+    #reconnect.paused .title { text-align: center; }
+    /* Paused: no dimming layer of its own; the last frame (if any) is blurred on the canvas, else the black background shows. */
+    #reconnect.paused { background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; }
+    #view.paused { filter: blur(10px) brightness(0.55); }
+    #reconnect .spin-ico { flex: none; width: 18px; height: 18px; }
+    #reconnect .spin-arc { stroke: #5865f2; }
     #reconnect .text { display: flex; flex-direction: column; min-width: 0; }
-    #reconnect .title { font-size: 12px; font-weight: 600; color: #f2f3f5; white-space: nowrap; }
+    #reconnect .title { font-size: 12px; font-weight: 600; color: #f2f3f5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
     #reconnect .sub {
         font-size: 11px; color: #949ba4; margin-top: 1px;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     #reconnect .sub:empty { display: none; }
-    @keyframes vet-spin { to { transform: rotate(360deg); } }
 
+    /* Hidden until JS decides the state (setStatus sets display:flex). */
     #status {
         position: absolute; inset: 0;
-        display: flex; align-items: center; justify-content: center;
+        display: none; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
         color: #72767d; font-size: 12px;
         pointer-events: none; z-index: 5;
     }
+    #status svg { display: block; flex-shrink: 0; width: 64px; height: 64px; }
+    #status svg[hidden] { display: none; }
+
+    /* Reconnect survives the page reload: head script sets data-reconnect when a reconnect is in progress,
+       so the card is up from the first paint and the status text never shows. */
+    html[data-reconnect] #reconnect { opacity: 1; }
+    html[data-reconnect] #status { display: none !important; }
+
+    /* Compact window (max-width 239px or max-height 129px): icon only, sized to fit; reconnect shows "Attempt N" under it.
+       Pure CSS, so it applies from the first paint. */
+    @media (max-width: 239px), (max-height: 129px) {
+        #status svg, #reconnect .spin-ico, #reconnect .pause-ico, #reconnect.paused .pause-ico { width: min(56px, 45vh); height: min(56px, 45vh); }
+        #status svg:not([hidden]) ~ #status-text { display: none; }
+        #reconnect .card { flex-direction: column; gap: 4px; padding: 0; background: none; border: none; box-shadow: none; }
+        #reconnect .text { align-items: center; }
+        #reconnect .title { display: none; }
+        #reconnect .sub { font-size: 11px; color: #72767d; }
+        #reconnect.paused .text { display: none; }
+        /* header: smaller controls; alpha and preview hidden, zoom stays (it is a gesture, no button) */
+        #controls { gap: 2px; padding: 0 4px; }
+        .btn { min-width: 18px; height: 18px; padding: 0 3px; }
+        #btn-alpha, #btn-pin, #alpha-pop, #alpha-pop.show { display: none; }
+    }
 </style>
+<script>
+// First paint: a reconnect in progress (sessionStorage survives the page reload) shows the card at once,
+// unless it was a quiet one (silence rule): then the last frame stays up and no card is shown.
+try {
+    if (sessionStorage.getItem("vet:reconnect") && sessionStorage.getItem("vet:quiet") !== "1")
+        document.documentElement.setAttribute("data-reconnect", "1");
+} catch (e) {}
+</script>
 </head>
 <body>
 <div id="root">
     <canvas id="view"></canvas>
+    <div id="vwrap">
+        <div id="vpic"><video id="vview" autoplay muted playsinline></video></div>
+    </div>
     <div id="zoom-badge"></div>
     <img id="last-frame" alt="">
     <div id="controls">
         <button class="btn" id="btn-main" title="Make main" hidden>
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8L12 2.5Z"/></svg>
+        </button>
+        <button class="btn" id="btn-max" title="Fill the screen" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path id="max-path" d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
         </button>
         <button class="btn" id="btn-alpha" title="Opacity">
             <svg viewBox="0 0 24 24" fill="currentColor">
@@ -145,8 +193,8 @@
                 <path d="M12 2a10 10 0 1 1 0 20V2z" fill="none" stroke="currentColor" stroke-width="1.4"/>
             </svg>
         </button>
-        <button class="btn" id="btn-pin" title="Preview mode (small corner)">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h6v2H6v4H4V4Zm10 0h6v6h-2V6h-4V4ZM4 14h2v4h4v2H4v-6Zm14 0h2v6h-6v-2h4v-4Z"/></svg>
+        <button class="btn" id="btn-pin" title="Shrink to a small corner">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path id="pin-path" d="M9 4v5H4M4 4l5 5M15 20v-5h5M20 20l-5-5"/></svg>
         </button>
         <button class="btn" id="btn-close" title="Close">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7 12 12l6.3 6.3-1.4 1.4L10.6 13.4 4.3 19.7 2.9 18.3 9.2 12 2.9 5.7 4.3 4.3l6.3 6.3 6.3-6.3z"/></svg>
@@ -157,10 +205,25 @@
         <input id="alpha-range" type="range" min="20" max="100" step="1" value="100">
         <span id="alpha-val">100%</span>
     </div>
-    <div id="status">Waiting for stream…</div>
+    <div id="status">
+        <svg id="status-spin" viewBox="0 0 64 64" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" shape-rendering="geometricPrecision" aria-hidden="true" hidden>
+            <path class="spin-arc" d="M32 6 A26 26 0 1 1 6 32" stroke="#72767d"><animateTransform attributeName="transform" type="rotate" from="0 32 32" to="360 32 32" dur="1s" repeatCount="indefinite"/></path>
+            <path d="M28 24 L41 32 L28 40 Z" stroke="#b5bac1"/>
+        </svg>
+        <svg id="status-art" viewBox="0 0 64 64" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden>
+            <rect x="2" y="12" width="36" height="28" rx="4" stroke="#72767d"/>
+            <path d="M16 40 L14 52 M24 40 L26 52 M10 53 H30" stroke="#72767d"/>
+            <path d="M44 16 C44 9 48 4 53 4 C58 4 61 8 61 13 C61 18 57 20 54 23 C52 25 52 27 52 31" stroke="#b5bac1" stroke-width="3.2"/>
+            <circle cx="52" cy="42" r="2.6" fill="#b5bac1" stroke="none"/>
+        </svg>
+        <span id="status-text"></span>
+    </div>
     <div id="reconnect">
         <div class="card">
-            <div class="spinner"></div>
+            <svg class="spin-ico" viewBox="0 0 64 64" fill="none" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" shape-rendering="geometricPrecision" aria-hidden="true">
+                <path class="spin-arc" d="M32 6 A26 26 0 1 1 6 32"><animateTransform attributeName="transform" type="rotate" from="0 32 32" to="360 32 32" dur="1s" repeatCount="indefinite"/></path>
+                <path d="M28 24 L41 32 L28 40 Z" stroke="#b5bac1"/>
+            </svg>
             <svg class="pause-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 4h3.5v16H7zM13.5 4H17v16h-3.5z"/></svg>
             <div class="text">
                 <div class="title" id="reconnect-text">Reconnecting…</div>
@@ -169,49 +232,173 @@
         </div>
     </div>
 </div>
+<script>
+// First paint text for a reconnect carried over the reload (the main script takes over after this).
+try { const a = Number(sessionStorage.getItem("vet:reconnect")) || 0; if (a > 1) document.getElementById("reconnect-sub").textContent = "Attempt " + a; } catch (e) {}
+</script>
 
 <script>
 const API_BASE = "http://127.0.0.1:17842";
 // Which viewer this window is (several can be open); set by the overlay app.
 const viewKey = () => (window.__vetStreamParams || {}).key || "";
 const isLocal = () => !!(window.__vetStreamParams || {}).local;
+const elRoot = document.getElementById("root");
 const elView = document.getElementById("view");
 const elStatus = document.getElementById("status");
 const ctx = elView.getContext("2d", { alpha: false });
+// Render mode: ?render=canvas|video (default canvas); window.__vetSetRenderMode switches at runtime.
+const elVWrap = document.getElementById("vwrap");
+const elVPic = document.getElementById("vpic");
+const elVideo = document.getElementById("vview");
+const RVFC_OK = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+const RENDER_FROM_URL = new URLSearchParams(location.search).get("render");
+let videoMode = false;
+let rvfcId = 0;                  // requestVideoFrameCallback handle (0 = not armed)
+let curTrack = null, curStream = null;   // received (or local) track and its stream
+let vidPic = null;               // video mode: picture rect of the cropped frame, CSS px in the stage
 
 let pc = null;
-let readerLoopRunning = false;
+let readerSeq = 0;               // bumped on every reader start/stop; stale loops exit
+let activeReader = null;         // ReadableStreamDefaultReader of the canvas-mode track
 
 // Smooth playout. The source delivers frames in bursts (gaps of 200-350 ms
 // about once a second, with matching timestamps, so WebRTC's own jitter buffer
-// can't fix it). We copy every decoded frame into an ImageBitmap right away
-// (and close the VideoFrame so the decoder pool is never starved), queue the
-// bitmaps and show them at an even pace, keeping ~BUFFER_MS of frames in stock.
+// can't fix it). Every decoded VideoFrame is copied into an ImageBitmap right away
+// (downscaled to canvas size times zoom) and closed, so decoder buffers are released.
+// The bitmaps are shown at an even pace from a ~BUFFER_MS stock.
 const BUFFER_MS = 500;          // target stock; must exceed the largest burst gap (seen up to ~375 ms)
 const MAX_BUFFER_MS = 900;      // above this, drop old frames to catch up
-const queue = [];               // ImageBitmap[]
+const queue = [];               // { bmp: ImageBitmap, sx, sy, sw, sh } (crop rect in bitmap px)
 let srcFps = 60;                // measured input rate (EMA)
 const arrivals = [];
 let nextDue = 0;
 let playing = false;
 let raf = 0;
 function log(...args) { console.log("[video]", ...args); }
-function setStatus(txt) {
+const elStatusText = document.getElementById("status-text");
+// Icon per status: "spin" (waiting for stream) or "monitor" (connected, no frame yet).
+const statusArts = { spin: document.getElementById("status-spin"), monitor: document.getElementById("status-art") };
+// The only writer of #status: text, icon and visibility all go through here.
+let lastStatusKey = null;
+function setStatus(txt, art = "") {
     if (!elStatus) return;
+    // The reconnect card replaces the status text while it is up.
+    if (txt && elReconnect.classList.contains("show")) txt = "";
     if (!txt) elStatus.style.display = "none";
-    else { elStatus.style.display = "flex"; elStatus.textContent = txt; }
+    else { elStatus.style.display = "flex"; elStatusText.textContent = txt; }
+    // SVGElement has no reflected "hidden" property: set the attribute itself.
+    for (const k in statusArts) statusArts[k].toggleAttribute("hidden", !(txt && art === k));
+    const key = txt + "|" + art;
+    if (key !== lastStatusKey) {
+        lastStatusKey = key;
+        log("status", txt, art, "spin:", getComputedStyle(statusArts.spin).display,
+            "art:", getComputedStyle(statusArts.monitor).display,
+            statusArts.monitor.getBoundingClientRect().width);
+    }
+}
+// WebRTC path: waiting for the connection, then for the first frame; after that no text
+// (Discord sends almost no frames for a static picture, so a quiet stream is normal).
+function syncStatus() {
+    if (drewOnce) setStatus("");
+    else if (pc && pc.connectionState === "connected") setStatus("Connected, waiting for the first frame", "monitor");
+    else setStatus("Waiting for stream…", "spin");
 }
 
+// Picture rect (canvas pixels) of the last drawn frame, and while paused a copy of the
+// canvas, so a resize (which clears the canvas) can put the paused frame back.
+let lastPic = null;
+let pausedSnap = null;          // { canvas, rect }
+// Last drawn queue entry (bitmap kept open). Redrawn on resize and canvas clears, so the
+// picture never goes black; closed when replaced, on a new offer / pipeline stop.
+let lastShown = null;
+function takePausedSnap() {
+    if (!lastPic || !elView.width || !elView.height) { pausedSnap = null; return; }
+    const c = document.createElement("canvas");
+    c.width = elView.width;
+    c.height = elView.height;
+    c.getContext("2d").drawImage(elView, 0, 0);
+    pausedSnap = { canvas: c, rect: lastPic };
+}
+function drawPausedSnap() {
+    if (!pausedSnap) return;
+    const cw = elView.width, ch = elView.height;
+    const r = pausedSnap.rect;
+    const scale = Math.min(cw / r.w, ch / r.h);
+    const dw = r.w * scale, dh = r.h * scale;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, cw, ch);
+    ctx.drawImage(pausedSnap.canvas, r.x, r.y, r.w, r.h, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+}
+function setLastShown(e) {
+    if (lastShown && lastShown !== e) dropFrame(lastShown);
+    lastShown = e;
+}
+function closeLastShown() {
+    if (lastShown) dropFrame(lastShown);
+    lastShown = null;
+}
+// Paints the last shown entry again with the current crop and zoom (after a canvas clear).
+function redrawLastShown() {
+    const e = lastShown;
+    if (!e) return;
+    const c = cropFor(e.vw, e.vh);
+    const fx = e.bmp.width / e.vw, fy = e.bmp.height / e.vh;
+    try { paintFrame(e.bmp, c.x * fx, c.y * fy, c.w * fx, c.h * fy); } catch (err) { log("redraw error:", err.message); }
+}
+// The stage (the window) has the same size in both modes; the canvas may be hidden in video mode.
+function stageW() { return Math.max(1, elRoot.clientWidth); }
+function stageH() { return Math.max(1, elRoot.clientHeight); }
 function fitCanvas() {
-    const w = Math.max(1, elView.clientWidth);
-    const h = Math.max(1, elView.clientHeight);
+    const w = stageW();
+    const h = stageH();
     if (elView.width !== w || elView.height !== h) {
         elView.width = w;
         elView.height = h;
+        if (pausedSnap) drawPausedSnap();
+        else redrawLastShown();
     }
 }
 window.addEventListener("resize", fitCanvas);
+window.addEventListener("resize", () => { if (videoMode) layoutVideo(); });
 fitCanvas();
+
+// Tell the overlay how many pixels this view needs, so it can ask the plugin for a
+// matching stream size. Sent on start and on resize, debounced, and only when the
+// size changed by more than 10%.
+let reportedSize = { w: 0, h: 0 };
+let sizeTimer = null;
+// force: send even if unchanged (used on offer / connected / first frame, because the
+// plugin drops the size if its pump is not running yet).
+// Zoom-aware: when zoomed by z, the size is multiplied by z so the plugin delivers enough
+// resolution for the visible region (it caps at the source size, never upscales).
+function sendSize(force = false) {
+    const dpr = window.devicePixelRatio || 1;
+    const z = zoom.z;
+    const w = Math.round(stageW() * dpr * z), h = Math.round(stageH() * dpr * z);
+    if (!w || !h) return;
+    const changed = !reportedSize.w || Math.abs(w - reportedSize.w) > reportedSize.w * 0.1
+        || Math.abs(h - reportedSize.h) > reportedSize.h * 0.1;
+    if (!changed && !force) return;
+    reportedSize = { w, h };
+    fetch(API_BASE + "/video/size", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: viewKey(), w, h })
+    }).catch(() => {});
+}
+function sendSizeSoon() {
+    clearTimeout(sizeTimer);
+    sizeTimer = setTimeout(sendSize, 600);
+}
+// Zoom change (also a reset to 1): forced send, ignores the 10% rule, debounced 300 ms.
+let zoomSizeTimer = null;
+function sendSizeZoomSoon() {
+    clearTimeout(zoomSizeTimer);
+    zoomSizeTimer = setTimeout(() => sendSize(true), 300);
+}
+window.addEventListener("resize", sendSizeSoon);
+sendSizeSoon();
+
 
 // Tell the overlay the stream's aspect ratio so the window keeps it (no black bars).
 let reportedAspect = 0;
@@ -231,15 +418,19 @@ function reportAspect(w, h) {
 // To avoid cropping dark scenes, a crop is accepted only when:
 //   - the bars are symmetric (top≈bottom or left≈right), and
 //   - what remains has a standard aspect ratio (16:9, 21:9, 4:3, ...), and
-//   - the same result is seen 3 probes in a row (~4.5 s).
-// Once set, the crop is NOT dropped in dark scenes; it is dropped only when
-// picture content shows up inside the bar area, or the resolution changes.
+//   - the same result is seen 3 probes in a row (~15 s).
+// Detection probes run every PROBE_MS. Once the crop is accepted it is settled and the
+// probe drops to SETTLED_PROBE_MS: it only checks whether picture shows up in the bars
+// (then the crop is dropped), and it is also dropped on a resolution change.
+const PROBE_MS = 5000;
+const SETTLED_PROBE_MS = 15000;
 const probe = document.createElement("canvas");
 const probeCtx = probe.getContext("2d", { willReadFrequently: true });
 let crop = null;            // { x, y, w, h, vw, vh } in source pixels
 let cropCandidate = null;
 let cropHits = 0;
 let barContentHits = 0;
+let cropSettled = false;    // true once the crop passed 3 consecutive probes
 let lastProbeAt = 0;
 const STD_ASPECTS = [16/9, 21/9, 64/27, 32/9, 4/3, 16/10];
 
@@ -304,12 +495,12 @@ function sameCrop(a, b) {
 }
 
 function probeCrop(frame, vw, vh) {
-    if (crop && (crop.vw !== vw || crop.vh !== vh)) { crop = null; log("crop reset: resolution changed"); }
+    if (crop && (crop.vw !== vw || crop.vh !== vh)) { crop = null; cropSettled = false; barContentHits = 0; log("crop reset: resolution changed"); }
     const { data, pw, ph } = readProbe(frame, vw, vh);
-    if (crop) {
-        // Keep the crop through dark scenes; drop it only if the bars show picture.
+    if (cropSettled) {
+        // Keep the crop through dark scenes; drop it only if the bars show picture (2 probes in a row).
         if (barsHaveContent(data, pw, ph)) {
-            if (++barContentHits >= 2) { crop = null; barContentHits = 0; log("crop removed: content in bar area"); }
+            if (++barContentHits >= 2) { crop = null; cropSettled = false; barContentHits = 0; log("crop removed: content in bar area"); }
         } else barContentHits = 0;
         return;
     }
@@ -317,7 +508,7 @@ function probeCrop(frame, vw, vh) {
     if (!c) { cropCandidate = null; cropHits = 0; return; }
     if (sameCrop(c, cropCandidate)) cropHits++; else { cropCandidate = c; cropHits = 1; }
     if (cropHits >= 3) {
-        crop = c; cropHits = 0;
+        crop = c; cropHits = 0; cropSettled = true;
         log("crop", `${c.w}x${c.h}+${c.x}+${c.y}`, "of", `${vw}x${vh}`);
     }
 }
@@ -334,31 +525,46 @@ const elZoomBadge = document.getElementById("zoom-badge");
 
 // By the window's real size, not the preview flag: any stream window big
 // enough to look into can zoom (the first one may sit in the preview place).
-const ZOOM_MIN_WIDTH = 300;
+const ZOOM_MIN_WIDTH = 120;
 function zoomAllowed() { return window.innerWidth >= ZOOM_MIN_WIDTH; }
 window.addEventListener("resize", () => refreshZoomable());
 
-// canvas pixel -> 0..1 position in the shown (cropped) frame at zoom 1
+// Pointer -> 0..1 position inside the letterboxed picture (lastPic = the drawn rect
+// in canvas pixels), clamped to the picture. Mapping uses the picture, not the canvas,
+// so black bars (small / tiled windows) don't skew the point.
+// Units: canvas pixels in canvas mode, CSS px in video mode (P is the picture in the same units).
+function pictureFraction(clientX, clientY) {
+    const { r, uw, uh, P } = surfaceInfo();
+    const x = (clientX - r.left) * uw / r.width;
+    const y = (clientY - r.top) * uh / r.height;
+    return {
+        px: Math.max(0, Math.min(1, (x - P.x) / P.w)),
+        py: Math.max(0, Math.min(1, (y - P.y) / P.h)),
+    };
+}
+// Pointer -> position in the shown (cropped) frame, in 0..1 frame units.
+// Visible window = 1/zoom of the frame, centred on zoom.cx/cy and kept inside the frame.
 function frameFraction(clientX, clientY) {
-    const r = elView.getBoundingClientRect();
-    const px = (clientX - r.left) / r.width, py = (clientY - r.top) / r.height;
-    // current visible window in 0..1 frame space
-    const w = 1 / zoom.z, h = 1 / zoom.z;
+    const { px, py } = pictureFraction(clientX, clientY);
+    const w = 1 / zoom.z;
     const left = Math.max(0, Math.min(1 - w, zoom.cx - w / 2));
-    const top  = Math.max(0, Math.min(1 - h, zoom.cy - h / 2));
-    return { fx: left + px * w, fy: top + py * h, px, py };
+    const top  = Math.max(0, Math.min(1 - w, zoom.cy - w / 2));
+    return { fx: left + px * w, fy: top + py * w, px, py };
 }
 
 function setZoom(z, cx, cy, save = true) {
+    const prevZ = zoom.z;
     zoom.z = Math.max(1, Math.min(ZOOM_MAX, z));
     if (zoom.z <= 1.001) { zoom.z = 1; }
     const half = 0.5 / zoom.z;
     zoom.cx = Math.max(half, Math.min(1 - half, cx));
     zoom.cy = Math.max(half, Math.min(1 - half, cy));
-    elView.classList.toggle("zoomed", zoom.z > 1);
+    setSurfaceClass("zoomed", zoom.z > 1);
     elZoomBadge.textContent = zoom.z.toFixed(1).replace(/\.0$/, "") + "×";
     elZoomBadge.classList.toggle("show", zoom.z > 1);
     if (save) saveZoomSoon();
+    if (zoom.z !== prevZ) sendSizeZoomSoon();
+    if (videoMode) layoutVideo();
 }
 
 let zoomSaveTimer = null;
@@ -371,18 +577,27 @@ function saveZoomSoon() {
 
 function refreshZoomable() {
     const ok = zoomAllowed();
-    elView.classList.toggle("zoomable", ok);
+    setSurfaceClass("zoomable", ok);
     if (!ok && zoom.z > 1) setZoom(1, 0.5, 0.5, false);
 }
 
 // Called by the overlay: preview on/off, and the saved zoom for this streamer.
-window.__vetSetPreview = (on) => { window.__vetPreview = !!on; refreshZoomable(); };
+// Size toggle icon/title show the action: small window -> "enlarge" arrows, large -> "shrink" arrows.
+const PIN_ICON_SHRINK = "M9 4v5H4M4 4l5 5M15 20v-5h5M20 20l-5-5";
+const PIN_ICON_ENLARGE = "M15 4h5v5M20 4l-6 6M9 20H4v-5M4 20l6-6";
+function syncPinBtn() {
+    const small = !!window.__vetPreview;
+    const btn = document.getElementById("btn-pin");
+    btn.title = small ? "Enlarge" : "Shrink to a small corner";
+    document.getElementById("pin-path").setAttribute("d", small ? PIN_ICON_ENLARGE : PIN_ICON_SHRINK);
+}
+window.__vetSetPreview = (on) => { window.__vetPreview = !!on; syncPinBtn(); refreshZoomable(); };
 window.__vetSetZoom = (zs) => {
     if (zs && zoomAllowed()) setZoom(Number(zs.z) || 1, Number(zs.cx) || 0.5, Number(zs.cy) || 0.5, false);
 };
 
 let dragStart = null;
-elView.addEventListener("mousedown", (e) => {
+for (const el of [elView, elVWrap]) el.addEventListener("mousedown", (e) => {
     if (e.button !== 0 || !zoomAllowed()) return;
     dragStart = { x: e.clientX, y: e.clientY, cx: zoom.cx, cy: zoom.cy, moved: false };
 });
@@ -391,21 +606,23 @@ window.addEventListener("mousemove", (e) => {
     const dx = e.clientX - dragStart.x, dy = e.clientY - dragStart.y;
     if (!dragStart.moved && Math.hypot(dx, dy) < 4) return;
     dragStart.moved = true;
-    elView.classList.add("panning");
-    const r = elView.getBoundingClientRect();
-    setZoom(zoom.z, dragStart.cx - dx / r.width / zoom.z, dragStart.cy - dy / r.height / zoom.z);
+    setSurfaceClass("panning", true);
+    // drag distance measured against the drawn picture (CSS px), so 1 px = the same frame move as the picture
+    const { r, uw, uh, P } = surfaceInfo();
+    const picW = P.w * r.width / uw, picH = P.h * r.height / uh;
+    setZoom(zoom.z, dragStart.cx - dx / picW / zoom.z, dragStart.cy - dy / picH / zoom.z);
 });
 window.addEventListener("mouseup", (e) => {
     const d = dragStart;
     dragStart = null;
-    elView.classList.remove("panning");
+    setSurfaceClass("panning", false);
     if (!d || d.moved || e.button !== 0 || !zoomAllowed()) return;
-    if (e.target !== elView) return;
+    if (!isSurfaceTarget(e.target)) return;
     if (zoom.z > 1) { setZoom(1, 0.5, 0.5); return; }
     const { fx, fy } = frameFraction(e.clientX, e.clientY);
     setZoom(2, fx, fy);
 });
-elView.addEventListener("wheel", (e) => {
+for (const el of [elView, elVWrap]) el.addEventListener("wheel", (e) => {
     if (!zoomAllowed()) return;
     e.preventDefault();
     const { fx, fy, px, py } = frameFraction(e.clientX, e.clientY);
@@ -415,19 +632,20 @@ elView.addEventListener("wheel", (e) => {
     setZoom(z, fx - (px - 0.5) * w, fy - (py - 0.5) * w);
 }, { passive: false });
 
-function drawOne(frame) {
-    const vw = frame.displayWidth || frame.codedWidth || frame.width;
-    const vh = frame.displayHeight || frame.codedHeight || frame.height;
-    if (!vw || !vh) return;
+// The crop that applies to a frame of this size (ignored if it was measured on another resolution).
+function cropFor(vw, vh) {
+    return crop && crop.vw === vw && crop.vh === vh ? crop : { x: 0, y: 0, w: vw, h: vh };
+}
 
-    const now = performance.now();
-    if (now - lastProbeAt > 1500) {
-        lastProbeAt = now;
-        try { probeCrop(frame, vw, vh); } catch (e) {}
-    }
+function drawEntry(e) {
+    paintFrame(e.bmp, e.sx, e.sy, e.sw, e.sh);
+    if (!drewOnce) markFirstFrame();
+    unpauseOnLiveLocalFrame();
+}
 
-    let sx = crop ? crop.x : 0, sy = crop ? crop.y : 0;
-    let sw = crop ? crop.w : vw, sh = crop ? crop.h : vh;
+// Paints the zoomed part of the source rect (sx, sy, sw, sh) into the canvas.
+// src: ImageBitmap (canvas mode) or the <video> element (paused snapshot).
+function paintFrame(src, sx, sy, sw, sh) {
     reportAspect(sw, sh);
     if (zoom.z > 1) {
         const zw = sw / zoom.z, zh = sh / zoom.z;
@@ -444,26 +662,46 @@ function drawOne(frame) {
         ctx.fillStyle = "#000";
         ctx.fillRect(0, 0, cw, ch);
     }
-    ctx.drawImage(frame, sx, sy, sw, sh, dx, dy, dw, dh);
+    lastPic = { x: dx, y: dy, w: dw, h: dh };
+    ctx.drawImage(src, sx, sy, sw, sh, dx, dy, dw, dh);
 }
 
-function targetFrames() { return Math.max(4, Math.round(BUFFER_MS * srcFps / 1000)); }
+function markFirstFrame() {
+    drewOnce = true;
+    setFfStep(0);
+    log("first frame");
+    sendSize(true);
+    if (!isLocal()) syncStatus();
+    syncPausedVisuals();
+}
+// My own stream paused for the local reason (source not listed) while a live frame still arrives:
+// clear the plate at once, so it never sits over a live picture. Remote pauses are not touched.
+function unpauseOnLiveLocalFrame() {
+    if (streamPaused && pausedLocal && isLocal()) window.__vetSetPaused(false);
+}
 
+function maxFrames() { return Math.round(MAX_BUFFER_MS * srcFps / 1000); }
+function targetFrames() { return Math.max(4, Math.round(BUFFER_MS * srcFps / 1000)); }
+function dropFrame(e) { try { e.bmp.close(); } catch (err) {} }
+function closeVF(f) { try { f.close(); } catch (e) {} }
+
+// Runs only while frames are queued: it is re-armed by enqueueFrame() and by itself
+// while the queue has frames, and stops once the queue is empty.
 function tick(now) {
-    raf = requestAnimationFrame(tick);
+    raf = 0;
     bump("raf");
     const target = targetFrames();
-    const maxFrames = Math.round(MAX_BUFFER_MS * srcFps / 1000);
+    const max = maxFrames();
 
-    while (queue.length > maxFrames) { try { queue.shift().close(); } catch (e) {} gap.dropped++; }
+    while (queue.length > max) { dropFrame(queue.shift()); gap.dropped++; }
 
     if (!playing) {
-        if (queue.length < target) return;
+        if (queue.length < target) return;      // enqueueFrame() wakes the loop
         playing = true;
         nextDue = now;
     }
     if (queue.length === 0) { playing = false; gap.underruns++; return; }
-    if (now < nextDue) return;
+    if (now < nextDue) { raf = requestAnimationFrame(tick); return; }
 
     // Base step from the source rate, nudged by how far the stock is from target
     // so the buffer neither drains nor grows over time.
@@ -473,22 +711,62 @@ function tick(now) {
     nextDue += step;
     if (now - nextDue > 100) nextDue = now + step;   // fell far behind (tab hidden etc.)
 
-    const bmp = queue.shift();
-    const t0 = performance.now();
-    try { drawOne(bmp); } catch (e) { log("draw error:", e.message); }
-    gap.slowDraw = Math.max(gap.slowDraw, performance.now() - t0);
-    bump("draw");
-    try { bmp.close(); } catch (e) {}
+    const entry = queue.shift();
+    let shown = false;
+    if (!document.hidden) {
+        const t0 = performance.now();
+        try { drawEntry(entry); shown = true; } catch (e) { log("draw error:", e.message); }
+        gap.slowDraw = Math.max(gap.slowDraw, performance.now() - t0);
+        bump("draw");
+    }
+    // A drawn entry stays open as the last shown picture; anything else is closed.
+    if (shown) setLastShown(entry);
+    else dropFrame(entry);
+
+    if (queue.length) raf = requestAnimationFrame(tick);
+    else { playing = false; gap.underruns++; }
 }
 
 function startPlayout() { if (!raf) raf = requestAnimationFrame(tick); }
 
 function clearQueue() {
-    while (queue.length) { try { queue.shift().close(); } catch (e) {} }
+    while (queue.length) dropFrame(queue.shift());
     playing = false;
 }
 
-async function enqueueFrame(frame) {
+// Hidden or minimized: nothing is drawn and incoming frames are closed at once.
+// The last drawn picture stays on the canvas for resume.
+document.addEventListener("visibilitychange", () => {
+    if (document.hidden) clearQueue();
+    else startPlayout();
+});
+
+// Copies a VideoFrame into a bitmap sized for the canvas at the current zoom (never up),
+// probes the crop on the cadence, and closes the VideoFrame at once. Returns the queue entry.
+async function copyFrame(frame) {
+    const vw = frame.displayWidth || frame.codedWidth || frame.width;
+    const vh = frame.displayHeight || frame.codedHeight || frame.height;
+    if (!vw || !vh) { closeVF(frame); return null; }
+    const now = performance.now();
+    if (now - lastProbeAt > (cropSettled ? SETTLED_PROBE_MS : PROBE_MS)) {
+        lastProbeAt = now;
+        try { probeCrop(frame, vw, vh); } catch (e) {}
+    }
+    const c = cropFor(vw, vh);
+    // Scale so the cropped picture is canvas size * zoom: enough for the zoomed view, no more.
+    const cw = elView.width || c.w, ch = elView.height || c.h;
+    const s = Math.min(1, cw * zoom.z / c.w, ch * zoom.z / c.h);
+    const bw = Math.max(1, Math.round(vw * s)), bh = Math.max(1, Math.round(vh * s));
+    let bmp = null;
+    try { bmp = await createImageBitmap(frame, { resizeWidth: bw, resizeHeight: bh, resizeQuality: "medium" }); }
+    catch (e) { log("createImageBitmap:", e.message); }
+    finally { closeVF(frame); }
+    if (!bmp) return null;
+    const fx = bmp.width / vw, fy = bmp.height / vh;      // bitmap px per source px
+    return { bmp, sx: c.x * fx, sy: c.y * fy, sw: c.w * fx, sh: c.h * fy, vw, vh };
+}
+
+async function enqueueFrame(frame, seq) {
     const now = performance.now();
     // Input rate = frames that arrived in the last 2 s (bursts average out).
     arrivals.push(now);
@@ -497,14 +775,14 @@ async function enqueueFrame(frame) {
         const measured = (arrivals.length - 1) * 1000 / (now - arrivals[0]);
         srcFps = Math.max(10, Math.min(120, measured));
     }
-    let bmp = null;
-    try { bmp = await createImageBitmap(frame); }
-    catch (e) { log("createImageBitmap:", e.message); }
-    finally { try { frame.close(); } catch (e) {} }
-    if (!bmp) return;
-    queue.push(bmp);
-    lastFrameAt = performance.now();
-    if (reconnecting) endReconnect();
+    lastFrameAt = now;                          // stall watchdog still sees frames while hidden
+    if (reconnecting || document.documentElement.hasAttribute("data-reconnect")) endReconnect();
+    if (document.hidden) { closeVF(frame); return; }
+    const entry = await copyFrame(frame);       // the reader awaits this, so order is kept
+    if (!entry) return;
+    if (seq !== readerSeq || document.hidden) { dropFrame(entry); return; }
+    while (queue.length >= maxFrames()) { dropFrame(queue.shift()); gap.dropped++; }
+    queue.push(entry);
     startPlayout();
 }
 
@@ -514,31 +792,215 @@ async function startReader(track) {
         setStatus("WebCodecs unavailable");
         return;
     }
-    if (readerLoopRunning) return;
-    readerLoopRunning = true;
+    stopReader();                       // a previous reader (other track or mode) goes first
+    const seq = ++readerSeq;
     const processor = new MediaStreamTrackProcessor({ track, maxBufferSize: 1 });
     const reader = processor.readable.getReader();
+    activeReader = reader;
     log("reader started");
-    setStatus("");
     try {
         while (true) {
             const { done, value: frame } = await reader.read();
             if (done) { log("reader done"); break; }
+            if (seq !== readerSeq) { closeVF(frame); break; }
             framesFromReader++;
             bump("reader");
-            enqueueFrame(frame);
+            await enqueueFrame(frame, seq);
         }
     } catch (e) {
         log("reader error:", e.message);
     } finally {
-        readerLoopRunning = false;
+        if (activeReader === reader) activeReader = null;
     }
 }
+function stopReader() {
+    const r = activeReader;
+    activeReader = null;
+    readerSeq++;
+    if (r) { try { r.cancel(); } catch (e) {} }
+}
 
-// Diagnostics: once a second log what the receiver got/decoded/froze.
+// ---------------------------------------------------------------------
+// Video render mode: the stream plays in <video> (srcObject), no per-frame JS.
+// Layout is CSS: #vpic clips to the picture rect (black bars stay outside it), #vview is sized
+// so the cropped frame fills that rect, and zoom is a CSS transform on #vview. Frame arrival
+// (first frame, silence watchdog) comes from requestVideoFrameCallback, plus a 1 s check of the
+// decoded-frame counter (rVFC does not run while the page is hidden).
+// ---------------------------------------------------------------------
+function useVideoSurface() { return videoMode && !streamPaused; }   // the video is what is on screen
+function surfaceInfo() {
+    const vid = useVideoSurface();
+    const r = (vid ? elVWrap : elView).getBoundingClientRect();
+    const uw = vid ? r.width : elView.width, uh = vid ? r.height : elView.height;
+    const P = (vid ? vidPic : lastPic) || { x: 0, y: 0, w: uw, h: uh };
+    return { r, uw, uh, P };
+}
+function isSurfaceTarget(t) { return t === elView || elVWrap.contains(t); }
+function setSurfaceClass(name, on) { elView.classList.toggle(name, on); elVWrap.classList.toggle(name, on); }
+function syncSurfaceClasses() { setSurfaceClass("zoomable", zoomAllowed()); setSurfaceClass("zoomed", zoom.z > 1); }
+
+function applyRenderLayout() {
+    const showVideo = useVideoSurface();
+    elVWrap.classList.toggle("on", showVideo);
+    elView.classList.toggle("off", showVideo);
+    syncSurfaceClasses();
+    if (showVideo) layoutVideo();
+}
+
+// Picture rect of the (cropped) frame in the stage, the <video> box in the clip, and the zoom transform.
+// Same zoom state as canvas mode: visible window = 1/z of the frame, anchored at cx/cy.
+function layoutVideo() {
+    if (!videoMode) return;
+    const W = stageW(), H = stageH();
+    const vw = elVideo.videoWidth, vh = elVideo.videoHeight;
+    if (!vw || !vh) {
+        // Size unknown until metadata: the <video> still gets a full-stage box (object-fit contain),
+        // a 0x0 element is not decoded or presented, so no frame would ever come.
+        vidPic = { x: 0, y: 0, w: W, h: H };
+        elVPic.style.left = "0px";
+        elVPic.style.top = "0px";
+        elVPic.style.width = W + "px";
+        elVPic.style.height = H + "px";
+        elVideo.style.left = "0px";
+        elVideo.style.top = "0px";
+        elVideo.style.width = W + "px";
+        elVideo.style.height = H + "px";
+        elVideo.style.transform = "none";
+        return;
+    }
+    const c = cropFor(vw, vh);
+    const sx = c.x, sy = c.y, sw = c.w, sh = c.h;
+    const k = Math.min(W / sw, H / sh);                  // CSS px per source px (contain fit)
+    const PW = sw * k, PH = sh * k, PX = (W - PW) / 2, PY = (H - PH) / 2;
+    vidPic = { x: PX, y: PY, w: PW, h: PH };
+    reportAspect(sw, sh);
+    elVPic.style.left = PX + "px";
+    elVPic.style.top = PY + "px";
+    elVPic.style.width = PW + "px";
+    elVPic.style.height = PH + "px";
+    // Whole source, scaled by k, offset so the crop origin sits at the clip's top-left.
+    const BX = -sx * k, BY = -sy * k;
+    elVideo.style.left = BX + "px";
+    elVideo.style.top = BY + "px";
+    elVideo.style.width = vw * k + "px";
+    elVideo.style.height = vh * k + "px";
+    // Zoom (origin 0 0): picture point f (0..1 of the frame) -> clip x = z*PW*(f - L).
+    const z = zoom.z, w = 1 / z;
+    const L = Math.max(0, Math.min(1 - w, zoom.cx - w / 2));
+    const T = Math.max(0, Math.min(1 - w, zoom.cy - w / 2));
+    const tx = (z - 1) * BX - L * z * PW;
+    const ty = (z - 1) * BY - T * z * PH;
+    elVideo.style.transform = "translate(" + tx + "px, " + ty + "px) scale(" + z + ")";
+}
+
+// Paints the current video frame into the canvas (used for the paused snapshot and saved last frame).
+function paintVideoNow() {
+    fitCanvas();
+    if (!elVideo.videoWidth || elVideo.readyState < 2) return false;
+    const c = cropFor(elVideo.videoWidth, elVideo.videoHeight);
+    paintFrame(elVideo, c.x, c.y, c.w, c.h);
+    return true;
+}
+function blankCanvas() {
+    fitCanvas();
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, elView.width, elView.height);
+    lastPic = null;
+    if (lastShown) redrawLastShown();     // a canvas clear keeps the last picture
+}
+
+function startVideoPlayback() {
+    if (!videoMode || !curStream) return;
+    if (elVideo.srcObject !== curStream) elVideo.srcObject = curStream;
+    if (streamPaused) return;
+    const p = elVideo.play();
+    if (p && p.then) p.then(() => log("video mode: play ok"), (e) => log("video mode: play failed:", e.message));
+    if (!rvfcId) rvfcId = elVideo.requestVideoFrameCallback(onVideoFrame);
+}
+function stopVideoPlayback() {
+    if (rvfcId) { try { elVideo.cancelVideoFrameCallback(rvfcId); } catch (e) {} rvfcId = 0; }
+    try { elVideo.pause(); } catch (e) {}
+}
+// Re-armed on every presented frame; the callback itself does only the bookkeeping.
+function onVideoFrame() {
+    rvfcId = 0;
+    if (!videoMode || streamPaused) return;
+    noteVideoFrame("rVFC");
+    rvfcId = elVideo.requestVideoFrameCallback(onVideoFrame);
+}
+// A frame reached the screen: the bookkeeping drawEntry() does in canvas mode.
+// via: what saw it (rVFC, or the decoded-frame counter, which is the fallback).
+function noteVideoFrame(via = "rVFC") {
+    lastFrameAt = performance.now();
+    if (reconnecting || document.documentElement.hasAttribute("data-reconnect")) endReconnect();
+    if (!drewOnce) { log("video mode: first frame via", via); markFirstFrame(); }
+    unpauseOnLiveLocalFrame();
+}
+// Decoded-frame counter: a frame arrival even when rVFC does not fire (hidden page, odd states).
+let lastVidTotal = 0;
+function checkVideoFrames(via) {
+    if (!videoMode || !elVideo.srcObject || streamPaused) return;
+    try {
+        const total = elVideo.getVideoPlaybackQuality().totalVideoFrames;
+        if (total !== lastVidTotal) {
+            lastVidTotal = total;
+            if (total > 0) noteVideoFrame(via);
+        }
+    } catch (e) {}
+}
+
+// Starts the pipeline of the current mode on the current track.
+function attachSource() {
+    if (!curTrack) return;
+    if (videoMode) startVideoPlayback();
+    else startReader(curTrack);
+}
+function stopPipeline() {
+    stopReader();
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    clearQueue();
+    closeLastShown();
+    stopVideoPlayback();
+    elVideo.srcObject = null;
+}
+function setRenderMode(mode, initial = false) {
+    let want = mode === "canvas" ? "canvas" : "video";
+    if (want === "video" && !RVFC_OK) { log("requestVideoFrameCallback missing: canvas mode"); want = "canvas"; }
+    if (!initial && want === (videoMode ? "video" : "canvas")) return;
+    stopPipeline();
+    videoMode = want === "video";
+    if (!videoMode) fitCanvas();
+    applyRenderLayout();
+    log("render mode", want);
+    if (curTrack) attachSource();
+}
+window.__vetSetRenderMode = (mode) => setRenderMode(mode);
+
+// Video mode: 1 s tick. Frame progress while hidden, and the crop probe on the canvas cadence
+// (drawn from the <video> element, on a small offscreen canvas).
+setInterval(() => {
+    if (!videoMode || !elVideo.srcObject || streamPaused) return;
+    checkVideoFrames("quality");
+    const now = performance.now();
+    if (!document.hidden && elVideo.readyState >= 2 && elVideo.videoWidth
+        && now - lastProbeAt > (cropSettled ? SETTLED_PROBE_MS : PROBE_MS)) {
+        lastProbeAt = now;
+        try { probeCrop(elVideo, elVideo.videoWidth, elVideo.videoHeight); } catch (e) {}
+        layoutVideo();
+    }
+}, 1000);
+
+elVideo.addEventListener("loadedmetadata", () => layoutVideo());
+elVideo.addEventListener("resize", () => layoutVideo());
+elVideo.addEventListener("loadeddata", () => { layoutVideo(); checkVideoFrames("loadeddata"); });
+elVideo.addEventListener("playing", () => { layoutVideo(); checkVideoFrames("playing"); });
+
+// Diagnostics: every STATS_MS log what the receiver got/decoded/froze.
+// Diagnostics only: stall and first-frame logic use their own timers (watchdog below).
+const STATS_MS = 5000;
 let statsTimer = null;
 let framesFromReader = 0;
-// Largest gap (ms) between consecutive frames per second, at each stage:
+// Largest gap (ms) between consecutive frames per interval, at each stage:
 // reader = frame came out of the decoder, draw = frame painted, raf = rAF ticks.
 const gap = { dropped: 0, underruns: 0, reader: 0, draw: 0, raf: 0, lastReader: 0, lastDraw: 0, lastRaf: 0, slowDraw: 0 };
 function bump(kind) {
@@ -581,17 +1043,41 @@ function startStatsLog() {
             framesFromReader = 0;
             gap.reader = gap.draw = gap.raf = gap.slowDraw = gap.underruns = gap.dropped = 0;
         } catch (e) {}
-    }, 1000);
+    }, STATS_MS);
 }
 
 // ---------------------------------------------------------------------
-// Stall watchdog: no frames for STALL_MS (or connection lost) -> dim the
-// last frame, show a spinner, and ask the overlay to reconnect. The overlay
-// only forwards it to the plugin while the stream is still live; otherwise
-// it closes this window on its own.
+// Stall watchdog -> dim the last frame, show a spinner, and ask the overlay to
+// reconnect. WebRTC path: only when (a) no frame was ever drawn and the connection
+// has been "connected" for noFirstFrameWait(), or (b) the peer connection is
+// failed/disconnected/closed (or ICE failed) for PC_BAD_MS. Frames stopping after
+// the first one while connected is NOT a stall (static pictures send few frames).
+// Local capture path: no first frame for noFirstFrameWait() after capture start (silence
+// after the first frame is normal, window capture sends on change only). The overlay only forwards the
+// reconnect to the plugin while the stream is still live; otherwise it closes
+// this window on its own.
 // ---------------------------------------------------------------------
-const STALL_MS = 3000;
+const SILENT_MS = 15000;            // WebRTC: no new frame this long after the first one -> quiet reconnect (last frame stays)
+const STALL_MS = 3000;            // resume-reconnect marker only (see __vetResumeReconnect)
+// Connected (or local capture started) but no frame ever drawn: how long to wait before reconnecting.
+// First connection of this viewer: 45 s. After a no-frame reconnect (step >= 1): 8 s, since reconnects
+// usually succeed fast. Step resets once a frame is drawn. Kept in sessionStorage so it survives the reload done on reconnect.
+const FF_STEP_KEY = "vet:ffStep";
+let ffStepMem = 0;
+function ffStep() {
+    try { return Number(sessionStorage.getItem(FF_STEP_KEY)) || 0; } catch (e) { return ffStepMem; }
+}
+function setFfStep(n) {
+    ffStepMem = n;
+    try { sessionStorage.setItem(FF_STEP_KEY, String(n)); } catch (e) {}
+}
+function noFirstFrameWait() { return ffStep() >= 1 ? 8000 : 45000; }
+let localStartedAt = 0;             // when the local capture last started (0 = not)
+let localStallFired = false;        // no-first-frame trigger fires once per capture start
+const PC_BAD_MS = 3000;             // connection failed/disconnected/closed
 const RECONNECT_EVERY_MS = 12000;   // each attempt reloads this page and re-watches from scratch
+let connectedSince = 0;             // when the WebRTC connection became "connected" (0 = not)
+let badPcSince = 0;                 // when the connection went bad (0 = fine)
 let lastFrameAt = 0;
 let reconnecting = false;
 let reconnectSince = 0;
@@ -599,19 +1085,56 @@ let lastReconnectReq = 0;
 let reconnectAttempts = 0;
 const elReconnect = document.getElementById("reconnect");
 const elReconnectSub = document.getElementById("reconnect-sub");
+// "Reconnect in progress" (attempt number) survives the reload done on each attempt.
+// Set while reconnecting, cleared on resume, pause or close. Read at load (head script + init below).
+const RECONNECT_KEY = "vet:reconnect";
+const QUIET_KEY = "vet:quiet";          // "1" = started by the silence rule: no card unless the attempt fails
+let reconnectQuiet = false;
+function setReconnectFlag(n, quiet = false) {
+    try {
+        if (n) { sessionStorage.setItem(RECONNECT_KEY, String(n)); sessionStorage.setItem(QUIET_KEY, quiet ? "1" : "0"); }
+        else { sessionStorage.removeItem(RECONNECT_KEY); sessionStorage.removeItem(QUIET_KEY); }
+    } catch (e) {}
+}
+function readReconnectFlag() {
+    try { return Number(sessionStorage.getItem(RECONNECT_KEY)) || 0; } catch (e) { return 0; }
+}
+function readQuietFlag() {
+    try { return sessionStorage.getItem(QUIET_KEY) === "1"; } catch (e) { return false; }
+}
 
 // Discord paused the stream (streamer's window minimized): show the last frame
 // blurred with a quiet note; no spinner, no reconnecting.
+// Blur applies only once a frame was drawn; before that the window is black + the plate.
 let streamPaused = false;
+let pausedLocal = false;    // the current pause is my own local stream's (own:true from the overlay)
+let drewOnce = false;
+function syncPausedVisuals() {
+    elView.classList.toggle("paused", streamPaused && drewOnce);
+}
 window.__vetSetPaused = (on, own) => {
     streamPaused = !!on;
+    pausedLocal = streamPaused && !!own;
     elReconnect.classList.toggle("paused", streamPaused);
+    if (streamPaused && videoMode) {
+        // Video mode: the paused picture is the current frame, copied once onto the canvas.
+        if (!paintVideoNow()) blankCanvas();
+        stopVideoPlayback();
+    }
+    applyRenderLayout();
+    syncPausedVisuals();
     if (streamPaused) {
+        takePausedSnap();                     // copied once, here; resizes redraw it
         reconnecting = false;
+        reconnectQuiet = false;
+        setReconnectFlag(0);
+        setStatus("");
         document.getElementById("reconnect-text").textContent = "Stream paused";
         elReconnectSub.textContent = own ? "Your streamed window is minimized" : "The streamer minimized their window";
         elReconnect.classList.add("show");
     } else {
+        pausedSnap = null;
+        if (videoMode) startVideoPlayback();
         document.getElementById("reconnect-text").textContent = "Reconnecting…";
         elReconnectSub.textContent = "";
         if (!reconnecting) elReconnect.classList.remove("show");
@@ -619,14 +1142,16 @@ window.__vetSetPaused = (on, own) => {
     }
 };
 
-function startReconnect(reason) {
+function startReconnect(reason, quiet = false) {
     if (streamPaused) return;
     if (!reconnecting) {
         reconnecting = true;
+        reconnectQuiet = !!quiet;
         reconnectSince = performance.now();
         reconnectAttempts = 0;
-        log("stall detected:", reason);
-        elReconnect.classList.add("show");
+        log("reconnect: reason", reason);
+        if (!isLocal()) setReconnectFlag(1, reconnectQuiet);
+        if (!reconnectQuiet) elReconnect.classList.add("show");
     }
 }
 
@@ -635,7 +1160,9 @@ function startReconnect(reason) {
 const LAST_FRAME_KEY = "vet:lastFrame";
 const elLastFrame = document.getElementById("last-frame");
 function saveLastFrame() {
-    if (!lastFrameAt || !elView.width || !elView.height) return;
+    if (!lastFrameAt) return;
+    if (videoMode && !streamPaused && !paintVideoNow()) return;   // in video mode the canvas gets the live frame first
+    if (!elView.width || !elView.height) return;
     try { sessionStorage.setItem(LAST_FRAME_KEY, elView.toDataURL("image/jpeg", 0.85)); } catch (e) {}
 }
 function showSavedFrame() {
@@ -655,8 +1182,11 @@ function hideSavedFrame() {
 function endReconnect() {
     if (streamPaused) return;          // a stray frame while paused doesn't end the pause card
     reconnecting = false;
+    reconnectQuiet = false;
+    setReconnectFlag(0);
     hideSavedFrame();
     elReconnect.classList.remove("show");
+    document.documentElement.removeAttribute("data-reconnect");   // set by the head script after a reconnect reload
     log("stream resumed after", Math.round(performance.now() - reconnectSince), "ms,", reconnectAttempts, "attempt(s)");
 }
 
@@ -671,6 +1201,12 @@ let localRetry = null;
 window.__vetStartLocal = async (sourceId) => {
     clearTimeout(localRetry);
     localRetry = null;
+    if (!sourceId) {
+        // Not listed (minimized window): paused. The overlay starts the capture once it is back.
+        log("[video] local capture waiting: no source");
+        window.__vetSetPaused(true, true);
+        return;
+    }
     try {
         if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
         log("local capture of", sourceId);
@@ -681,22 +1217,39 @@ window.__vetStartLocal = async (sourceId) => {
                 maxFrameRate: 25, maxWidth: 640, maxHeight: 360
             } }
         });
+        localStartedAt = performance.now();
+        localStallFired = false;
         const track = localStream.getVideoTracks()[0];
-        track.addEventListener("ended", () => { log("local capture ended"); retryLocal(sourceId); });
+        track.addEventListener("ended", () => { log("local capture ended"); retryLocal(); });
         setStatus("");
+        curTrack = track; curStream = localStream;
         if (streamPaused) window.__vetSetPaused(false);
         startStatsLog();
-        startReader(track);
+        attachSource();
     } catch (e) {
         // Windows can't capture a minimized window: keep trying until it's back.
+        // The overlay decides "paused" (window really minimized, 2 misses in a row);
+        // a single failed start just keeps waiting and retries.
         log("local capture failed:", e.message);
-        window.__vetSetPaused(true, true);
-        retryLocal(sourceId);
+        retryLocal();
     }
 };
-function retryLocal(sourceId) {
+// Never reuse an old capture id: each retry asks main to re-resolve the source.
+function retryLocal(ms = 3000) {
     clearTimeout(localRetry);
-    localRetry = setTimeout(() => { localRetry = null; window.__vetStartLocal(sourceId); }, 3000);
+    localRetry = setTimeout(() => { localRetry = null; requestLocalResolve(); }, ms);
+}
+// Main validates the source and starts the capture itself via __vetStartLocal(id).
+// Source gone: "No signal" and another try in 5 s.
+async function requestLocalResolve() {
+    try {
+        const r = await fetch(API_BASE + "/video/local-resolve", {
+            method: "POST", body: JSON.stringify({ key: viewKey() })
+        });
+        const d = await r.json();
+        if (d && d.paused) { window.__vetSetPaused(true, true); return; }   // overlay polls and restarts the capture
+        if (d && d.ok && d.live === false) { setStatus("No signal"); retryLocal(5000); }
+    } catch (e) { log("local resolve failed:", e.message); retryLocal(5000); }
 }
 
 async function requestReconnect() {
@@ -704,14 +1257,22 @@ async function requestReconnect() {
     if (isLocal()) {
         lastReconnectReq = performance.now();
         reconnectAttempts++;
-        if (!localRetry) window.__vetStartLocal((window.__vetStreamParams || {}).sourceId);
+        if (!localRetry) requestLocalResolve();
         return;
     }
     // Only grab the canvas while it still holds a real frame (first attempt);
     // after a reload it is blank and the stored frame is kept.
+    // Quiet (silence rule) covers only the first attempt. Reaching the next request means that
+    // attempt brought no frame (a frame would have ended the reconnect): clear quiet, show the card.
+    if (reconnectQuiet && reconnectAttempts >= 1) {
+        reconnectQuiet = false;
+        elReconnect.classList.add("show");
+        log("reconnect: quiet attempt brought no frame, showing card");
+    }
     if (!elLastFrame.classList.contains("show")) saveLastFrame();
     lastReconnectReq = performance.now();
     reconnectAttempts++;
+    setReconnectFlag(reconnectAttempts, reconnectQuiet);
     elReconnectSub.textContent = reconnectAttempts > 1 ? "Attempt " + reconnectAttempts : "";
     try {
         const r = await fetch(API_BASE + "/video/reconnect", {
@@ -729,6 +1290,7 @@ async function requestReconnect() {
 // Called by the overlay after it reloaded this page for a reconnect: keep
 // the spinner up and keep retrying until frames come back.
 window.__vetResumeReconnect = (attempts) => {
+    if (streamPaused) return;          // paused card stays as it is
     const now = performance.now();
     showSavedFrame();
     startReconnect("page reloaded for reconnect");
@@ -736,21 +1298,67 @@ window.__vetResumeReconnect = (attempts) => {
     elReconnectSub.textContent = reconnectAttempts > 1 ? "Attempt " + reconnectAttempts : "";
     lastFrameAt = now - STALL_MS - 1;
     lastReconnectReq = now;
+    if (!isLocal()) setReconnectFlag(reconnectAttempts, reconnectQuiet);
 };
 
+// Load: a reconnect carried over the reload keeps the card (or, if quiet, the saved last frame only);
+// otherwise the status starts as "waiting".
+{
+    const saved = readReconnectFlag();
+    if (saved && !isLocal()) {
+        reconnecting = true;
+        reconnectQuiet = readQuietFlag();
+        reconnectSince = performance.now();
+        reconnectAttempts = saved;
+        showSavedFrame();
+        if (!reconnectQuiet) elReconnect.classList.add("show");
+        elReconnectSub.textContent = saved > 1 ? "Attempt " + saved : "";
+    } else {
+        setStatus("Waiting for stream…", "spin");
+    }
+}
+
+function pcBad() {
+    return !!pc && (pc.connectionState === "failed" || pc.connectionState === "disconnected"
+        || pc.connectionState === "closed" || pc.iceConnectionState === "failed");
+}
+
 setInterval(() => {
-    if (!lastFrameAt || streamPaused) return;   // never started yet / paused on purpose
+    if (streamPaused) return;                   // paused on purpose
     const now = performance.now();
-    if (!reconnecting && now - lastFrameAt > STALL_MS) startReconnect("no frames for " + Math.round(now - lastFrameAt) + " ms");
+    if (isLocal()) {
+        // Window capture sends frames only on change: silence after the first frame is not a stall.
+        if (!drewOnce && !reconnecting && !localStallFired && localStartedAt && now - localStartedAt > noFirstFrameWait()) {
+            localStallFired = true;
+            setFfStep(ffStep() + 1);
+            startReconnect("local capture, no first frame for " + Math.round(now - localStartedAt) + " ms");
+        }
+    } else if (pc) {
+        if (pcBad()) { if (!badPcSince) badPcSince = now; }
+        else badPcSince = 0;
+        if (!reconnecting) {
+            if (badPcSince && now - badPcSince > PC_BAD_MS) startReconnect("connection " + pc.connectionState + " for " + Math.round(now - badPcSince) + " ms");
+            else if (!drewOnce && connectedSince && now - connectedSince > noFirstFrameWait()) {
+                setFfStep(ffStep() + 1);
+                startReconnect("connected, no first frame for " + Math.round(now - connectedSince) + " ms");
+            }
+            else if (drewOnce && lastFrameAt && now - lastFrameAt > SILENT_MS) {
+                startReconnect("silent " + Math.round(SILENT_MS / 1000) + " s", true);
+            }
+        }
+    }
+    // A quiet attempt that brings no frame shows the card at the next request (see requestReconnect).
+    // Not timed here: reconnectSince restarts on every reload, so a timer would never fire.
     if (reconnecting && now - lastReconnectReq > RECONNECT_EVERY_MS) requestReconnect();
 }, 500);
 
 async function handleOffer({ sdp, candidates }) {
     if (!sdp) return;
     log("offer received");
+    sendSize(true);
     if (pc) { try { pc.close(); } catch(e){} pc = null; }
-    if (raf) { try { cancelAnimationFrame(raf); } catch(e){} raf = 0; }
-    clearQueue();
+    stopPipeline();
+    curTrack = curStream = null;
 
     pc = new RTCPeerConnection({ iceServers: [] });
 
@@ -758,22 +1366,27 @@ async function handleOffer({ sdp, candidates }) {
         log("ontrack", event.track.kind);
         if (event.track.kind !== "video") return;
 
-        setStatus("");
+        syncStatus();
         startStatsLog();
 
-        // WebCodecs pipeline — читаем кадры напрямую с трека.
-        // <video> не нужен — рисуем через <canvas> в drawOne().
-        startReader(event.track);
+        // Canvas mode: frames are read from the track (WebCodecs), copied to bitmaps and drawn in drawEntry().
+        // Video mode: the received stream plays in <video>. attachSource() picks the path for the mode.
+        curTrack = event.track;
+        curStream = (event.streams && event.streams[0]) || new MediaStream([event.track]);
+        attachSource();
     };
 
     pc.onconnectionstatechange = () => {
         log("conn state:", pc.connectionState);
-        if ((pc.connectionState === "failed" || pc.connectionState === "disconnected") && lastFrameAt) {
-            startReconnect("connection " + pc.connectionState);
-        }
+        // Failed/disconnected/closed is judged by the watchdog after PC_BAD_MS, not here.
         if (pc.connectionState === "connected") {
-            setStatus("");
+            sendSize(true);
+            if (!connectedSince) connectedSince = performance.now();
+            if (!drewOnce) log("connected, no frames yet");
+        } else {
+            connectedSince = 0;
         }
+        syncStatus();
     };
 
     try { await pc.setRemoteDescription(sdp); }
@@ -805,6 +1418,9 @@ async function handleOffer({ sdp, candidates }) {
     } catch(e) { log("sendAnswer failed:", e.message); }
 }
 
+// Render mode: ?render=canvas|video (default canvas). All state above is declared by now.
+setRenderMode(RENDER_FROM_URL === "video" ? "video" : "canvas", true);
+
 if (window.vetWebRTC) {
     window.vetWebRTC.onOffer(handleOffer);
     window.vetWebRTC.ready();
@@ -823,16 +1439,30 @@ if (window.vetWebRTC) {
 }
 
 document.getElementById("btn-close").addEventListener("click", () => {
+    setReconnectFlag(0);
     fetch(API_BASE + "/video/close", { method: "POST", body: JSON.stringify({ key: viewKey() }) }).catch(() => {});
 });
 
 // Called by the overlay: this window is one of several stream tiles.
 // The "Make main" button shows only on a tiled small window (not the main one).
-window.__vetSetTile = ({ tiled, isMain } = {}) => {
+// The fill button shows only in tiled layouts; its title says what a click does.
+// Fill button: "expand to corners" = fill the screen; "inward corners" = restore the layout.
+const MAX_ICON_FILL = "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5";
+const MAX_ICON_RESTORE = "M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5";
+window.__vetSetTile = ({ tiled, isMain, maximized, canResize } = {}) => {
     document.getElementById("btn-main").hidden = !(tiled && !isMain);
+    const btnMax = document.getElementById("btn-max");
+    btnMax.hidden = !tiled;
+    btnMax.title = maximized ? "Restore layout" : "Fill the screen";
+    document.getElementById("max-path").setAttribute("d", maximized ? MAX_ICON_RESTORE : MAX_ICON_FILL);
+    // the size toggle is hidden on tiled windows that cannot be resized (only main slot 0 can)
+    document.getElementById("btn-pin").hidden = !!tiled && !canResize;
 };
 document.getElementById("btn-main").addEventListener("click", () => {
     fetch(API_BASE + "/video/promote", { method: "POST", body: JSON.stringify({ key: viewKey() }) }).catch(() => {});
+});
+document.getElementById("btn-max").addEventListener("click", () => {
+    fetch(API_BASE + "/video/maximize", { method: "POST", body: JSON.stringify({ key: viewKey() }) }).catch(() => {});
 });
 
 document.getElementById("btn-pin").addEventListener("click", () => {

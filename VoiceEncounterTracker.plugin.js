@@ -98,6 +98,14 @@ module.exports = class VoiceEncounterTracker {
         // Several streams can be watched at once: one peer + native handle per
         // viewer key (a user id, or "cam:<id>" for a camera).
         this._pumps = new Map();
+        // Watch queues are per viewer key (see _chainWatch); in-flight watches and
+        // close bookkeeping decide when Discord's own stream may be left.
+        this._watchChains = new Map();
+        this._watchInFlight = new Set();
+        this._stwDispatched = new Set();
+        this._closeRequested = new Set();
+        // Full rejoins of a frozen stream, per base: { at, done } (see _watchStreamImpl).
+        this._rejoinState = new Map();
 
         this.prefs = {
             autoMuteBlocked: false,
@@ -280,6 +288,9 @@ module.exports = class VoiceEncounterTracker {
             this._postJSON("/speaking", { speakers: [] });
             this._postJSON("/ping", { last: null, avg: null });
         } catch (e) {}
+        // The overlay was just told the empty state: the next push must send again.
+        this._lastStateBody = null; this._lastPingKey = null; this._lastSpeakers = "";
+        this._speakingPushTimer = null;
 
         const me = this.getCurrentUserId();
         const mySession = me ? this.active.get(me) : null;
@@ -295,7 +306,9 @@ module.exports = class VoiceEncounterTracker {
         this._writeOpenNow();
 
         try { this._stopFramePump(); } catch (e) {}
+        this._forceBackup = true;   // final save on stop: write backup-last regardless of the 5 min limit
         this.flushEncounters();
+        this._forceBackup = false;
         this.restoreModifiedStyles();
 
         for (const node of this.badgeNodes.values()) {
@@ -707,8 +720,8 @@ module.exports = class VoiceEncounterTracker {
                     }, self.INJECT_THROTTLE_MS));
                 } else if (action.type === "STREAM_UPDATE" || action.type === "STREAM_CREATE" ||
                            action.type === "STREAM_DELETE" || action.type === "STREAM_SERVER_UPDATE") {
-                    // viewers joined / left my stream: refresh the count right away
-                    try { self.pushStateToOverlay(); } catch (e) {}
+                    // viewers joined / left my stream: refresh the count (trailing 200 ms)
+                    try { self.scheduleOverlayPush(200); } catch (e) {}
                 } else if (action.type === "PRESENCE_UPDATES" || action.type === "PRESENCES_REPLACE") {
                     try { self.scheduleOverlayPush(); } catch (e) {}
                 } else if (action.type === "CALL_CREATE" || action.type === "CALL_UPDATE" || action.type === "CALL_DELETE") {
@@ -745,7 +758,7 @@ module.exports = class VoiceEncounterTracker {
                     action.type === "SPEAKING_STOP" ||
                     action.type === "SPEAKING_STOP_USERS"
                 ) {
-                    try { self.pushSpeakingToOverlay(); } catch (e) {}
+                    try { self.scheduleSpeakingPush(); } catch (e) {}
                 }
             } catch (e) {}
         });
@@ -793,11 +806,20 @@ module.exports = class VoiceEncounterTracker {
         }
     }
 
-    scheduleOverlayPush() {
+    scheduleOverlayPush(delayMs = 500) {
         if (this._overlayDebounce) clearTimeout(this._overlayDebounce);
         this._overlayDebounce = this._addTimer(setTimeout(() => {
             try { this.pushStateToOverlay(); } catch (e) {}
-        }, 500));
+        }, delayMs));
+    }
+
+    // Trailing throttle: all speaking events inside a 100 ms window produce one push.
+    scheduleSpeakingPush() {
+        if (this._speakingPushTimer) return;
+        this._speakingPushTimer = this._addTimer(setTimeout(() => {
+            this._speakingPushTimer = null;
+            try { this.pushSpeakingToOverlay(); } catch (e) {}
+        }, 100));
     }
 
     // =====================================================================
@@ -1202,6 +1224,7 @@ module.exports = class VoiceEncounterTracker {
                 this.finalizeMeeting(otherId, session, otherSession, endedAt, trusted);
                 // The meeting with them is closed until I am in their channel again.
                 otherSession.meetClosed = true;
+                delete otherSession.meetStart;
             }
         } else {
             const mySession = this.active.get(me);
@@ -1279,7 +1302,10 @@ module.exports = class VoiceEncounterTracker {
             return;
         }
 
-        const start = Math.max(mySession.startedAt, otherSession.startedAt);
+        // meetStart: set by a merge of stored sessions into the ongoing one (see _mergeIntoLiveOther).
+        const start = Number.isFinite(otherSession.meetStart)
+            ? otherSession.meetStart
+            : Math.max(mySession.startedAt, otherSession.startedAt);
         const end = trusted
             ? endedAt
             : Math.min(endedAt, otherSession.lastSeen ?? endedAt, mySession.lastSeen ?? endedAt);
@@ -1520,6 +1546,12 @@ module.exports = class VoiceEncounterTracker {
         this._storedUserCount = arr.length;
         this._storedSessionCount = this._countSessions(arr);
         this._clearedAt = main?.clearedAt || 0;
+        // backup-last is read once here; saveEncounters keeps its numbers in memory.
+        const lastBak = this._readStore(this._backupNamespaces()[0]);
+        this._lastBackupSessions = lastBak ? this._countSessions(lastBak.users) : null;
+        this._lastBackupSavedAt = lastBak?.savedAt || 0;
+        this._lastBackupWriteAt = 0;
+        this._backupDirty = false;
         vetLog("info", `loadEncounters: ${this.encounters.size} users, ${this._storedSessionCount} sessions`
             + (bad ? `, ${bad} bad records skipped` : ""));
         if (this._restoredFrom) this.saveEncounters();   // write the restored data back to the main file
@@ -1542,21 +1574,30 @@ module.exports = class VoiceEncounterTracker {
         try {
             BdApi.Data.save(this.meta.name, this.getStoreKey(), payload);
             this._storedUserCount = users.length;
+            this._backupDirty = true;
         } catch (e) {
             vetLog("error", "saveEncounters failed:", e);
             return;
         }
 
         // Backups. "last" must not be degraded by a save that lost most of the history.
+        // Its session count / savedAt are kept in memory (set in loadEncounters); it is
+        // written at most every 5 min, and only when the main store changed since the last write.
         const [lastNs, ...dayNs] = this._backupNamespaces();
         try {
-            const prev = this._readStore(lastNs);
-            const prevSessions = this._countSessions(prev?.users);
-            const deliberateClear = (this._clearedAt || 0) > (prev?.savedAt || 0);
-            if (!prev || deliberateClear || sessions >= prevSessions * 0.5) {
-                BdApi.Data.save(lastNs, this.getStoreKey(), payload);
-            } else {
-                vetLog("warn", `backup-last kept: new save has ${sessions} sessions vs ${prevSessions}`);
+            const now = Date.now();
+            if (this._backupDirty && (this._forceBackup || now - (this._lastBackupWriteAt || 0) >= 5 * 60_000)) {
+                const prevSessions = this._lastBackupSessions;   // null = no readable backup-last
+                const deliberateClear = (this._clearedAt || 0) > (this._lastBackupSavedAt || 0);
+                if (prevSessions == null || deliberateClear || sessions >= prevSessions * 0.5) {
+                    BdApi.Data.save(lastNs, this.getStoreKey(), payload);
+                    this._lastBackupSessions = sessions;
+                    this._lastBackupSavedAt = payload.savedAt;
+                    this._lastBackupWriteAt = now;
+                    this._backupDirty = false;
+                } else {
+                    vetLog("warn", `backup-last kept: new save has ${sessions} sessions vs ${prevSessions}`);
+                }
             }
         } catch (e) { vetLog("warn", "backup-last failed:", e); }
         try {
@@ -1897,6 +1938,16 @@ module.exports = class VoiceEncounterTracker {
     // Overlay push
     // =====================================================================
 
+    // POST /state only when the body changed, or at least every 15 s.
+    _postStateOnce(payload) {
+        const body = JSON.stringify(payload);
+        const now = Date.now();
+        if (body === this._lastStateBody && now - (this._lastStateAt || 0) < 15_000) return;
+        this._lastStateBody = body;
+        this._lastStateAt = now;
+        this._postJSON("/state", payload, body);
+    }
+
     pushStateToOverlay() {
         try {
             const me = this.getCurrentUserId();
@@ -1908,8 +1959,9 @@ module.exports = class VoiceEncounterTracker {
                 mySession = this.active.get(me);
             }
             if (!mySession) {
-                this._postJSON("/state", {
+                this._postStateOnce({
                     guildId: null, channelId: null, channelName: null, users: [],
+                    mySessionStart: this._mySess?.start ?? null,
                     prefs: this._prefsPayload(),
                     streamSound: null,
                     returnTo: this._returnCard(),
@@ -1970,7 +2022,7 @@ module.exports = class VoiceEncounterTracker {
                 });
             }
 
-            this._postJSON("/state", {
+            this._postStateOnce({
                 guildId: mySession.guildId ?? null,
                 channelId: mySession.channelId,
                 channelName: this.getChannelName(mySession.channelId),
@@ -1978,6 +2030,7 @@ module.exports = class VoiceEncounterTracker {
                 isDM: !mySession.guildId,
                 users,
                 departures: this._departureCards(mySession),
+                mySessionStart: this._mySess?.start ?? null,
                 prefs: this._prefsPayload(),
                 streamSound: this._getLiveStreamSound()
             });
@@ -1987,6 +2040,13 @@ module.exports = class VoiceEncounterTracker {
     pushPingToOverlay() {
         try {
             const { last, avg } = this.getVoicePing();
+            // Sent when last/avg change (compared at 1 ms), or at least every 10 s.
+            const r = (v) => (typeof v === "number" ? Math.round(v) : null);
+            const key = r(last) + "|" + r(avg);
+            const now = Date.now();
+            if (key === this._lastPingKey && now - (this._lastPingAt || 0) < 10_000) return;
+            this._lastPingKey = key;
+            this._lastPingAt = now;
             this._postJSON("/ping", { last, avg });
         } catch (e) {}
     }
@@ -2002,7 +2062,10 @@ module.exports = class VoiceEncounterTracker {
                 mySession = this.active.get(me);
             }
             if (!mySession) {
-                this._postJSON("/speaking", { speakers: [] });
+                if (this._lastSpeakers !== "") {
+                    this._lastSpeakers = "";
+                    this._postJSON("/speaking", { speakers: [] });
+                }
                 return;
             }
 
@@ -2120,22 +2183,28 @@ module.exports = class VoiceEncounterTracker {
         if (action === "stop-stream") {
             const key = userId ? String(userId) : null;
             vetLog("info", "stop-stream requested (viewer closed)", key || "(all)");
-            // Queued behind any watch in progress, so a half-started watch never
-            // has its track released under it; a pending watch of the same
-            // viewer is cancelled.
+            // Not queued behind any watch: a pending watch of this viewer is
+            // cancelled by its token and aborts at its next check.
             if (key) this._bumpWatchToken(key);
-            // Viewer closed for good: after our handle is released, stop watching
-            // that stream in Discord as well (others' streams only).
-            const leaveDiscord = cmd.name === "closed" && key && /^\d+$/.test(this.baseOf(key));
-            const stop = async () => {
-                this._stopFramePump(key);
-                if (leaveDiscord) {
-                    await new Promise(res => setTimeout(res, 300));
-                    const base = this.baseOf(key);
-                    if (this.pumpsForBase(base).length === 0) this._stopWatchingInDiscord(base);
-                }
-            };
-            this._watchChain = (this._watchChain || Promise.resolve()).then(stop, stop);
+            // Viewer closed for good: stop watching that stream in Discord too
+            // (others' streams only), once nobody else of that base needs it.
+            const closed = cmd.name === "closed" && key && /^\d+$/.test(this.baseOf(key));
+            // A watch still running for this viewer is aborted now; it sends the
+            // close itself when it ends (if it had triggered STREAM_WATCH).
+            if (closed && this._watchInFlight.has(key)) this._closeRequested.add(key);
+            this._stopFramePump(key);
+            if (closed) setTimeout(() => this._closeDiscordIfUnused(this.baseOf(key)), 300);
+            return;
+        }
+
+        if (action === "stream-size") {
+            // Target picture size (WxH, pixels) of this viewer's picture; drops if no pump runs yet.
+            const entry = userId ? this._pumps.get(String(userId)) : null;
+            const m = /^(\d+)x(\d+)$/.exec(String(name || ""));
+            if (!entry || !m || !(+m[1] > 0) || !(+m[2] > 0)) return;
+            entry.target = { w: +m[1], h: +m[2] };
+            vetLog("info", "stream-size", String(userId), `${entry.target.w}x${entry.target.h}`);
+            this.applySenderScale(entry);
             return;
         }
 
@@ -2232,12 +2301,12 @@ module.exports = class VoiceEncounterTracker {
         }, 300));
     }
 
-    _postJSON(path, payload) {
+    _postJSON(path, payload, body = null) {
         try {
             BdApi.Net.fetch(this.OVERLAY_URL + path, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
+                body: body ?? JSON.stringify(payload)
             }).catch(() => {});
         } catch (e) {}
     }
@@ -2420,29 +2489,88 @@ module.exports = class VoiceEncounterTracker {
         return [...this._pumps].filter(([k]) => this.baseOf(k) === b);
     }
 
-    // Watch requests run one at a time: two overlapping watches (one holding
-    // Discord's native track while the other makes Discord rejoin the stream)
-    // crash Discord. A request that is superseded while waiting is dropped.
+    // Watches are queued per viewer key, so a hung watch of one viewer never
+    // blocks another stream. Overlapping watches of the same viewer (one holding
+    // Discord's native track while another makes Discord rejoin the stream) still
+    // run one at a time. A new request for a key bumps its token, which aborts
+    // the pending watch of that key.
     _bumpWatchToken(key) {
         this._watchTokens ||= {};
         return (this._watchTokens[key] = (this._watchTokens[key] || 0) + 1);
     }
 
+    _watchAborted(key, token) {
+        return token !== this._watchTokens?.[key];
+    }
+
+    // Chains fn on this key's own queue only; other keys run in parallel.
+    _chainWatch(key, fn) {
+        const prev = this._watchChains.get(key) || Promise.resolve();
+        const next = prev.then(fn, fn)
+            .catch((e) => vetLog("error", "watch chain:", e))
+            .finally(() => { if (this._watchChains.get(key) === next) this._watchChains.delete(key); });
+        this._watchChains.set(key, next);
+        return next;
+    }
+
+    // Runs one watch body for `key`. Skipped when already superseded. While it
+    // runs the key is in flight. If it ends after a viewer close and it had
+    // dispatched STREAM_WATCH, Discord's stream is left when nobody else uses it.
+    async _runWatch(key, token, body) {
+        if (this._watchAborted(key, token)) {
+            vetLog("info", "watch superseded, skipped", key);
+            return false;
+        }
+        this._watchInFlight.add(key);
+        try {
+            return await body();
+        } finally {
+            this._watchInFlight.delete(key);
+            const dispatched = this._stwDispatched.delete(key);
+            const closed = this._closeRequested.delete(key);
+            if (closed && dispatched) this._closeDiscordIfUnused(this.baseOf(key));
+        }
+    }
+
+    // Leaves Discord's stream of `base` only when no pump and no other watch uses it.
+    _closeDiscordIfUnused(base) {
+        const b = String(base);
+        if (this.pumpsForBase(b).length > 0) return;
+        if ([...this._watchInFlight].some(k => this.baseOf(k) === b)) return;
+        this._stopWatchingInDiscord(b);
+    }
+
+    // Releases what an aborted watch acquired but never handed to a pump.
+    // `got` is the {stream, handle, sid} result of _watchStreamByUserId.
+    _dropAbortedWatch(got) {
+        if (got?.handle) {
+            try { got.handle.release(); } catch (e) {}
+        } else if (got?.owned) {
+            // only our clones; never Discord's original track
+            try { got.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+        }
+    }
+
+    // Sleeps ms; returns false early when aborted() turns true.
+    async _waitAbortable(ms, aborted) {
+        const t0 = Date.now();
+        while (Date.now() - t0 < ms) {
+            if (aborted()) return false;
+            await new Promise(res => setTimeout(res, 100));
+        }
+        return !aborted();
+    }
+
     _watchStream(userId, opts = {}) {
         const key = this.viewerKeyOf(String(userId), opts.inst || "");
         const token = this._bumpWatchToken(key);
-        const run = async () => {
-            if (token !== this._watchTokens[key]) {
-                vetLog("info", "_watchStream: superseded, skipped", key);
-                return false;
-            }
-            return this._watchStreamImpl(userId, opts);
-        };
-        this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
-        return this._watchChain;
+        const aborted = () => this._watchAborted(key, token);
+        return this._chainWatch(key, () => this._runWatch(key, token,
+            () => this._watchStreamImpl(userId, { ...opts, aborted })));
     }
 
-    async _watchStreamImpl(userId, { reconnect = false, inst = "" } = {}) {
+    async _watchStreamImpl(userId, { reconnect = false, inst = "", aborted = () => false } = {}) {
+        let rejoinResolve = null;   // set when this watch runs a full rejoin of its base
         try {
             const me = this.getCurrentUserId();
             const mySession = this.active.get(me);
@@ -2460,33 +2588,61 @@ module.exports = class VoiceEncounterTracker {
             const key = this.viewerKeyOf(base, inst);
             if (!reconnect) this._postJSON("/video/open", { key, userId, streamKey, inst });
 
-            if (!reconnect && this._pumps.has(key)) {
+            // Frozen source of this user: a pump sent no frames at all, or a pump
+            // stalled mid-stream. Kept until a pump of this user encodes frames again.
+            const stalledPump = this.pumpsForBase(base).map(([, e]) => e).find(e => e.stalledMidStream);
+            const frozenSrc = this._frozenSource?.userId === base ? this._frozenSource
+                : stalledPump ? { userId: base, sid: stalledPump.sid ?? null } : null;
+
+            if (!reconnect && !frozenSrc && this._pumps.has(key)) {
                 vetLog("info", "_watchStream: already watching, reusing");
                 return true;
             }
-            if (reconnect) {
+            if (reconnect || frozenSrc) {
                 vetLog("info", "_watchStream: reconnect for", userId);
                 this._stopFramePump(key);
             }
 
-            // The last pump on this user's stream sent no frames at all:
-            // Discord's own copy is frozen, so reusing it can't recover.
-            const frozen = this._frozenSource && this._frozenSource.userId === String(userId);
-            const lastRewatch = (this._lastRewatchAt ||= {})[userId] || 0;
-            const rewatch = frozen && Date.now() - lastRewatch > 30000;
+            // Discord's own copy is frozen, so reusing its track can't recover:
+            // always rejoin (fresh STREAM_WATCH). Only ever on a viewer reconnect.
+            const frozen = !!frozenSrc;
+            let rewatch = frozen;
+            let waited = false;   // a rejoin of this base was in flight; take its live track
             let otherKeys = [];
             if (rewatch) {
-                this._lastRewatchAt[userId] = Date.now();
+                vetLog("warn", "[watch] frozen sid " + frozenSrc.sid + ", rewatching");
                 // Every viewer of this stream sits on the frozen upstream.
                 otherKeys = this.pumpsForBase(base).map(([k]) => k).filter(k => k !== key);
-                for (const [k] of this.pumpsForBase(base)) this._stopFramePump(k);
-                // Let Discord's pipeline let go of the old track before it rejoins.
-                await new Promise(res => setTimeout(res, 1000));
+                const prev = this._rejoinState.get(base);
+                if (prev && Date.now() - prev.at < 15000) {
+                    // At most one full rejoin per base per 15 s: wait for the in-flight one.
+                    vetLog("info", "[watch] frozen: rejoin in flight, waiting for it", base);
+                    await prev.done;
+                    if (aborted()) return false;
+                    rewatch = false;
+                    waited = true;
+                } else {
+                    vetLog("warn", "[watch] frozen: closing Discord watch and rejoining");
+                    let resolve;
+                    const done = new Promise(r => { resolve = r; });
+                    this._rejoinState.set(base, { at: Date.now(), done });
+                    rejoinResolve = resolve;
+                    for (const [k] of this.pumpsForBase(base)) this._stopFramePump(k);
+                    // Leave Discord's frozen stream, then let its pipeline let go before rejoining.
+                    this._stopWatchingInDiscord(base);
+                    if (!await this._waitAbortable(1200, aborted)) return false;
+                }
             }
-            const frozenSid = frozen ? this._frozenSource.sid : null;
-            this._frozenSource = null;
+            // Not cleared here: it is cleared once a pump of this user encodes frames.
+            const frozenSid = frozen ? frozenSrc.sid : null;
 
-            const stream = await this._watchStreamByUserId(userId, { rewatch, frozenSid });
+            const got = await this._watchStreamByUserId(userId, { rewatch, frozenSid, key, aborted });
+            if (aborted()) {
+                vetLog("info", "_watchStream: closed or superseded while watching", key);
+                this._dropAbortedWatch(got);
+                return false;
+            }
+            const stream = got?.stream || null;
             if (!stream) {
                 vetLog("warn", "_watchStream: no stream");
                 return false;
@@ -2495,23 +2651,28 @@ module.exports = class VoiceEncounterTracker {
             // Other viewers of this stream lost their pumps in the rewatch: give
             // each a clone of the new track.
             const srcTrack = stream.getVideoTracks()[0];
-            const extra = rewatch && srcTrack ? otherKeys.map(k => [k, srcTrack.clone()]) : [];
-            await this._startWatchStreamPeer(stream, key);
+            const extra = (rewatch || waited) && srcTrack ? otherKeys.map(k => [k, srcTrack.clone()]) : [];
+            await this._startWatchStreamPeer(stream, key, { handle: got.handle, sid: got.sid, ownsTrack: !!got.owned });
+            // Closed or superseded while the peer was being set up: drop this pump.
+            const stale = aborted();
+            if (stale) this._stopFramePump(key);
             for (const [k, t] of extra) {
-                if (this._pumps.has(k)) continue;
-                await this._startWatchStreamPeer(new MediaStream([t]), k);
+                if (this._pumps.has(k)) { try { t.stop(); } catch (e) {} continue; }
+                await this._startWatchStreamPeer(new MediaStream([t]), k, { ownsTrack: true });
             }
-            return true;
+            return !stale;
         } catch (e) {
             vetLog("error", "_watchStream:", e);
             return false;
+        } finally {
+            if (rejoinResolve) rejoinResolve();
         }
     }
 
     // rewatch: Discord's copy of the stream is frozen (still ACTIVE, no frames).
     // Our pump is already stopped and its native handle released, so nothing
     // of ours holds the old track when STREAM_WATCH makes Discord rejoin.
-    async _watchStreamByUserId(userId, { timeout = 20000, rewatch = false, frozenSid = null } = {}) {
+    async _watchStreamByUserId(userId, { timeout = 20000, rewatch = false, frozenSid = null, key = null, aborted = () => false } = {}) {
         const me = this.getCurrentUserId();
         const mySession = this.active.get(me);
         if (!mySession) {
@@ -2524,15 +2685,16 @@ module.exports = class VoiceEncounterTracker {
             if (existing) {
                 vetLog("info", "_watchStreamByUserId: already live, reusing");
                 const track = existing.srcObject.getVideoTracks()[0];
-                try { return new MediaStream([track.clone()]); }
-                catch { return new MediaStream([track]); }
+                try { return { stream: new MediaStream([track.clone()]), handle: null, sid: null, owned: true }; }
+                catch { return { stream: new MediaStream([track]), handle: null, sid: null }; }
             }
         }
 
         if (!rewatch) {
-            const reused = await this._reuseDiscordWatch(userId);
+            const reused = await this._reuseDiscordWatch(userId, { excludeSid: frozenSid, aborted });
             if (reused) return reused;
         }
+        if (aborted()) return null;
 
         const before = new Set(document.querySelectorAll("video"));
 
@@ -2541,6 +2703,7 @@ module.exports = class VoiceEncounterTracker {
             vetLog("error", "_watchStreamByUserId: streamWatch not found");
             return null;
         }
+        if (aborted()) return null;
         try {
             streamWatch({
                 streamType: "guild",
@@ -2548,6 +2711,7 @@ module.exports = class VoiceEncounterTracker {
                 channelId: mySession.channelId,
                 ownerId: userId,
             });
+            if (key) this._stwDispatched.add(key);
             vetLog("info", "STREAM_WATCH dispatched for", userId, rewatch ? "(rewatch, frozen sid " + frozenSid + ")" : "");
         } catch (e) {
             vetLog("error", "streamWatch failed:", e);
@@ -2560,20 +2724,27 @@ module.exports = class VoiceEncounterTracker {
             const t0 = Date.now();
             while (Date.now() - t0 < timeout) {
                 await new Promise(res => setTimeout(res, 1000));
-                const fresh = await this._reuseDiscordWatch(userId, { excludeSid: frozenSid });
+                if (aborted()) return null;
+                const fresh = await this._reuseDiscordWatch(userId, { excludeSid: frozenSid, aborted });
+                if (aborted()) return null;
                 if (fresh) return fresh;
             }
+            if (aborted()) return null;
             // Discord kept the same stream id: take what there is rather than fail.
             vetLog("warn", "rewatch: no new stream id from Discord, using the current one");
-            return await this._reuseDiscordWatch(userId);
+            return await this._reuseDiscordWatch(userId, { aborted });
         }
 
-        const video = await this._waitForLiveVideo(timeout, before);
+        // No timeout: waits until video appears or the watch is aborted (viewer closed / superseded).
+        const video = await this._waitForLiveVideo(null, before, aborted);
+        if (aborted()) return null;
         if (!video) {
             vetLog("warn", "no live video appeared");
             return null;
         }
 
+        let nzHandle = null;
+        let nzSid = null;
         const streamId = this._extractStreamId(video);
         if (streamId) {
             vetLog("info", "streamId =", streamId);
@@ -2584,8 +2755,8 @@ module.exports = class VoiceEncounterTracker {
                 try {
                     const handle = nz(streamId);
                     if (handle && handle.stream) {
-                        this._nativeStreamHandle = handle;
-                        this._sourceSid = String(streamId);
+                        nzHandle = handle;
+                        nzSid = String(streamId);
                         const nativeTrack = handle.stream.getVideoTracks()[0];
                         if (nativeTrack) {
                             vetLog("info", "native track:",
@@ -2594,7 +2765,7 @@ module.exports = class VoiceEncounterTracker {
                                 "label:", nativeTrack.label
                             );
                             vetLog("info", "returning original native track (no clone)");
-                            return new MediaStream([nativeTrack]);
+                            return { stream: new MediaStream([nativeTrack]), handle: nzHandle, sid: nzSid };
                         }
                     }
                 } catch (e) {
@@ -2608,26 +2779,31 @@ module.exports = class VoiceEncounterTracker {
         const track = video.srcObject?.getVideoTracks?.()[0];
         if (!track) {
             vetLog("error", "no video track on fallback");
+            if (nzHandle) { try { nzHandle.release(); } catch (e) {} }
             return null;
         }
         let liveTrack = track;
         const t0 = Date.now();
         while (liveTrack.readyState !== "live" && Date.now() - t0 < 3000) {
             await new Promise(r => setTimeout(r, 100));
+            if (aborted()) {
+                if (nzHandle) { try { nzHandle.release(); } catch (e) {} }
+                return null;
+            }
         }
         try {
             const cloned = liveTrack.clone();
             vetLog("info", "fallback cloned track:", cloned.readyState);
-            return new MediaStream([cloned]);
+            return { stream: new MediaStream([cloned]), handle: nzHandle, sid: nzSid, owned: true };
         } catch (e) {
             vetLog("info", "fallback without clone:", liveTrack.readyState);
-            return new MediaStream([liveTrack]);
+            return { stream: new MediaStream([liveTrack]), handle: nzHandle, sid: nzSid };
         }
     }
 
     // If Discord already watches this user's stream, take its video without
     // dispatching STREAM_WATCH again (that makes Discord drop and rejoin the stream).
-    async _reuseDiscordWatch(userId, { excludeSid = null } = {}) {
+    async _reuseDiscordWatch(userId, { excludeSid = null, aborted = () => false } = {}) {
         let active = [];
         try {
             const ass = BdApi.Webpack.getStore("ApplicationStreamingStore");
@@ -2656,10 +2832,8 @@ module.exports = class VoiceEncounterTracker {
                     const handle = nz(String(sid));
                     const t = handle?.stream?.getVideoTracks?.()[0];
                     if (t) {
-                        this._nativeStreamHandle = handle;
-                        this._sourceSid = String(sid);
                         vetLog("info", "_reuseDiscordWatch: native track via streamId", sid);
-                        return new MediaStream([t]);
+                        return { stream: new MediaStream([t]), handle, sid: String(sid) };
                     }
                 } catch (e) { vetLog("warn", "_reuseDiscordWatch nz failed:", e); }
             }
@@ -2670,11 +2844,13 @@ module.exports = class VoiceEncounterTracker {
         if (excludeSid != null) return null;
         const me = this.getCurrentUserId();
         if (active.filter(x => String(x.ownerId) !== String(me)).length === 1) {
-            const v = this._findLiveVideoForStream() || await this._waitForLiveVideo(3000);
+            const v = this._findLiveVideoForStream() || await this._waitForLiveVideo(3000, new Set(), aborted);
+            if (aborted()) return null;
             const t = v?.srcObject?.getVideoTracks?.()[0];
             if (t) {
                 vetLog("info", "_reuseDiscordWatch: cloned track from Discord video element");
-                try { return new MediaStream([t.clone()]); } catch (e) { return new MediaStream([t]); }
+                try { return { stream: new MediaStream([t.clone()]), handle: null, sid: null, owned: true }; }
+                catch (e) { return { stream: new MediaStream([t]), handle: null, sid: null }; }
             }
         }
         vetLog("warn", "_reuseDiscordWatch: watched in Discord but no track found, will dispatch");
@@ -2722,10 +2898,20 @@ module.exports = class VoiceEncounterTracker {
         return found;
     }
 
-    _waitForLiveVideo(timeoutMs, exclude = new Set()) {
+    // Resolves with the live video, or null when aborted() turns true or, if
+    // timeoutMs is given, when it runs out. Polled every 750 ms, so abort is seen within 750 ms.
+    _waitForLiveVideo(timeoutMs = null, exclude = new Set(), aborted = () => false) {
         return new Promise((resolve) => {
             const seen = new WeakSet();
             const start = Date.now();
+            let timer = null;
+            let done = false;
+            const finish = (v) => {
+                if (done) return;
+                done = true;
+                if (timer) clearInterval(timer);
+                resolve(v);
+            };
             const check = () => {
                 let found = null;
                 document.querySelectorAll("video").forEach((v) => {
@@ -2740,34 +2926,59 @@ module.exports = class VoiceEncounterTracker {
                 });
                 return found;
             };
+            if (aborted()) return finish(null);
             const v0 = check();
-            if (v0) return resolve(v0);
-            const observer = new MutationObserver(() => {
+            if (v0) return finish(v0);
+            timer = setInterval(() => {
+                if (aborted()) return finish(null);
                 const v = check();
-                if (v) { observer.disconnect(); resolve(v); }
-            });
-            observer.observe(document.body, { childList: true, subtree: true });
-            const timer = setInterval(() => {
-                const v = check();
-                if (v) {
-                    clearInterval(timer);
-                    observer.disconnect();
-                    resolve(v);
-                    return;
-                }
-                if (Date.now() - start > timeoutMs) {
-                    clearInterval(timer);
-                    observer.disconnect();
-                    resolve(null);
-                }
-            }, 500);
+                if (v) return finish(v);
+                if (timeoutMs != null && Date.now() - start > timeoutMs) finish(null);
+            }, 750);
         });
     }
 
+    // Viewer's target picture size -> encoder limits (pure). low = my own preview:
+    // the target is capped at 360p there. Scale never upscales (>= 1).
+    _senderLimits(target, low, srcW, srcH) {
+        let tw = target.w, th = target.h;
+        if (low && th > 360) { tw = Math.round(tw * 360 / th); th = 360; }
+        const scaleResolutionDownBy = Math.max(1, Math.round(Math.min(srcW / tw, srcH / th) * 100) / 100);
+        const maxFramerate = th <= 240 ? 20 : th <= 480 ? 30 : 60;
+        const maxBitrate = Math.min(8_000_000, Math.max(300_000, Math.round(tw * th * maxFramerate * 0.1)));
+        const degradationPreference = th > 480 ? "maintain-resolution" : "balanced";
+        return { scaleResolutionDownBy, maxFramerate, maxBitrate, degradationPreference };
+    }
+
+    // Source size of a sent video track (fallback 1920x1080 when unknown).
+    _senderSourceSize(track) {
+        const s = track?.getSettings?.() || {};
+        const h = s.height || 1080;
+        return { w: s.width || Math.round(h * 16 / 9), h };
+    }
+
+    // Applies the viewer's target size to the sender (every encoding). No-op without target/sender.
+    async applySenderScale(entry) {
+        if (!entry || !entry.target || !entry.sender) return;
+        try {
+            const src = this._senderSourceSize(entry.sender.track);
+            const lim = this._senderLimits(entry.target, entry.low, src.w, src.h);
+            entry.appliedSrcH = src.h;
+            const params = entry.sender.getParameters();
+            if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+            for (const enc of params.encodings) Object.assign(enc, lim);
+            params.degradationPreference = lim.degradationPreference;
+            await entry.sender.setParameters(params);
+            vetLog("info", "sender scaled:", `${entry.target.w}x${entry.target.h}`, "src", `${src.w}x${src.h}`, JSON.stringify(lim));
+        } catch (e) {
+            vetLog("warn", "applySenderScale failed:", e.message);
+        }
+    }
+
     // `key` = which viewer this feeds. The native handle / stream id that the
-    // watch just acquired (this._nativeStreamHandle / this._sourceSid) move into
-    // this viewer's entry; only this viewer's previous peer is closed.
-    async _startWatchStreamPeer(stream, key, { low = false } = {}) {
+    // watch acquired (passed in as handle / sid) move into this viewer's entry;
+    // only this viewer's previous peer is closed.
+    async _startWatchStreamPeer(stream, key, { low = false, handle = null, sid = null, ownsTrack = false } = {}) {
         // My own preview: small and cheap (360p, 25 fps, ~1.2 Mbps); others' streams: full quality.
         const tuneEncoding = (enc) => {
             if (low) {
@@ -2783,11 +2994,12 @@ module.exports = class VoiceEncounterTracker {
             }
             enc.networkPriority = "high";
             enc.priority = "high";
+            // A viewer's target size (stream-size command) overrides the limits above.
+            if (entry.target) {
+                const src = this._senderSourceSize(stream.getVideoTracks()[0]);
+                Object.assign(enc, this._senderLimits(entry.target, low, src.w, src.h));
+            }
         };
-        const handle = this._nativeStreamHandle;
-        const sid = this._sourceSid || null;
-        this._nativeStreamHandle = null;
-        this._sourceSid = null;
         if (this._pumps.has(key)) {
             this._stopFramePump(key);
             vetLog("info", "frame pump stopped (replaced)", key);
@@ -2800,11 +3012,18 @@ module.exports = class VoiceEncounterTracker {
         const pumpUserId = /^(cam|own):/.test(pumpBase) ? null : pumpBase;   // frozen-source check is for others' streams
         const pumpSid = sid;
         const pumpStartedAt = Date.now();
+        let statsLastEncoded = 0;
+        let statsLastEncodedAt = Date.now();
         const entry = {
             pc, handle, sid,
+            low, sender: null, target: null, appliedSrcH: null,
+            stalledMidStream: false,   // frames stopped after they had started (set by the stats timer)
+            // true only for clones this pump was given (stream tracks); Discord's own track is never stopped here
+            ownsTrack: !!ownsTrack,
             stop: () => {
                 if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
                 try { pc.close(); } catch (e) {}
+                if (entry.ownsTrack) stream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
             }
         };
         this._pumps.set(key, entry);
@@ -2818,6 +3037,8 @@ module.exports = class VoiceEncounterTracker {
 
         for (const track of stream.getTracks()) {
             pc.addTrack(track, stream);
+            // Screen content: favour detail over motion. Camera tracks keep the default.
+            if (track.kind === "video" && !/^cam:/.test(pumpBase)) { try { track.contentHint = "detail"; } catch (e) {} }
             track.addEventListener("ended", () => vetLog("warn", "watch source track ENDED", track.kind));
             track.addEventListener("mute", () => vetLog("warn", "watch source track MUTED", track.kind));
             track.addEventListener("unmute", () => vetLog("info", "watch source track unmuted", track.kind));
@@ -2830,6 +3051,7 @@ module.exports = class VoiceEncounterTracker {
                 if (!params.encodings || params.encodings.length === 0) {
                     params.encodings = [{}];
                 }
+                entry.sender = sender;
                 tuneEncoding(params.encodings[0]);
                 await sender.setParameters(params);
                 vetLog("info", "sender tuned (pre-offer):",
@@ -2907,11 +3129,18 @@ module.exports = class VoiceEncounterTracker {
                 if (!params.encodings || params.encodings.length === 0) {
                     params.encodings = [{}];
                 }
+                entry.sender = sender;
                 tuneEncoding(params.encodings[0]);
                 await sender.setParameters(params);
+                this.applySenderScale(entry);
                 statsTimer = setInterval(async () => {
                     if (pc.connectionState === "closed" || this._pumps.get(key) !== entry) {
                         clearInterval(statsTimer); statsTimer = null; return;
+                    }
+                    // Source resolution changed (window resized / re-shared): re-fit the target scale.
+                    if (entry.target && entry.sender &&
+                        this._senderSourceSize(entry.sender.track).h !== entry.appliedSrcH) {
+                        this.applySenderScale(entry);
                     }
                     try {
                         const stats = await pc.getStats();
@@ -2924,11 +3153,35 @@ module.exports = class VoiceEncounterTracker {
                                 if (!r.framesEncoded && pc.connectionState === "connected" &&
                                     Date.now() - pumpStartedAt > 5000 && pumpUserId &&
                                     !this._streamPaused(pumpUserId, this.active.get(this.getCurrentUserId())) &&
-                                    !(this._frozenSource && this._frozenSource.userId === pumpUserId)) {
+                                    !(this._frozenSource?.userId === pumpUserId &&
+                                      String(this._frozenSource.sid) === String(pumpSid ?? this._streamIdByUser?.[pumpUserId]))) {
                                     this._frozenSource = { userId: pumpUserId, sid: pumpSid ?? this._streamIdByUser?.[pumpUserId] ?? null };
                                     vetLog("warn", "watch source frozen (0 frames encoded), sid", pumpSid);
                                 }
-                                const pktPerSec = r.packetsSent - (statsPrevPackets || r.packetsSent);
+                                // Frames stopped mid-stream: no increase for 10 s after frames had started.
+                                const now = Date.now();
+                                if (r.framesEncoded > statsLastEncoded) {
+                                    statsLastEncoded = r.framesEncoded;
+                                    statsLastEncodedAt = now;
+                                    if (entry.stalledMidStream) {
+                                        entry.stalledMidStream = false;
+                                        vetLog("info", "[sender] frames resumed after stall, sid", pumpSid);
+                                    }
+                                    // Frames flow for this user again: the frozen record is no longer true.
+                                    if (pumpUserId && this._frozenSource?.userId === pumpUserId) this._frozenSource = null;
+                                } else if (r.framesEncoded > 0 && !entry.stalledMidStream && pumpUserId &&
+                                           pc.connectionState === "connected" &&
+                                           !this._streamPaused(pumpUserId, this.active.get(this.getCurrentUserId()))) {
+                                    if (now - statsLastEncodedAt >= 10000) {
+                                        entry.stalledMidStream = true;
+                                        this._frozenSource = { userId: pumpUserId, sid: pumpSid ?? this._streamIdByUser?.[pumpUserId] ?? null };
+                                        vetLog("warn", "[sender] source stalled mid-stream, sid", pumpSid);
+                                    }
+                                } else {
+                                    // Paused, not connected, or no frames yet: not a stall, restart the window.
+                                    statsLastEncodedAt = now;
+                                }
+                                const pktPerSec = Math.round((r.packetsSent - (statsPrevPackets || r.packetsSent)) / 5);   // 5 s window
                                 statsPrevPackets = r.packetsSent;
                                 vetLog("info", "[sender]", {
                                     fps: r.framesPerSecond,
@@ -2948,7 +3201,7 @@ module.exports = class VoiceEncounterTracker {
                             }
                         });
                     } catch (e) {}
-                }, 1000);
+                }, 5000);
                 vetLog("info", "sender tuned:", JSON.stringify(params.encodings[0]));
             } else {
                 vetLog("warn", "sender tuned: no video sender");
@@ -3045,6 +3298,7 @@ module.exports = class VoiceEncounterTracker {
         else this._favorites.delete(userId);
         this._saveFavorites();
         this.scheduleOverlayPush();
+        this._refreshOpenTracker();
     }
 
     setFavoriteSound(userId, on) {
@@ -3053,6 +3307,7 @@ module.exports = class VoiceEncounterTracker {
         this._favorites.set(userId, { ...this._favorites.get(userId), sound: !!on });
         this._saveFavorites();
         this.scheduleOverlayPush();
+        this._refreshOpenTracker();
     }
 
     setFavoriteNotify(userId, on) {
@@ -3061,6 +3316,7 @@ module.exports = class VoiceEncounterTracker {
         this._favorites.set(userId, { ...this._favorites.get(userId), notify: !!on });
         this._saveFavorites();
         this.scheduleOverlayPush();
+        this._refreshOpenTracker();
     }
 
     setFavoriteCalls(userId, on) {
@@ -3069,6 +3325,7 @@ module.exports = class VoiceEncounterTracker {
         this._favorites.set(userId, { ...this._favorites.get(userId), calls: !!on });
         this._saveFavorites();
         this.scheduleOverlayPush();
+        this._refreshOpenTracker();
     }
 
     // Decides whether an overlay notification for userId is allowed by a scope mode.
@@ -3410,9 +3667,13 @@ module.exports = class VoiceEncounterTracker {
         try { m = BdApi.Webpack.getByKeys("amplitudeToPerceptual", "perceptualToAmplitude", { searchExports: true }); } catch (e) {}
         if (!ok(m)) try { m = BdApi.Webpack.getByKeys("amplitudeToPerceptual", "perceptualToAmplitude"); } catch (e) {}
         if (!ok(m)) try { m = BdApi.Webpack.getModule(x => ok(x)); } catch (e) {}
-        if (!ok(m)) try {
-            m = BdApi.Webpack.getModule(x => !!x && typeof x === "object" && Object.values(x).some(f => typeof f === "function" && /perceptualToAmplitude/.test(f.toString())));
-        } catch (e) {}
+        // The toString scan walks every module: run it once per session, not on each 30 s retry.
+        if (!ok(m) && !this._volConvScanTried) {
+            this._volConvScanTried = true;
+            try {
+                m = BdApi.Webpack.getModule(x => !!x && typeof x === "object" && Object.values(x).some(f => typeof f === "function" && /perceptualToAmplitude/.test(f.toString())));
+            } catch (e) {}
+        }
         if (ok(m)) { this._volConvMod = m; return m; }
         this._volConvRetryAt = Date.now() + 30000;
         if (!this._volConvWarned) {
@@ -3722,11 +3983,12 @@ module.exports = class VoiceEncounterTracker {
     // handle (picked up by _startWatchStreamPeer into its entry and released when
     // that pump stops). A later viewer gets a clone of the track, so the clone
     // stays valid while the upstream is kept alive by the first viewer's handle.
+    // Returns {track, handle, sid} for the new viewer's pump.
     _adoptWatchHandle(base, handle, sid, track) {
-        this._nativeStreamHandle = handle;
-        this._sourceSid = String(sid);
-        if (this.pumpsForBase(base).length === 0) return track;
-        try { return track.clone(); } catch (e) { return track; }
+        const out = { track, handle, sid: String(sid) };
+        if (this.pumpsForBase(base).length === 0) return out;
+        try { out.track = track.clone(); out.owned = true; } catch (e) {}
+        return out;
     }
 
     // A camera goes through the same viewer window as streams. Discord only
@@ -3754,14 +4016,14 @@ module.exports = class VoiceEncounterTracker {
                     return;
                 }
                 vetLog("info", "watch-own: Discord's own stream track via sid", sid);
-                const track = this._adoptWatchHandle(base, handle, sid, t);
-                await this._startWatchStreamPeer(new MediaStream([track]), key, { low: true });
+                const adopted = this._adoptWatchHandle(base, handle, sid, t);
+                await this._startWatchStreamPeer(new MediaStream([adopted.track]), key, { low: true, handle: adopted.handle, sid: adopted.sid, ownsTrack: !!adopted.owned });
             } catch (e) {
                 vetLog("error", "_watchOwn:", e);
                 this._postJSON("/video/own-local", { inst });
             }
         };
-        this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
+        this._chainWatch(key, () => this._runWatch(key, token, run));
     }
 
     async _watchCamera(userId, inst = "") {
@@ -3783,11 +4045,11 @@ module.exports = class VoiceEncounterTracker {
                     return;
                 }
                 this._postJSON("/video/open", { key, userId, camera: true, inst });
-                const track = this._adoptWatchHandle(base, handle, sid, t);
-                await this._startWatchStreamPeer(new MediaStream([track]), key);
+                const adopted = this._adoptWatchHandle(base, handle, sid, t);
+                await this._startWatchStreamPeer(new MediaStream([adopted.track]), key, { handle: adopted.handle, sid: adopted.sid, ownsTrack: !!adopted.owned });
             } catch (e) { vetLog("error", "_watchCamera:", e); }
         };
-        this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
+        this._chainWatch(key, () => this._runWatch(key, token, run));
     }
 
     // =====================================================================
@@ -3920,6 +4182,7 @@ module.exports = class VoiceEncounterTracker {
                 };
                 this._saveOpenOwn();
                 this._touchAlive();
+                this.scheduleOverlayPush();
             }
             return;
         }
@@ -3990,7 +4253,8 @@ module.exports = class VoiceEncounterTracker {
             if (userId === me) continue;
             next.set(userId, {
                 start: s.startedAt, guildId: s.guildId ?? null, channelId: s.channelId,
-                myStart, events: Array.isArray(s.events) ? s.events : [], meetClosed: !!s.meetClosed
+                myStart, events: Array.isArray(s.events) ? s.events : [], meetClosed: !!s.meetClosed,
+                meetStart: Number.isFinite(s.meetStart) ? s.meetStart : undefined
             });
         }
         const json = JSON.stringify([...next]);
@@ -4042,6 +4306,7 @@ module.exports = class VoiceEncounterTracker {
                     sess.startedAt = e.start;
                     if (events.length) sess.events = events;
                     if (e.meetClosed) sess.meetClosed = true;
+                    if (Number.isFinite(e.meetStart)) sess.meetStart = e.meetStart;
                     this.active.set(userId, sess);
                     const mineS = me ? this.active.get(me) : null;
                     if (mineS && mineS.channelId === e.channelId && Number.isFinite(e.myStart) && e.myStart < mineS.startedAt) {
@@ -4053,7 +4318,8 @@ module.exports = class VoiceEncounterTracker {
                 if (e.meetClosed || !Number.isFinite(e.myStart)) continue;
                 const end = alive != null ? Math.min(Math.max(alive, e.start), now) : e.start;
                 const mine = { startedAt: Number.isFinite(e.myStart) ? e.myStart : e.start, channelId: e.channelId, guildId, lastSeen: end };
-                const other = { startedAt: e.start, channelId: e.channelId, guildId, events, lastSeen: end };
+                const other = { startedAt: e.start, channelId: e.channelId, guildId, events, lastSeen: end,
+                    meetStart: Number.isFinite(e.meetStart) ? e.meetStart : undefined };
                 try { this.finalizeMeeting(userId, mine, other, end, false); }
                 catch (er) { vetLog("warn", "recover open session:", er); }
             }
@@ -4079,6 +4345,7 @@ module.exports = class VoiceEncounterTracker {
             start: saved.start, channelId: saved.channelId, guildId,
             channelName: this.getChannelName(saved.channelId), guildName: this.getGuildName(guildId, saved.channelId)
         };
+        this.scheduleOverlayPush();
         if (cur && cur.channelId === saved.channelId && now - lastSeen <= 120_000) return;
         this._endOwnSession(lastSeen, false);
     }
@@ -4086,6 +4353,7 @@ module.exports = class VoiceEncounterTracker {
     _endOwnSession(end, left) {
         const sess = this._mySess;
         this._mySess = null;
+        this.scheduleOverlayPush();
         if (!sess) return;
         this._clearOpenOwn();
         if (end - sess.start < 5000) return;
@@ -4223,10 +4491,6 @@ module.exports = class VoiceEncounterTracker {
             }
             vetLog("info", "frame pump stopped", k);
         }
-        if (key == null && this._nativeStreamHandle) {
-            try { this._nativeStreamHandle.release(); } catch (e) {}
-        }
-        if (key == null) { this._nativeStreamHandle = null; this._sourceSid = null; }
     }
 
     _setStreamSound(enabled) {
@@ -4637,6 +4901,7 @@ module.exports = class VoiceEncounterTracker {
                 .vet-status { font-weight: 600; }
                 .vet-status[data-status="blocked"] { color: #ed4245; }
                 .vet-status[data-status="ignored"] { color: #faa61a; }
+    .vet-status[data-status="favorite"] { color: #d2c193; }
                 .vet-status[data-status="muted"]   { color: #72767d; }
                 .vet-date { font-variant-numeric: tabular-nums; }
                 .vet-empty { padding: 20px; opacity: .5; text-align: center; }
@@ -5263,7 +5528,7 @@ module.exports = class VoiceEncounterTracker {
             if (sessionEntry) {
                 const userId = sessionEntry.getAttribute("data-user-id");
                 const idx = Number(sessionEntry.getAttribute("data-session-idx"));
-                if (!userId || !Number.isFinite(idx)) return;
+                if (!userId || !Number.isFinite(idx) || idx < 0) return;   // idx -1: the ongoing line, no timeline
                 if (userId === this.getCurrentUserId()) return;   // my sessions: no timeline
                 e.preventDefault(); e.stopPropagation();
 
@@ -5429,14 +5694,23 @@ module.exports = class VoiceEncounterTracker {
                 .map(n => `${this.formatDate(n.at)}  ${n.globalName && n.globalName !== n.username ? n.globalName + " (" + n.username + ")" : (n.username || n.globalName)}`);
             const nameTitle = this._escape(`${this.getUserName(rec.userId)} (${rec.userId})` +
                 (prevNameLines.length > 1 ? "\nName history:\n" + prevNameLines.join("\n") : ""));
+            const favRec = isSelf ? null : (this._favorites?.get(String(rec.userId)) ?? null);
+            const favTitle = favRec
+                ? ` title="Favorite · join/leave sound: ${favRec.sound ? "on" : "off"} · messages in overlay: ${favRec.notify !== false ? "on" : "off"} · calls in overlay: ${favRec.calls !== false ? "on" : "off"}"`
+                : "";
+            const FAV_GLYPH = `<svg width="12" height="12" viewBox="0 0 24 24" fill="#d2c193" stroke="#d2c193" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8z"/></svg>`;
             let glyph, glyphColor, status;
             if (isSelf)                  { glyph = ""; glyphColor = "#72767d"; status = "—"; }
             else if (kind === "blocked")      { glyph = "⊘"; glyphColor = "#ed4245"; status = "blocked"; }
             else if (kind === "ignored") { glyph = "⊘"; glyphColor = "#faa61a"; status = "ignored"; }
+            else if (favRec)            { glyph = FAV_GLYPH; glyphColor = "#d2c193"; status = "favorite"; }
             else if (kind === "muted")   { glyph = "○"; glyphColor = "#72767d"; status = "muted"; }
             else if (kind === "known")   { glyph = "✓"; glyphColor = "#3ba55d"; status = "—"; }
             else                          { glyph = "!"; glyphColor = "#a3a6aa"; status = "—"; }
 
+            // Others: the ongoing meeting with me counts in the total (self's live part is already in totalMs).
+            const liveS = isSelf ? null : this._vetLiveSessionOther(rec.userId);
+            const shownMs = (rec.totalMs || 0) + (liveS ? liveS.durationMs : 0);
             const blockedCls = rec.blocked ? " active" : "";
             const ignoredCls = rec.ignored ? " active" : "";
             const isExpanded = expandedId === rec.userId;
@@ -5456,11 +5730,11 @@ module.exports = class VoiceEncounterTracker {
                 </td>
                 <td class="vet-id" title="${rec.userId}">${rec.userId}</td>
                 <td class="vet-status" data-status="${status}">${status}</td>
-                <td class="vet-num">${rec.totalMs ? this.formatDuration(rec.totalMs) : "—"}</td>
+                <td class="vet-num">${shownMs ? this.formatDuration(shownMs) : "—"}</td>
                 <td class="vet-num">${(rec.sessions || []).length || "—"}</td>
                 <td class="vet-date">${this.formatDate(rec.firstSeenAt)}</td>
-                <td class="vet-date">${rec.live ? "now" : this.formatDate(rec.lastSeenAt)}</td>
-                <td class="vet-badge" style="color:${glyphColor};font-weight:700">${glyph}</td>
+                <td class="vet-date">${(rec.live || (!isSelf && this._vetLiveOf(rec.userId))) ? "now" : this.formatDate(rec.lastSeenAt)}</td>
+                <td class="vet-badge" style="color:${glyphColor};font-weight:700"${favTitle}>${glyph}</td>
                 <td class="vet-actions">${isSelf ? `<button type="button" class="vet-btn" tabindex="-1" aria-hidden="true" style="visibility:hidden;pointer-events:none">History</button>` : `
                     <button type="button" class="vet-btn history"
                         data-action="history" data-user-id="${rec.userId}"
@@ -5502,7 +5776,7 @@ module.exports = class VoiceEncounterTracker {
                 const sessName = isSelf ? "" : this._escape(s.username
                     ? (s.globalName && s.globalName !== s.username ? `${s.globalName} (${s.username})` : s.username)
                     : (s.globalName || "—"));
-                const key = this._vetSessKey(s);
+                const key = s.live ? "live" : this._vetSessKey(s);
                 const isSessExpanded = expandedSession &&
                     expandedSession.userId === rec.userId &&
                     expandedSession.sessionIndex === idx;
@@ -5519,9 +5793,9 @@ module.exports = class VoiceEncounterTracker {
                             title="Delete session">${TRASH_SVG}</button>`;
                 return `<div class="vet-session-entry${isSessExpanded ? " expanded" : ""}${isSel ? " selected" : ""}"
                         data-user-id="${rec.userId}" data-session-idx="${idx}" data-session-key="${key}">
-                    ${s.live ? `<span class="vet-session-pick"></span>` : `<span class="vet-session-pick" data-action="sel-toggle"
+                    <span class="vet-session-pick" data-action="sel-toggle"
                         data-user-id="${rec.userId}" data-session-key="${key}"
-                        title="Select">${isSel ? "☑" : "☐"}</span>`}
+                        title="Select">${isSel ? "☑" : "☐"}</span>
                     <span class="vet-session-date"${mergedNote}>
                         <span class="vet-session-arrow">${arrowS}</span>${dateStr}
                     </span>
@@ -5553,10 +5827,12 @@ module.exports = class VoiceEncounterTracker {
                 `<div class="vet-sess-chunk" data-chunk="${k}">${chunkHtml(k)}</div>`).join("");
             const moreSentinel = sessState.chunks < totalChunks
                 ? `<div class="vet-sess-sentinel" data-role="sess-more"></div>` : "";
-            const sessionLines = allSessions.length
-                ? `<div class="vet-sess-list">${loadedChunks}${moreSentinel}</div>` : "";
+            // Others: the ongoing meeting is a live line on top (not in rec.sessions until it ends).
+            const liveHtml = liveS ? sessionLine({ s: liveS, idx: -1 }) : "";
+            const sessionLines = (allSessions.length || liveHtml)
+                ? `<div class="vet-sess-list">${liveHtml}${loadedChunks}${moreSentinel}</div>` : "";
 
-            const sessionsEmpty = allSessions.length === 0
+            const sessionsEmpty = (allSessions.length === 0 && !liveHtml)
                 ? `<div class="vet-session-more">No sessions recorded.</div>`
                 : "";
 
@@ -5725,7 +6001,36 @@ module.exports = class VoiceEncounterTracker {
         return true;
     }
 
-    // ---- Session selection (this._vetSel: Map userId -> Set(sessionKey); live sessions never selected) ----
+    // ---- Session selection (this._vetSel: Map userId -> Set(sessionKey); key "live" = the ongoing session) ----
+
+    // The ongoing session of a user as {start}, or null. Self: this._mySess. Others: the open meeting
+    // with me (both in the same channel, not closed); its start is meetStart when a merge moved it.
+    _vetLiveOf(userId) {
+        const me = this.getCurrentUserId();
+        if (!me) return null;
+        if (userId === me) return this._mySess ? { start: this._mySess.start } : null;
+        const mine = this.active.get(me);
+        const other = this.active.get(userId);
+        if (!mine || !other || other.meetClosed || !mine.channelId || other.channelId !== mine.channelId) return null;
+        const start = Number.isFinite(other.meetStart) ? other.meetStart : Math.max(mine.startedAt, other.startedAt);
+        return { start };
+    }
+
+    // Others' ongoing meeting as a display session (start..now, live), or null.
+    _vetLiveSessionOther(userId) {
+        const live = this._vetLiveOf(userId);
+        if (!live || userId === this.getCurrentUserId()) return null;
+        const other = this.active.get(userId);
+        const now = Date.now();
+        const name = this._liveName(userId);
+        return {
+            startedAt: live.start, endedAt: now, durationMs: Math.max(0, now - live.start),
+            guildId: other?.guildId ?? null, channelId: other?.channelId ?? null,
+            guildName: this.getGuildName(other?.guildId ?? null, other?.channelId), channelName: this.getChannelName(other?.channelId),
+            username: name?.username ?? null, globalName: name?.globalName ?? null,
+            live: true
+        };
+    }
 
     _vetSelPlan() {
         return [...(this._vetSel?.entries() || [])].map(([userId, set]) => ({ userId, keys: [...set] }));
@@ -5738,6 +6043,7 @@ module.exports = class VoiceEncounterTracker {
         for (const [userId, set] of sel) {
             const rec = recOf(userId);
             const existing = new Set((Array.isArray(rec?.sessions) ? rec.sessions : []).map(s => this._vetSessKey(s)));
+            if (this._vetLiveOf(userId)) existing.add("live");
             for (const k of set) if (!existing.has(k)) set.delete(k);
             if (!set.size) sel.delete(userId);
         }
@@ -5745,18 +6051,25 @@ module.exports = class VoiceEncounterTracker {
 
     _vetSelBarHtml() {
         if (!this._vetSel || !this._vetSel.size) return "";
-        let n = 0, mergeable = 0;
-        for (const set of this._vetSel.values()) { n += set.size; if (set.size >= 2) mergeable++; }
+        let n = 0, mergeable = 0, stored = 0;
+        for (const set of this._vetSel.values()) {
+            n += set.size;
+            if (set.size >= 2) mergeable++;
+            for (const k of set) if (k !== "live") stored++;
+        }
         if (!n) return "";
         const users = this._vetSel.size;
         return `<span class="vet-sel-count">${n} selected · ${users} ${users === 1 ? "user" : "users"}</span>
             <button type="button" class="vet-btn" data-action="sel-merge"${mergeable ? "" : " disabled"}>Merge</button>
-            <button type="button" class="vet-btn" data-action="sel-delete">Delete</button>
+            <button type="button" class="vet-btn" data-action="sel-delete"${stored ? "" : " disabled"}>Delete</button>
             <button type="button" class="vet-btn" data-action="sel-clear">Clear</button>`;
     }
 
     _vetSelDelete(overlay, done) {
-        const plan = this._vetSelPlan();
+        // The ongoing session ("live") is never deleted: only stored sessions are in the plan.
+        const plan = this._vetSelPlan()
+            .map(p => ({ userId: p.userId, keys: p.keys.filter(k => k !== "live") }))
+            .filter(p => p.keys.length);
         const total = plan.reduce((n, p) => n + p.keys.length, 0);
         if (!total) return;
         this._vetConfirm(overlay,
@@ -5792,6 +6105,9 @@ module.exports = class VoiceEncounterTracker {
         if (skipped) {
             text += ` ${skipped} ${skipped === 1 ? "person has" : "people have"} only one selected session and will be skipped.`;
         }
+        if (plan.some(p => p.keys.includes("live"))) {
+            text += " The ongoing session will count from the earliest selected start.";
+        }
         this._vetConfirm(overlay, "Merge sessions", text, {
             confirmText: "Merge",
             cancelText: "Cancel",
@@ -5800,6 +6116,10 @@ module.exports = class VoiceEncounterTracker {
                 for (const { userId, keys } of plan) {
                     this._vetSel?.delete(userId);
                     if (userId === me) { this._mergeOwnSessions(keys); continue; }
+                    if (keys.includes("live")) {
+                        this._mergeIntoLiveOther(userId, keys.filter(k => k !== "live"));
+                        continue;
+                    }
                     const ss = this.encounters.get(userId)?.sessions || [];
                     const idx = keys.map(k => ss.findIndex(s => this._vetSessKey(s) === k)).filter(i => i >= 0);
                     this.mergeSessions(userId, idx);
@@ -5820,14 +6140,16 @@ module.exports = class VoiceEncounterTracker {
             BdApi.UI.showToast("Could not read your voice log; nothing merged", { type: "error" });
             return false;
         }
-        const keySet = new Set(keys);
+        // "live" = the running session: merged stored sessions are folded into it (start moves back).
+        const withLive = keys.includes("live") && !!this._mySess;
+        const keySet = new Set(keys.filter(k => k !== "live"));
         const pending = this._myVoicePending || [];
         const all = [...loaded, ...pending];
         const picked = all.filter(x => Number.isFinite(x.start) && Number.isFinite(x.end) &&
             keySet.has(`${x.start}-${x.end}`));
-        if (picked.length < 2) return false;
+        if (picked.length < (withLive ? 1 : 2)) return false;
         let spanStart = Math.min(...picked.map(x => x.start));
-        let spanEnd = Math.max(...picked.map(x => x.end));
+        let spanEnd = withLive ? Date.now() : Math.max(...picked.map(x => x.end));
         const absorbed = new Set(picked);
         let grew = true;
         while (grew) {
@@ -5841,6 +6163,21 @@ module.exports = class VoiceEncounterTracker {
                     grew = true;
                 }
             }
+        }
+        if (withLive) {
+            // Absorbed stored sessions are dropped; the running session now starts at spanStart.
+            const rest = all.filter(x => !absorbed.has(x)).sort((a, b) => a.start - b.start);
+            try { BdApi.Data.save(this.meta.name, "myVoice", rest); }
+            catch (e) {
+                BdApi.UI.showToast("Could not save your voice log; nothing merged", { type: "error" });
+                return false;
+            }
+            this._myVoicePending = [];
+            this._mySess.start = spanStart;
+            this._saveOpenOwn();
+            vetLog("info", `[merge] own: ${absorbed.size} sessions folded into the ongoing one from ${this.formatTime(spanStart)}`);
+            this.scheduleOverlayPush();
+            return true;
         }
         const involved = all.filter(x => absorbed.has(x)).sort((a, b) => a.start - b.start);
         const earliest = involved[0];
@@ -5859,6 +6196,55 @@ module.exports = class VoiceEncounterTracker {
             return false;
         }
         this._myVoicePending = [];
+        return true;
+    }
+
+    // Merge a user's selected stored sessions into their ongoing meeting with me ("live" selected).
+    // S = earliest selected start, grown over any stored session overlapping [S, now] (absorbed, so the
+    // history never overlaps). Absorbed sessions leave rec.sessions; the meeting's meetStart = S, so
+    // finalizeMeeting records one session [S, end]. Totals: rec.totalMs drops the absorbed time,
+    // the live part is added by the row (_vetLiveSessionOther).
+    _mergeIntoLiveOther(userId, keys) {
+        const rec = this.encounters.get(userId);
+        const other = this.active.get(userId);
+        if (!rec || !Array.isArray(rec.sessions) || !other || !this._vetLiveOf(userId)) return false;
+        const ss = rec.sessions;
+        const keySet = new Set(keys);
+        const picked = ss.filter(s => keySet.has(this._vetSessKey(s)));
+        if (!picked.length) return false;
+        let spanStart = Math.min(...picked.map(s => s.startedAt));
+        const absorbed = new Set(picked);
+        let grew = true;
+        while (grew) {
+            grew = false;
+            for (const s of ss) {
+                if (absorbed.has(s) || !(s.endedAt > spanStart)) continue;
+                absorbed.add(s);
+                if (s.startedAt < spanStart) spanStart = s.startedAt;
+                grew = true;
+            }
+        }
+        const involved = ss.filter(s => absorbed.has(s)).sort((a, b) => a.startedAt - b.startedAt);
+        let boundaries = 0;
+        for (let i = 1; i < involved.length; i++) {
+            if (involved[i].startedAt - involved[i - 1].endedAt > this.RECENT_MS) boundaries++;
+        }
+        const oldMs = involved.reduce((n, s) => n + (s.durationMs ?? (s.endedAt - s.startedAt)), 0);
+        rec.sessions = ss.filter(s => !absorbed.has(s));
+        rec.totalMs = Math.max(0, (rec.totalMs || 0) - oldMs);
+        rec.meetings = Math.max(1, (rec.meetings || 1) - boundaries);
+        if (rec.sessions.length) {
+            rec.firstSeenAt = Math.min(spanStart, ...rec.sessions.map(s => s.startedAt));
+            rec.lastSeenAt = Math.max(...rec.sessions.map(s => s.endedAt));
+        } else {
+            rec.firstSeenAt = spanStart;
+        }
+
+        other.meetStart = spanStart;
+        try { this._syncOpenSessions(); this._writeOpenNow(); } catch (e) {}
+        vetLog("info", `[merge] ${this.getUserName(userId)}: ${involved.length} sessions folded into the ongoing meeting from ${this.formatTime(spanStart)}`);
+        this.scheduleSave(this.MEETING_SAVE_MS);
+        this.scheduleOverlayPush();
         return true;
     }
 

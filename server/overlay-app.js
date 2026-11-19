@@ -15,7 +15,9 @@ const { execFile, spawn } = require("child_process");
 // Last-resort logging: an exception or rejected promise nobody caught is written
 // to video.log and the overlay keeps running instead of exiting silently.
 // (videoLog is a hoisted function; it guards its own use of the log dir.)
-process.on("uncaughtException", (e) => { try { videoLog("[fatal] " + ((e && e.stack) || e)); } catch (_) {} });
+// Native crashes leave a minidump in <userData>/Crashpad/reports (nothing is uploaded).
+try { require("electron").crashReporter.start({ uploadToServer: false }); } catch (e) {}
+process.on("uncaughtException", (e) => { try { videoLog("[fatal] " + ((e && e.stack) || e)); flushVideoLogSync(); } catch (_) {} });
 process.on("unhandledRejection", (e) => { try { videoLog("[fatal] unhandledRejection " + ((e && e.stack) || e)); } catch (_) {} });
 
 // ─── Chromium flags: kill occlusion detection + background throttling ───
@@ -35,7 +37,7 @@ const MARGIN_TOP     = 20;
 
 const CHROME_HEIGHT  = 34;
 const HEIGHT_OFFLINE   = 78;
-const HEIGHT_IDLE      = 66;   // same as one user in voice (CHROME_HEIGHT + ROW_HEIGHT)
+const HEIGHT_IDLE      = 67;   // "NOT IN VOICE" message: header 22 + list padding 12 + two 16.5px lines (33)
 const HEIGHT_EMPTY_VC  = 60;
 const ROW_HEIGHT       = 32;
 const CARD_HEIGHT      = 40;
@@ -115,14 +117,23 @@ let server = null;
 // ─── SSE (server-sent events) ───
 const sseClients = new Set();
 
-function sseSend(res, event, data) {
-    try { res.write("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n"); }
+function sseFrame(event, data) {
+    return "event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n";
+}
+
+function sseWrite(res, frame) {
+    try { res.write(frame); }
     catch (e) { sseClients.delete(res); }
+}
+
+function sseSend(res, event, data) {
+    sseWrite(res, sseFrame(event, data));
 }
 
 function sseBroadcast(event, data) {
     if (sseClients.size === 0) return;
-    for (const res of sseClients) sseSend(res, event, data);
+    const frame = sseFrame(event, data);     // serialized once, same string to every client
+    for (const res of sseClients) sseWrite(res, frame);
 }
 
 // ─── Command long-poll waiters ───
@@ -139,9 +150,38 @@ function flushCommandWaiters() {
     try { jsonReply(waiter.res, 200, { commands: pending }); } catch (e) {}
 }
 
+// State broadcasts are deduped: a broadcast is skipped when the state equals the last
+// one sent, ignoring volatile timestamp fields. A refresh is forced every 15 s.
+const STATE_KEEPALIVE_MS = 15000;
+let lastStateSig = null;
+let lastStateSentAt = 0;
+let lastStateBody = null;      // raw body of the previous POST /state
+
+function stateSignature(s) {
+    const { updatedAt, ...rest } = s;
+    if (rest.net) {
+        const { updatedAt: _netUpdatedAt, phaseMs, totalMs, ...net } = rest.net;
+        // Outside "ok" the phase/total counters are live: keep them, in whole seconds
+        if (net.level !== "ok") {
+            net.phaseMs = Math.round(phaseMs / 1000);
+            net.totalMs = Math.round(totalMs / 1000);
+        }
+        rest.net = net;
+    }
+    return JSON.stringify(rest);
+}
+
 function broadcastState() {
     if (sseClients.size === 0) return;
-    try { sseBroadcast("state", buildStateResponse()); } catch (e) {}
+    try {
+        const s = buildStateResponse();
+        const now = Date.now();
+        const sig = stateSignature(s);
+        if (sig === lastStateSig && now - lastStateSentAt < STATE_KEEPALIVE_MS) return;
+        lastStateSig = sig;
+        lastStateSentAt = now;
+        sseBroadcast("state", s);
+    } catch (e) {}
 }
 let isQuitting = false;
 let lastAliveState = false;
@@ -236,7 +276,8 @@ let settings = {
     preferredSourceId: "screen:0:0",
     preferredSourceName: null,
     streamSound: true,
-    clickThroughOnGameFocus: true
+    clickThroughOnGameFocus: true,
+    streamRender: "canvas"
 };
 
 function loadSettings() {
@@ -1087,6 +1128,18 @@ function startServer() {
             jsonReply(res, 200, { ok: true });
             return;
         }
+        // The view's pixel size: the plugin asks Discord for a stream of that size.
+        // Local (own capture) views have no plugin stream to resize.
+        if (req.method === "POST" && url === "/video/size") {
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                const v = viewerFor(d.key);
+                const w = Math.round(Number(d.w)), h = Math.round(Number(d.h));
+                if (v && !v.local && w > 0 && h > 0) queuePluginCommand("stream-size", v.key, `${w}x${h}`, v.inst);
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
         if (req.method === "POST" && url === "/video/reconnect") {
             let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
             const v = viewerFor(d.key);
@@ -1116,8 +1169,45 @@ function startServer() {
         }
         if (req.method === "POST" && url === "/video/own-local") {
             let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
-            try { ownStreamToLocal(d.inst); } catch (e) { videoLog("[video] own-local failed", String((e && e.stack) || e)); }
+            ownStreamToLocal(d.inst).catch(e => videoLog("[video] own-local failed", String((e && e.stack) || e)));
             jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/video/local-resolve") {
+            // The page asks for its capture source again (after a dropped capture or a retry).
+            let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
+            const v = viewerFor(d.key);
+            if (!v || !v.local || !v.win || v.win.isDestroyed()) { jsonReply(res, 200, { ok: false }); return; }
+            const cur = myStreamCaptureId();
+            const want = cur ? cur.src : v.sourceId;
+            const name = cur ? cur.name : ((cachedSources.find(s => s.id === v.sourceId) || {}).name || "");
+            const src = await resolveLocalSource(want, name);
+            if (!src) {
+                // Still streaming = the window is minimized, not gone: paused (after two failed lookups in a row) until it is listed again.
+                if (iAmStreaming()) {
+                    v._misses = (v._misses || 0) + 1;
+                    if (v._misses < 2) { jsonReply(res, 200, { ok: true, live: false }); return; }
+                    if (!v.paused) setLocalPaused(v, true);
+                    jsonReply(res, 200, { ok: true, live: false, paused: true });
+                    return;
+                }
+                if (v._missingSrc !== want) { videoLog("[video] local source missing", want); notifyLocalSourceGone(); }
+                v._missingSrc = want;
+                jsonReply(res, 200, { ok: true, live: false });
+                return;
+            }
+            if (v.win.isDestroyed()) { jsonReply(res, 200, { ok: false }); return; }
+            videoLog("[video] local source", want, "->", src.id, src.name);
+            v._misses = 0;
+            if (v.paused) setLocalPaused(v, false);   // listed again: the plate goes at once
+            v.sourceId = src.id;
+            v.params.sourceId = src.id;
+            try {
+                v.win.webContents.executeJavaScript(
+                    `window.__vetStreamParams = ${JSON.stringify(v.params)};` +
+                    `if (window.__vetStartLocal) window.__vetStartLocal(${JSON.stringify(src.id)});`).catch(() => {});
+            } catch (e) {}
+            jsonReply(res, 200, { ok: true, live: true, id: src.id });
             return;
         }
         if (req.method === "POST" && url === "/video/own") {
@@ -1129,6 +1219,12 @@ function startServer() {
         if (req.method === "POST" && url === "/video/promote") {
             let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
             promoteViewer(d.key);
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
+        if (req.method === "POST" && url === "/video/maximize") {
+            let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
+            try { toggleTileMaximize(viewerFor(d.key)); } catch (e) { videoLog("[tile] maximize failed", String((e && e.stack) || e)); }
             jsonReply(res, 200, { ok: true });
             return;
         }
@@ -1174,6 +1270,8 @@ function startServer() {
                 const now = Date.now();
                 const last = (typeof parsed.last === "number" && isFinite(parsed.last) && parsed.last > 0) ? parsed.last : null;
                 const avg = (typeof parsed.avg === "number" && isFinite(parsed.avg) && parsed.avg > 0) ? parsed.avg : null;
+                const prevLevel = netMachine.level;
+                const prevLast = pingState.last, prevAvg = pingState.avg;
                 pingState = { last, avg, updatedAt: now };
                 if (last) {
                     pingHistory.push({ t: now, v: last });
@@ -1181,7 +1279,9 @@ function startServer() {
                 }
                 updateNetMachine();
                 jsonReply(res, 200, { ok: true });
-                broadcastState();
+                // Broadcast only when the net state or the displayed ping (5 ms steps) changed
+                const r5 = (v) => (v == null ? null : Math.round(v / 5) * 5);
+                if (netMachine.level !== prevLevel || r5(prevLast) !== r5(last) || r5(prevAvg) !== r5(avg)) broadcastState();
             } catch (e) { jsonReply(res, 400, { ok: false, error: e.message }); }
             return;
         }
@@ -1190,14 +1290,16 @@ function startServer() {
             try {
                 const body = await readBody(req);
                 const prevSound = state.streamSound;
+                const sameBody = body === lastStateBody;
+                lastStateBody = body;
                 const gap = lastPluginSeen ? Date.now() - lastPluginSeen : Infinity;
                 state = Object.assign({ updatedAt: Date.now() }, JSON.parse(body));
                 lastPluginSeen = Date.now();
                 noteVoiceForReturn(gap);
                 jsonReply(res, 200, { ok: true });
-                applyAutoResizeAll();      // grow the window first, then draw into it
+                if (!sameBody) applyAutoResizeAll();      // grow the window first, then draw into it
                 broadcastState();
-                checkVideoAutoClose();
+                if (!sameBody) checkVideoAutoClose();
                 if (state.streamSound !== prevSound) {
                     try { rebuildTrayMenu(); } catch (e) {}
                 }
@@ -1871,6 +1973,7 @@ async function noteForegroundForProfiles(pid, gameLike) {
     const prev = _profileKey;
     _profileKey = key;
     tileAnchors.clear();
+    tileMax.clear();
     sseBroadcast("layouts", layoutsInfo());
     if (settings.layoutProfilesEnabled === false) return;
     const profiles = layoutProfiles();
@@ -1993,6 +2096,7 @@ function openLayoutsWindow() {
         focusable: true, show: false, title: "Window layouts",
         webPreferences: { nodeIntegration: false, contextIsolation: true, backgroundThrottling: false }
     });
+    layoutsWindow._vetTaskbar = true;   // this one belongs on the taskbar
     layoutsWindow.setAlwaysOnTop(true, "screen-saver");
     layoutsWindow.loadFile(path.join(__dirname, "layouts.html"));
     layoutsWindow.once("ready-to-show", () => { layoutsWindow.show(); layoutsWindow.focus(); });
@@ -2364,6 +2468,8 @@ function openSetupFrames(key) {
             setupMoved();
         });
         w.on("resized", () => { followAttached("f:" + kind); setupMoved(); });
+        // Tiled setup: the ghosts of the other tiles follow the anchor frame.
+        if (kind === "stream-big") for (const ev of ["move", "resize", "moved", "resized"]) w.on(ev, () => updateTileGhosts());
         setupFrames[kind] = w;
     };
     make("stream-big", big, true);
@@ -2372,6 +2478,7 @@ function openSetupFrames(key) {
     if (!tiledSetup) make("stream-small", small, true);
     make("notify", nt, false);
     if (!tiledSetup) (prof.video?.extra || vp.extraBounds || []).filter(b => boundsOnScreen(b)).forEach(b => addSetupStreamFrame(b));
+    else openTileGhosts(key);
 }
 
 // One more stream window place (for watching several streams). A new frame
@@ -2394,10 +2501,55 @@ function addSetupStreamFrame(bounds) {
 }
 
 function closeSetupFrames() {
+    closeTileGhosts();
     for (const k of Object.keys(setupFrames)) {
         dropAttachments("f:" + k);
         try { if (!setupFrames[k].isDestroyed()) setupFrames[k].close(); } catch (e) {}
         delete setupFrames[k];
+    }
+}
+
+// ── Setup ghosts: in tiled setup, dimmed non-interactive frames where the other
+// tiles (main 2.., then the smalls) will go, from the anchor frame. Not snap
+// targets, not saved.
+const setupGhosts = [];   // { win, label } in slot order
+function ghostSlots(key) {
+    const big = setupFrames["stream-big"];
+    if (!big || big.isDestroyed()) return [];
+    const t = tilingOf(layoutProfiles()[key]);
+    // Slot 0 is the anchor itself; the ghosts are the rest of the mains and 3 smalls.
+    const rects = computeTileRects(big.getBounds(), t, t.mains + 3).slice(1);
+    return rects.map((r, i) => ({ r, label: i < t.mains - 1 ? "Main " + (i + 2) : "Small " + (i - t.mains + 2) }));
+}
+function openTileGhosts(key) {
+    closeTileGhosts();
+    for (const s of ghostSlots(key)) {
+        const w = new BrowserWindow({
+            x: s.r.x, y: s.r.y, width: s.r.width, height: s.r.height,
+            frame: false, transparent: true, backgroundColor: "#00000000",
+            alwaysOnTop: true, resizable: false, skipTaskbar: true, hasShadow: false,
+            focusable: false, show: false,
+            webPreferences: { nodeIntegration: false, contextIsolation: true }
+        });
+        w.setAlwaysOnTop(true, "screen-saver");
+        w.setIgnoreMouseEvents(true);
+        w.loadFile(path.join(__dirname, "placeholder.html"), { query: { ghost: s.label } });
+        w.once("ready-to-show", () => { try { w.showInactive(); } catch (e) {} });
+        setupGhosts.push({ win: w, label: s.label });
+    }
+}
+// Same slots as openTileGhosts, following the anchor frame. Slot order is fixed per tiling.
+function updateTileGhosts() {
+    if (!setupGhosts.length || !setupMode) return;
+    const slots = ghostSlots(setupMode.key);
+    setupGhosts.forEach((g, i) => {
+        if (g.win.isDestroyed() || !slots[i]) return;
+        try { g.win.setBounds(slots[i].r); } catch (e) {}
+    });
+}
+function closeTileGhosts() {
+    for (const g of setupGhosts.splice(0)) {
+        try { if (!g.win.isDestroyed()) g.win.close(); } catch (e) {}
     }
 }
 
@@ -2959,6 +3111,12 @@ function rebuildTrayMenu() {
                 { label: "100%", click: () => setOpacityAll(1.0) }
             ]
         },
+        {
+            label: "Light stream rendering (may stutter)",
+            type: "checkbox",
+            checked: videoRenderMode() === "video",
+            click: (item) => setVideoRenderMode(item.checked ? "video" : "canvas")
+        },
         { type: "separator" },
         {
             label: "Click-through on fullscreen",
@@ -3013,6 +3171,22 @@ function setOpacityAll(val) {
         if (!rec.win || rec.win.isDestroyed()) continue;
         try { rec.win.setOpacity(val); } catch (e) {}
     }
+}
+
+// Stream rendering: "canvas" (smooth, default) or "video" (light, may stutter).
+function videoRenderMode() {
+    return settings.streamRender === "video" ? "video" : "canvas";
+}
+
+function setVideoRenderMode(mode) {
+    settings.streamRender = mode === "canvas" ? "canvas" : "video";
+    saveSettings();
+    const js = `window.__vetRenderMode = ${JSON.stringify(settings.streamRender)};` +
+        `if (window.__vetSetRenderMode) window.__vetSetRenderMode(${JSON.stringify(settings.streamRender)});`;
+    for (const v of viewers.values()) {
+        try { if (v.win && !v.win.isDestroyed()) v.win.webContents.executeJavaScript(js).catch(() => {}); } catch (e) {}
+    }
+    rebuildTrayMenu();
 }
 
 // =====================================================================
@@ -3221,12 +3395,18 @@ function aliveIn(group) {
 
 const TILE_SIDES = ["left", "right", "top", "bottom"];
 const TILE_OPPOSITE = { left: "right", right: "left", top: "bottom", bottom: "top" };
+// dir: where main windows 1.. go from main slot 0. Old profiles store arrange
+// ("row" = right, "column" = down) instead; it is read only when dir is missing.
+const TILE_DIRS = ["right", "left", "down", "up"];
+const TILE_DIR_OPPOSITE = { right: "left", left: "right", down: "up", up: "down" };
+const TILE_DIR_STEP = { right: [1, 0], left: [-1, 0], down: [0, 1], up: [0, -1] };
 function normTiling(t) {
     t = t && typeof t === "object" ? t : {};
+    const fromArrange = t.arrange === "column" ? "down" : t.arrange === "row" ? "right" : null;
     return {
         mode: t.mode === "tiled" ? "tiled" : "free",
         mains: [1, 2, 3].includes(Number(t.mains)) ? Number(t.mains) : 1,
-        arrange: t.arrange === "column" ? "column" : "row",
+        dir: TILE_DIRS.includes(t.dir) ? t.dir : (fromArrange || "right"),
         side: TILE_SIDES.includes(t.side) ? t.side : "left",
         small: [3, 4].includes(Number(t.small)) ? Number(t.small) : 3
     };
@@ -3239,7 +3419,7 @@ function mergeTiling(cur, patch) {
     return normTiling({
         mode: pick("mode", x => x === "free" || x === "tiled"),
         mains: pick("mains", x => [1, 2, 3].includes(Number(x))),
-        arrange: pick("arrange", x => x === "row" || x === "column"),
+        dir: pick("dir", x => TILE_DIRS.includes(x)),
         side: pick("side", x => TILE_SIDES.includes(x)),
         small: pick("small", x => [3, 4].includes(Number(x)))
     });
@@ -3257,8 +3437,10 @@ function defaultTileAnchor() {
     return { x: Math.round(wa.x + wa.width / 2 - 320), y: Math.round(wa.y + wa.height / 2 - 180), width: 640, height: 360 };
 }
 // Anchor = main slot 0's rect: the saved place for the main group; for another
-// overlay its corner (or the place it was dragged to).
+// overlay its corner (or the place it was dragged to). A maximized group has
+// its in-memory anchor instead.
 function anchorFor(group, p, list) {
+    if (tileMax.has(group)) return tileMax.get(group).rect;
     if (group === "") {
         const pb = p && p.video ? p.video.bounds : null;
         if (boundsOnScreen(pb)) return { x: pb.x, y: pb.y, width: pb.width, height: pb.height };
@@ -3269,65 +3451,113 @@ function anchorFor(group, p, list) {
     return overlayPlaceFor(group, 0).bounds || defaultTileAnchor();
 }
 
+// Rects of a tiled layout for `count` viewers from the anchor rect: the mains
+// (slot 0 = the anchor, each next main adjacent to the previous one in t.dir),
+// then the smalls along the side. Pure geometry. ok(rect) says whether a main or
+// a small may stay where it is (default: on a screen); if a main does not, the
+// mains go the opposite way, and if a small does not, the smalls go to the opposite side.
+function computeTileRects(anchor, t, count, ok) {
+    if (!(count > 0)) return [];
+    ok = ok || boundsOnScreen;
+    const M = Math.min(t.mains, count);
+    const mainsIn = (dir) => {
+        const [dx, dy] = TILE_DIR_STEP[dir];
+        const out = [{ x: anchor.x, y: anchor.y, width: anchor.width, height: anchor.height }];
+        for (let i = 1; i < M; i++) {
+            out.push({ x: anchor.x + dx * i * anchor.width, y: anchor.y + dy * i * anchor.height, width: anchor.width, height: anchor.height });
+        }
+        return out;
+    };
+    let mains = mainsIn(t.dir);
+    if (mains.slice(1).some(r => !ok(r))) mains = mainsIn(TILE_DIR_OPPOSITE[t.dir]);
+    const x0 = Math.min(...mains.map(r => r.x)), y0 = Math.min(...mains.map(r => r.y));
+    const x1 = Math.max(...mains.map(r => r.x + r.width)), y1 = Math.max(...mains.map(r => r.y + r.height));
+    const block = { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+    const n = count - M;
+    let smalls = layoutSmalls(n, block, t.small, t.side);
+    if (smalls.some(r => !ok(r))) smalls = layoutSmalls(n, block, t.small, TILE_OPPOSITE[t.side]);
+    return mains.concat(smalls);
+}
+
 // Rects of the group's viewers in slot order (same indexes as aliveIn(group)).
 function tileRects(group, p) {
     const list = aliveIn(group);
     if (!list.length) return [];
-    const t = tilingOf(p);
-    const anchor = anchorFor(group, p, list);
-    const M = Math.min(t.mains, list.length);
-    const mains = [{ x: anchor.x, y: anchor.y, width: anchor.width, height: anchor.height }];
-    for (let i = 1; i < M; i++) {
-        mains.push(t.arrange === "column"
-            ? { x: anchor.x, y: anchor.y + i * anchor.height, width: anchor.width, height: anchor.height }
-            : { x: anchor.x + i * anchor.width, y: anchor.y, width: anchor.width, height: anchor.height });
-    }
-    const x0 = Math.min(...mains.map(r => r.x)), y0 = Math.min(...mains.map(r => r.y));
-    const x1 = Math.max(...mains.map(r => r.x + r.width)), y1 = Math.max(...mains.map(r => r.y + r.height));
-    const block = { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
-    const w = Math.max(1, Math.round(anchor.width / t.small));
-    const h = Math.max(1, Math.round(w * anchor.height / anchor.width));
-    const n = list.length - M;
-    let smalls = layoutSmalls(n, block, w, h, t.side);
-    if (smalls.some(r => !boundsOnScreen(r))) smalls = layoutSmalls(n, block, w, h, TILE_OPPOSITE[t.side]);
-    return mains.concat(smalls);
+    return computeTileRects(anchorFor(group, p, list), tilingOf(p), list.length);
+}
+
+// `total` integer pixels split into `parts` that sum exactly to it (the first parts take the remainder).
+function splitPx(total, parts) {
+    total = Math.round(total);
+    const base = Math.floor(total / parts), extra = total - base * parts;
+    return Array.from({ length: parts }, (_, i) => base + (i < extra ? 1 : 0));
 }
 
 // The small (non-main) tiles along one side of the main block, flush to it and to each other.
-function layoutSmalls(n, block, w, h, side) {
+// Left/right: columns going outward, each holding `small` tiles that split the block's
+// height exactly; tile width = round(block height / small * 16/9). Top/bottom: the same
+// with rows and the block's width. A partial last column/row keeps the same tile size.
+function layoutSmalls(n, block, small, side) {
     const out = [];
-    if (side === "left" || side === "right") {
-        const rows = Math.max(1, Math.floor(block.height / h));
-        for (let k = 0; k < n; k++) {
-            const col = Math.floor(k / rows), row = k % rows;
-            const x = side === "left" ? block.x - (col + 1) * w : block.x + block.width + col * w;
-            out.push({ x, y: block.y + row * h, width: w, height: h });
-        }
-    } else {
-        const cols = Math.max(1, Math.floor(block.width / w));
-        for (let k = 0; k < n; k++) {
-            const row = Math.floor(k / cols), col = k % cols;
-            const y = side === "top" ? block.y - (row + 1) * h : block.y + block.height + row * h;
-            out.push({ x: block.x + col * w, y, width: w, height: h });
-        }
+    const vertical = side === "left" || side === "right";
+    const along = vertical ? block.height : block.width;
+    const thick = Math.max(1, Math.round(vertical ? along / small * 16 / 9 : along / small * 9 / 16));
+    const lens = splitPx(along, small);
+    const starts = [];
+    let at = vertical ? block.y : block.x;
+    for (const len of lens) { starts.push(at); at += len; }
+    for (let k = 0; k < n; k++) {
+        const col = Math.floor(k / small), row = k % small;
+        const off = col * thick, s = starts[row], len = lens[row];
+        if (side === "left") out.push({ x: block.x - off - thick, y: s, width: thick, height: len });
+        else if (side === "right") out.push({ x: block.x + block.width + off, y: s, width: thick, height: len });
+        else if (side === "top") out.push({ x: s, y: block.y - off - thick, width: len, height: thick });
+        else out.push({ x: s, y: block.y + block.height + off, width: len, height: thick });
     }
     return out;
 }
 
 // Puts the group's viewers on their tile rects (when tiled) and tells their pages the tile state.
+// A tiled viewer has no aspect lock (its rect is exact; the stream letterboxes inside it).
+// A free viewer gets its aspect lock back.
+const tileLogSig = new Map();   // group -> last logged tile state (logged only on change)
 function retile(group, p) {
     if (p === undefined) p = tilingProfile();
     group = String(group || "");
     try {
         const list = aliveIn(group);           // live windows only
-        if (isTiled(p) && list.length) {
-            const rects = tileRects(group, p);
+        // A maximized fit only holds for the count it was made for.
+        const m = tileMax.get(group);
+        if (m && m.count !== list.length) tileMax.delete(group);
+        const tiled = isTiled(p);
+        if (tiled && list.length) {
+            const anchor = anchorFor(group, p, list);
+            const rects = computeTileRects(anchor, tilingOf(p), list.length);
+            const placed = [];
             list.forEach((v, i) => {
                 if (!v.win || v.win.isDestroyed() || !rects[i]) return;
                 v.place = null;
+                try { v.win.setAspectRatio(0); v.win.setMinimumSize(48, 27); } catch (e) {}
                 setBoundsQuiet(v.win, rects[i]);
-                followAttached("v:" + v.key);
+                placed.push(v);
             });
+            // Attached windows follow once every tile is in its place.
+            placed.forEach(v => followAttached("v:" + v.key));
+            const actual = list.map(v => (v.win && !v.win.isDestroyed() ? v.win.getBounds() : null));
+            const sig = JSON.stringify([anchor, rects, actual]);
+            if (tileLogSig.get(group) !== sig) {
+                tileLogSig.set(group, sig);
+                videoLog("[tile]", group, "anchor", anchor, "rects", rects, "actual", actual);
+            }
+        } else if (!tiled) {
+            list.forEach(v => {
+                if (!v.win || v.win.isDestroyed()) return;
+                try {
+                    v.win.setMinimumSize(160, 90);
+                    if (v.aspect) v.win.setAspectRatio(v.aspect);
+                } catch (e) {}
+            });
+            tileLogSig.delete(group);
         }
         list.forEach(v => sendTileFlags(v, p, list));
     } catch (e) { videoLog("[tile] retile failed", group, String((e && e.stack) || e)); }
@@ -3346,14 +3576,23 @@ function sendTileFlags(v, p, list) {
         const tiled = t.mode === "tiled";
         const M = Math.min(t.mains, list.length);
         const idx = list.indexOf(v);
-        const st = { tiled, isMain: tiled && idx >= 0 && idx < M };
+        const st = {
+            tiled,
+            isMain: tiled && idx >= 0 && idx < M,
+            // Only main slot 0 (the anchor) can change size; other tiles hide the size toggle.
+            canResize: tiled && idx === 0,
+            maximized: tiled && tileMax.has(groupOf(v.main, v.inst))
+        };
         v.win.webContents.executeJavaScript(`window.__vetSetTile && window.__vetSetTile(${JSON.stringify(st)});`).catch(() => {});
     } catch (e) { videoLog("[tile] sendTileFlags failed", String((e && e.stack) || e)); }
 }
 
 // Remembers an anchor rect: the main group's saved place, or another overlay's own anchor.
+// A maximized group only changes its in-memory anchor; the saved one is never touched.
 function storeAnchor(group, p, r) {
     const rect = { x: r.x, y: r.y, width: r.width, height: r.height };
+    const m = tileMax.get(group);
+    if (m) { m.rect = rect; return; }
     if (group === "") {
         if (p) p.video = { ...(p.video || {}), bounds: rect };
         videoPrefs().bounds = rect;
@@ -3415,6 +3654,40 @@ function promoteViewer(key) {
     swapTiles(group, p, v, list[0]);
 }
 
+// Tiled maximize: a group's block fills the work area of the display its viewer
+// is on, as the largest 16:9 anchor whose whole block fits (centred on the spare
+// axis). Toggling again drops it and the saved anchor is back. Memory only.
+const tileMax = new Map();   // group -> { rect, count }
+function toggleTileMaximize(v) {
+    const p = tilingProfile();
+    if (!v || !v.win || v.win.isDestroyed() || !isTiled(p)) return false;
+    const group = groupOf(v.main, v.inst);
+    if (tileMax.has(group)) { tileMax.delete(group); retile(group, p); return true; }
+    const list = aliveIn(group);
+    if (!list.length) return false;
+    const wa = screen.getDisplayMatching(v.win.getBounds()).workArea;
+    const t = tilingOf(p);
+    const count = list.length;
+    // The whole block for anchor width W, relative to the anchor's corner.
+    const blockAt = (W) => {
+        const a = { x: 0, y: 0, width: W, height: Math.round(W * 9 / 16) };
+        const rs = computeTileRects(a, t, count, () => true);
+        const x0 = Math.min(...rs.map(r => r.x)), y0 = Math.min(...rs.map(r => r.y));
+        const x1 = Math.max(...rs.map(r => r.x + r.width)), y1 = Math.max(...rs.map(r => r.y + r.height));
+        return { anchor: a, x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+    };
+    const fits = (b) => b.width <= wa.width && b.height <= wa.height;
+    const ref = blockAt(1000);      // the block grows linearly with the anchor width
+    let W = Math.max(160, Math.floor(1000 * Math.min(wa.width / ref.width, wa.height / ref.height)));
+    let b = blockAt(W);
+    while (W > 160 && !fits(b)) { W--; b = blockAt(W); }
+    const ax = wa.x + Math.floor((wa.width - b.width) / 2) - b.x;
+    const ay = wa.y + Math.floor((wa.height - b.height) / 2) - b.y;
+    tileMax.set(group, { rect: { x: ax, y: ay, width: b.anchor.width, height: b.anchor.height }, count });
+    retile(group, p);
+    return true;
+}
+
 // POST /layouts/tiling: merge a partial tiling setting into a layout.
 function setTiling(key, patch) {
     const profiles = layoutProfiles();
@@ -3422,6 +3695,7 @@ function setTiling(key, patch) {
     const p = profiles[key];
     p.video = p.video && typeof p.video === "object" ? p.video : {};
     p.video.tiling = mergeTiling(p.video.tiling, patch);
+    tileMax.clear();                  // a maximized fit is for the old tiling
     // Setup open for this layout: keep where its frames are, then rebuild them
     // for the new tiling (tiled shows only big + notify, free restores the rest).
     const inSetup = !!(setupMode && setupMode.key === key);
@@ -3461,7 +3735,7 @@ function openVideoWindow(params) {
     const win = new BrowserWindow({
         width: 640, height: 380, minWidth: 160, minHeight: 90,
         ...(startBounds || {}),
-        frame: false, transparent: true, backgroundColor: "#00000000",
+        frame: false, transparent: false, backgroundColor: "#000000",
         alwaysOnTop: true, resizable: true, skipTaskbar: true, hasShadow: true,
         show: false,
         webPreferences: {
@@ -3486,7 +3760,7 @@ function openVideoWindow(params) {
     applyVideoClickThrough();
     win.setVisibleOnAllWorkspaces(true);
     try { win.setOpacity(_videoAlpha); } catch (e) {}
-    win.loadFile(path.join(__dirname, "video.html"));
+    win.loadFile(path.join(__dirname, "video.html"), { query: { render: videoRenderMode() } });
     retile(groupOf(main, inst));
 
     wireVideoWindowIpc(win);
@@ -3522,13 +3796,15 @@ function openVideoWindow(params) {
             // a call right at load time doesn't always stick: repeat it.
             try { win.setSkipTaskbar(true); } catch (e) {}
             setTimeout(() => { try { if (!win.isDestroyed()) win.setSkipTaskbar(true); } catch (e) {} }, 600);
-            v.paused = false;               // the page starts fresh; the next state re-sends it
+            v.paused = false;   // the page starts fresh; the next state re-sends it. A local viewer with no source yet shows the waiting state, not the plate
             win.webContents.executeJavaScript(
+                `window.__vetRenderMode = ${JSON.stringify(videoRenderMode())};` +
+                `if (window.__vetSetRenderMode) window.__vetSetRenderMode(${JSON.stringify(videoRenderMode())});` +
                 `window.__vetStreamParams = ${JSON.stringify(v.params)};` +
                 (resume ? `if (window.__vetResumeReconnect) window.__vetResumeReconnect(${resume});` : "") +
                 `if (window.__vetSetPreview) window.__vetSetPreview(${v.preview});` +
                 `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((videoPrefs().zoom || {})[v.key] || null)});` +
-                (v.local ? `if (window.__vetStartLocal) window.__vetStartLocal(${JSON.stringify(v.sourceId)});`
+                (v.local ? (v.sourceId ? `if (window.__vetStartLocal) window.__vetStartLocal(${JSON.stringify(v.sourceId)});` : "")
                          : `if (window.vetWebRTC) window.vetWebRTC.setChannel(${JSON.stringify(ch)});`)
             ).catch(() => {});
         } catch (e) {}
@@ -3558,7 +3834,7 @@ function openVideoWindow(params) {
                 const idx = viewersIn(g).indexOf(v);
                 viewers.delete(key);
                 orderRemove(g, key);
-                if (!aliveIn(g).length) tileAnchors.delete(g);
+                if (!aliveIn(g).length) { tileAnchors.delete(g); tileMax.delete(g); }
                 if (!v._swapped) { if (isTiled(tilingProfile())) retile(g); else reflowViewers(g, idx); }
             }
             // "closed": the window is gone for good (not a reconnect), so Discord can stop watching too
@@ -3577,7 +3853,47 @@ function myStreamCaptureId() {
         const scr = cachedSources.find(s => s.type === "screen" && String(s.handle) === sh[1]);
         src = scr ? scr.id : "screen:0:0";
     }
-    return { userId: me.userId, src };
+    const known = cachedSources.find(s => s.id === src);
+    return { userId: me.userId, src, name: known ? known.name : "" };
+}
+
+// Maps a stream source id to a live Electron capture source. Discord ids may be
+// "window:<hwnd>" while Electron uses "window:<hwnd>:0". Order: exact id, id prefix,
+// then name (the window may have been re-created). Returns {id, name} or null.
+async function resolveLocalSource(srcId, name) {
+    let list = [];
+    try {
+        list = await desktopCapturer.getSources({ types: ["window", "screen"], thumbnailSize: { width: 0, height: 0 } });
+    } catch (e) {
+        videoLog("[video] local source lookup failed", String((e && e.stack) || e));
+        return null;
+    }
+    const given = String(srcId);
+    const type = given.split(":")[0];
+    const hit = list.find(x => x.id === given)
+        || list.find(x => x.id.startsWith(given + ":"))
+        || (name ? list.find(x => x.name === name && x.id.split(":")[0] === type) : null);
+    return hit ? { id: hit.id, name: hit.name } : null;
+}
+
+function notifyLocalSourceGone() {
+    try {
+        addNotification({ id: "stream-gone-" + Date.now(), kind: "dm", name: "Stream", channelId: "stream",
+            text: "Your stream source window is gone - nothing to show" });
+    } catch (e) {}
+}
+
+// Am I streaming now? A source that is not listed while this is true is minimized, not gone.
+function iAmStreaming() {
+    const me = (Array.isArray(state.users) ? state.users : []).find(u => u.isSelf);
+    return !!(me && me.streaming) || !!myStreamCaptureId();
+}
+
+// My own stream viewer shows the calm "paused" card; no capture runs until the source is listed again.
+function setLocalPaused(v, on) {
+    v.paused = !!on;
+    if (!v.win || v.win.isDestroyed()) return;
+    try { v.win.webContents.executeJavaScript(`window.__vetSetPaused && window.__vetSetPaused(${!!on}, true);`).catch(() => {}); } catch (e) {}
 }
 
 // My own stream: from Discord's pipeline via the plugin (what Discord
@@ -3592,11 +3908,16 @@ function openOwnStream(winId) {
 }
 
 // The plugin couldn't get Discord's own-stream track: swap to local capture.
-function ownStreamToLocal(winId) {
+async function ownStreamToLocal(winId) {
     const cur = myStreamCaptureId();
     if (!cur) return;
     const inst = String(winId || "");
     const ownKey = viewerKey("own:" + cur.userId, inst);
+    // Validate before touching the own viewer: a dead window id here crashes Chromium's capture.
+    const src = await resolveLocalSource(cur.src, cur.name);
+    // Not listed while streaming = minimized: open in the waiting state (no plate); followMyStreamSource pauses it after two failed polls and starts the capture once it is back.
+    if (!src) videoLog("[video] local source not listed, opening paused", cur.src);
+    if (viewers.has(viewerKey("local:" + cur.userId, inst))) return;   // opened while we were checking
     const v = viewers.get(ownKey);
     let bounds = null;
     const order = [...viewers.keys()];
@@ -3605,9 +3926,13 @@ function ownStreamToLocal(winId) {
         v.local = true;                 // its "closed" handler must not ask the plugin for anything
         v._swapped = true;              // ...nor move the others
         viewers.delete(v.key);
-        try { v.win.close(); } catch (e) {}
+        // Don't close it right away: tearing down a fresh webContents while the local
+        // capture starts crashes Chromium (NOTREACHED). Hide now, close later.
+        const old = v.win;
+        try { old.hide(); } catch (e) {}
+        setTimeout(() => { try { if (!old.isDestroyed()) old.close(); } catch (e) {} }, 2500);
     }
-    openVideoWindow({ local: true, userId: cur.userId, sourceId: cur.src, inst });
+    openVideoWindow({ local: true, userId: cur.userId, sourceId: src ? src.id : null, inst });
     const nk = viewerKey("local:" + cur.userId, inst);
     const nv = viewers.get(nk);
     if (nv) {
@@ -3627,21 +3952,41 @@ function ownStreamToLocal(winId) {
         if (oi >= 0 && ni >= 0) { ord.splice(ni, 1); ord[oi] = nk; }
         if (isTiled(tilingProfile())) retile(ng);
     }
+    videoLog("[video] local source chosen", src ? src.id : "none (paused)", src ? src.name : "");
 }
 
-// I switched what I stream: the "my stream" viewer follows.
-function followMyStreamSource() {
+// I switched what I stream, or the streamed window was minimized: the "my stream"
+// viewer follows the source. Not listed while streaming = paused (not gone); polled every 2 s
+// (this runs every 1 s from checkVideoAutoClose).
+async function followMyStreamSource() {
     const cur = myStreamCaptureId();
     if (!cur) return;
     for (const v of viewers.values()) {
-        if (!v.local || v.sourceId === cur.src || !v.win || v.win.isDestroyed()) continue;
-        videoLog("own stream source changed", v.sourceId, "->", cur.src);
-        v.sourceId = cur.src;
-        v.params.sourceId = cur.src;
+        if (!v.local || !v.win || v.win.isDestroyed() || v._resolving) continue;
+        if (Date.now() - (v._pollAt || 0) < 2000) continue;
+        v._pollAt = Date.now();
+        v._resolving = true;
+        const src = await resolveLocalSource(cur.src, cur.name);
+        v._resolving = false;
+        if (!src) {
+            // Not listed while streaming: paused only after two failed polls in a row (no flicker).
+            v._misses = (v._misses || 0) + 1;
+            if (v._misses >= 2 && !v.paused) { videoLog("[video] local source not listed (minimized?), paused", cur.src); setLocalPaused(v, true); }
+            continue;
+        }
+        const wasPaused = !!v.paused;
+        v._misses = 0;
+        if (wasPaused) setLocalPaused(v, false);   // listed again: the plate goes at once
+        if (v.sourceId === src.id && !wasPaused) continue;   // still capturing it
+        if (!v.win || v.win.isDestroyed()) continue;
+        videoLog("[video] local source", cur.src, "->", src.id, src.name);
+        v.sourceId = src.id;
+        v.params.sourceId = src.id;
+        v.paused = false;
         try {
             v.win.webContents.executeJavaScript(
                 `window.__vetStreamParams = ${JSON.stringify(v.params)};` +
-                `if (window.__vetStartLocal) window.__vetStartLocal(${JSON.stringify(cur.src)});`).catch(() => {});
+                `if (window.__vetStartLocal) window.__vetStartLocal(${JSON.stringify(src.id)});`).catch(() => {});
         } catch (e) {}
     }
 }
@@ -3661,7 +4006,27 @@ function appendLog(file, text) {
 }
 const PLUGIN_LOG_FILE = path.join(VIDEO_LOG_DIR, "plugin.log");
 
-function videoLog(...args) {
+// Lines are buffered and written every 500 ms in one append (exitLog stays synchronous).
+let _videoLogBuf = [];
+let _videoLogTimer = null;
+
+// Synchronous flush for exit / fatal paths: writes whatever is buffered right now.
+function flushVideoLogSync() {
+    if (_videoLogTimer) { clearTimeout(_videoLogTimer); _videoLogTimer = null; }
+    if (_videoLogBuf.length === 0) return;
+    const text = _videoLogBuf.join("");
+    _videoLogBuf = [];
+    try {
+        fs.mkdirSync(VIDEO_LOG_DIR, { recursive: true });
+        fs.appendFileSync(VIDEO_LOG_FILE, text);
+    } catch (e) {}
+}
+
+function flushVideoLog() {
+    _videoLogTimer = null;
+    if (_videoLogBuf.length === 0) return;
+    const text = _videoLogBuf.join("");
+    _videoLogBuf = [];
     try {
         fs.mkdirSync(VIDEO_LOG_DIR, { recursive: true });
         try {
@@ -3669,10 +4034,17 @@ function videoLog(...args) {
                 fs.renameSync(VIDEO_LOG_FILE, VIDEO_LOG_FILE + ".old");
             }
         } catch (e) {}
+        fs.appendFile(VIDEO_LOG_FILE, text, () => {});
+    } catch (e) {}
+}
+
+function videoLog(...args) {
+    try {
         const line = new Date().toISOString() + " " + args.map(a =>
             typeof a === "string" ? a : (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })()
         ).join(" ") + "\n";
-        fs.appendFile(VIDEO_LOG_FILE, line, () => {});
+        _videoLogBuf.push(line);
+        if (!_videoLogTimer) _videoLogTimer = setTimeout(flushVideoLog, 500);
     } catch (e) {}
 }
 
@@ -3733,6 +4105,28 @@ setInterval(() => {
     }
 }, 2000);
 
+// Windows can put a skipTaskbar window back on the taskbar when it is shown, moved
+// or resized (layout switches, setup frames). Re-assert it on those events for every
+// window except the ones meant to be on the taskbar (layouts window: _vetTaskbar).
+app.on("browser-window-created", (_e, w) => {
+    const keep = () => { try { if (!w.isDestroyed() && !w._vetTaskbar) w.setSkipTaskbar(true); } catch (e) {} };
+    for (const ev of ["show", "moved", "resized", "restore", "focus"]) w.on(ev, keep);
+});
+
+// Events fire only after the change, so the taskbar button can already flash for a
+// second or two (layout auto-switch moves many windows at once). Re-assert right
+// inside every programmatic geometry/visibility call instead, before Windows repaints.
+for (const m of ["setBounds", "setPosition", "setSize", "setContentBounds", "setAspectRatio",
+                 "setMinimumSize", "show", "showInactive", "setAlwaysOnTop", "setVisibleOnAllWorkspaces"]) {
+    const orig = BrowserWindow.prototype[m];
+    if (typeof orig !== "function") continue;
+    BrowserWindow.prototype[m] = function (...args) {
+        const r = orig.apply(this, args);
+        try { if (!this.isDestroyed() && !this._vetTaskbar) this.setSkipTaskbar(true); } catch (e) {}
+        return r;
+    };
+}
+
 // Streamer's window minimized (Discord pauses the stream): the viewer shows a
 // calm "paused" card instead of reconnecting.
 function updateViewerPaused() {
@@ -3751,7 +4145,7 @@ function updateViewerPaused() {
 
 function checkVideoAutoClose() {
     if (!isPluginAlive()) return;   // no fresh info: don't guess
-    followMyStreamSource();
+    followMyStreamSource().catch(e => videoLog("[video] follow source failed", String((e && e.stack) || e)));
     updateViewerPaused();
     for (const v of [...viewers.values()]) {
         if (isViewerLive(v)) { v.notLiveSince = 0; continue; }
@@ -3787,6 +4181,7 @@ function saveVideoBoundsSoon(v) {
         v._saveTimer = null;
         if (!v.win || v.win.isDestroyed()) return;
         if (viewersIn("")[0] !== v) return;
+        if (tileMax.has("")) return;          // a maximized block is not the saved place
         const p = videoPrefs();
         const b = v.win.getBounds();
         if (v.preview) p.previewBounds = b; else p.bounds = b;
@@ -3807,10 +4202,10 @@ function applyVideoAspect(v, w, h) {
     if (Math.abs(aspect - v.aspect) < 0.01) return;
     v.aspect = aspect;
     try {
-        v.win.setAspectRatio(aspect);
-        // Tiled: the tile rects stay as they are (the stream letterboxes inside them).
+        // Tiled: no aspect lock, the tile rects stay as they are (the stream letterboxes inside them).
         if (isTiled(tilingProfile())) retile(groupOf(v.main, v.inst));
         else {
+            v.win.setAspectRatio(aspect);
             v.win.setBounds(fitToAspect(v.place || v.win.getBounds(), aspect));
             followAttached("v:" + v.key);
         }
@@ -3818,8 +4213,42 @@ function applyVideoAspect(v, w, h) {
     videoLog("aspect locked", v.key, w + "x" + h);
 }
 
+function sendPreviewState(v) {
+    try {
+        const p = videoPrefs();
+        v.win.webContents.executeJavaScript(
+            `if (window.__vetSetPreview) window.__vetSetPreview(${v.preview});` +
+            (v.preview ? "" : `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((p.zoom || {})[v.key] || null)});`)
+        ).catch(() => {});
+    } catch (e) {}
+}
+// Tiled: only main slot 0 toggles, and it changes the anchor size (16:9, top-left kept):
+// preview 320x180, back to the large width it had. Other tiles ignore the toggle.
+// Returns false when v is not slot 0.
+function toggleTiledPreview(v, p) {
+    const group = groupOf(v.main, v.inst);
+    const list = aliveIn(group);
+    if (list[0] !== v) return false;
+    if (tileMax.has(group)) tileMax.delete(group);     // a maximized fit is dropped first
+    const anchor = anchorFor(group, p, list);
+    let w;
+    if (!v.preview) { v.tiledLargeWidth = anchor.width; w = 320; }
+    else w = v.tiledLargeWidth > 0 ? v.tiledLargeWidth : 640;
+    const h = Math.round(w * 9 / 16);
+    v.preview = !v.preview;
+    storeAnchor(group, p, { x: anchor.x, y: anchor.y, width: w, height: h });
+    retile(group, p);
+    if (group === "") { videoPrefs().preview = v.preview; saveSettingsSoon(); }
+    return true;
+}
+
 function toggleVideoPreview(v) {
     if (!v || !v.win || v.win.isDestroyed()) return;
+    const tp = tilingProfile();
+    if (isTiled(tp)) {
+        if (toggleTiledPreview(v, tp)) sendPreviewState(v);
+        return;
+    }
     const first = viewersIn("")[0] === v;
     const p = videoPrefs();
     const cur = v.win.getBounds();
@@ -3831,21 +4260,16 @@ function toggleVideoPreview(v) {
         // keep the stream's proportions in preview too
         v.preview = true;
         v.place = target;
-        v.win.setBounds(fitToAspect(target, v.aspect));
+        setBoundsQuiet(v.win, fitToAspect(target, v.aspect));
     } else {
         if (first) p.previewBounds = cur;
         const target = first && boundsOnScreen(p.bounds) ? p.bounds : v.savedBounds;
         v.preview = false;
-        if (target) { v.place = target; v.win.setBounds(fitToAspect(target, v.aspect)); }
+        if (target) { v.place = target; setBoundsQuiet(v.win, fitToAspect(target, v.aspect)); }
     }
     followAttached("v:" + v.key);
     if (first) { p.preview = v.preview; saveSettings(); }
-    try {
-        v.win.webContents.executeJavaScript(
-            `if (window.__vetSetPreview) window.__vetSetPreview(${v.preview});` +
-            (v.preview ? "" : `if (window.__vetSetZoom) window.__vetSetZoom(${JSON.stringify((p.zoom || {})[v.key] || null)});`)
-        ).catch(() => {});
-    } catch (e) {}
+    sendPreviewState(v);
 }
 
 function openSenderWindow() {
@@ -3881,6 +4305,16 @@ if (!app.requestSingleInstanceLock()) {
     app.quit();
     process.exit(0);
 }
+
+// Why the app ends: written synchronously so the line survives a hard exit.
+function exitLog(msg) {
+    try { flushVideoLogSync(); } catch (e) {}
+    try { fs.appendFileSync(VIDEO_LOG_FILE, new Date().toISOString() + " [exit] " + msg + "\n"); } catch (e) {}
+}
+process.on("exit", (code) => exitLog("process exit code=" + code + " quitting=" + isQuitting));
+app.on("before-quit", () => exitLog("before-quit quitting=" + isQuitting + "\n" + new Error("stack").stack));
+app.on("child-process-gone", (_e, d) => exitLog("child-process-gone " + JSON.stringify(d)));
+app.on("render-process-gone", (_e, wc, d) => exitLog("render-process-gone " + JSON.stringify(d) + " url=" + (wc && !wc.isDestroyed() ? wc.getURL() : "?")));
 
 app.whenReady().then(async () => {
     loadSettings();

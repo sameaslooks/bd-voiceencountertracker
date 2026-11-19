@@ -18,6 +18,8 @@
     .t { font-size: 13px; font-weight: 700; color: #fff; }
     .s { font-size: 10px; color: #b5bac1; }
     svg { width: 22px; height: 22px; color: #b5bac1; }
+    /* Tile ghost (?ghost=Label): dimmed, not draggable, label only */
+    body.ghost #f { opacity: 0.35; background: none; cursor: default; -webkit-app-region: no-drag; }
 </style>
 </head>
 <body>
@@ -34,10 +36,19 @@ const LABEL = {
     "stream-extra": ["Stream", "opens here when one more is watched"],
     "notify":       ["Notifications", "drag"]
 };
-let [t, s] = LABEL[kind] || LABEL[String(kind).replace(/-\d+$/, "")] || ["", ""];
-const extraN = /^stream-extra-(\d+)$/.exec(kind || "");
-if (extraN) t = "Stream " + (Number(extraN[1]) + 1);     // extra-1 = the 2nd stream
-document.getElementById("f").innerHTML = `${kind === "notify" ? ICON.notify : ICON.stream}<span class="t">${t}</span><span class="s">${s}</span>`;
+const ghost = new URLSearchParams(location.search).get("ghost");
+if (ghost) {
+    document.body.classList.add("ghost");
+    const el = document.createElement("span");
+    el.className = "t";
+    el.textContent = ghost;
+    document.getElementById("f").appendChild(el);
+} else {
+    let [t, s] = LABEL[kind] || LABEL[String(kind).replace(/-\d+$/, "")] || ["", ""];
+    const extraN = /^stream-extra-(\d+)$/.exec(kind || "");
+    if (extraN) t = "Stream " + (Number(extraN[1]) + 1);     // extra-1 = the 2nd stream
+    document.getElementById("f").innerHTML = `${kind === "notify" ? ICON.notify : ICON.stream}<span class="t">${t}</span><span class="s">${s}</span>`;
+}
 </script>
 </body>
 </html>

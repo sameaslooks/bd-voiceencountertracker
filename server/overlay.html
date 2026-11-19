@@ -64,6 +64,26 @@
     }
     #drag-bar .count { opacity: 0.7; }
 
+    /* Header clock: local time, or session length while in voice (alternating) */
+    #drag-bar .time-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex-shrink: 0;
+        font-size: 11px;
+        letter-spacing: 0;
+        text-transform: none;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+        color: #949ba4;
+        -webkit-app-region: drag;
+        pointer-events: none;
+        transition: opacity 200ms ease;
+    }
+    #drag-bar .time-label.fading { opacity: 0; }
+    #drag-bar .time-label.hidden { display: none; }
+    #drag-bar .time-label svg { width: 10px; height: 10px; display: block; color: #72767d; flex-shrink: 0; }
+
     #stream-source-btn {
         background: transparent;
         border: none;
@@ -224,6 +244,9 @@
         background: rgba(255,255,255,0.15);
     }
     #users { flex: 0 0 auto; }
+    /* Message states (offline / not in voice) fit the window exactly: no scroll */
+    #users-wrap:has(> #empty.offline),
+    #users-wrap:has(> #empty.idle) { overflow: hidden; }
 
     #empty {
         flex: 1 1 auto;
@@ -606,6 +629,7 @@
             <span id="channel-name">Voice</span>
         </span>
         <span class="header-right">
+            <span id="time-label" class="time-label hidden" aria-hidden="true"><span id="time-ico"></span><span id="time-txt"></span></span>
             <button id="leave-btn" class="hidden" type="button" title="Hold to leave voice">
                 <svg class="ring" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="8"/></svg>
                 <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M21.1 13.2c.6.6.6 1.5 0 2.1l-1.4 1.4c-.5.5-1.3.6-1.9.2l-2.3-1.6c-.4-.3-.7-.8-.7-1.3v-1.6a12.6 12.6 0 0 0-5.6 0V14c0 .5-.3 1-.7 1.3l-2.3 1.6c-.6.4-1.4.3-1.9-.2l-1.4-1.4c-.6-.6-.6-1.5 0-2.1C5.4 10.6 8.6 9.5 12 9.5s6.6 1.1 9.1 3.7Z"/></svg>
@@ -745,6 +769,7 @@ let speakingSet    = new Set();
 let knownJoinTime  = new Map();
 let lastChannelId  = null;
 let lastStateSig   = "";
+let mySessionStart = null;   // ms epoch when I came into the current channel; null = not in voice
 
 let flashIconOnMute = true;
 
@@ -783,6 +808,7 @@ function esc(s) {
 }
 
 function showMessage(kind, text, channelLabel) {
+    mySessionStart = null;
     elChannelName.textContent = channelLabel || "Voice";
     elCount.textContent = "";
     elUsers.innerHTML = "";
@@ -1044,6 +1070,7 @@ function renderState(data) {
     const pluginAlive = data.pluginAlive !== false;
     const users = Array.isArray(data.users) ? data.users : [];
     const channelId = data.channelId ?? null;
+    mySessionStart = typeof data.mySessionStart === "number" && data.mySessionStart > 0 ? data.mySessionStart : null;
 
     flashIconOnMute = data?.prefs?.flashIconOnMute !== false;
 
@@ -1585,6 +1612,60 @@ function connectEvents() {
         startFallbackPoll();
     });
 }
+
+// ─── Header clock: local time; in voice it alternates with the session length ───
+const elDragBar   = document.getElementById("drag-bar");
+const elTime      = document.getElementById("time-label");
+const elTimeIco   = document.getElementById("time-ico");
+const elTimeTxt   = document.getElementById("time-txt");
+const CLOCK_SWAP_MS = 8000;
+const CLOCK_FADE_MS = 200;
+const CLOCK_HEADER_MIN_W = 200;
+const CLOCK_ICON_TIME = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M12 7v5.5l3.5 2" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>`;
+const CLOCK_ICON_SESSION = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="${PATH_HEADPHONES}"/></svg>`;
+
+function clockMode(now) {
+    return mySessionStart && Math.floor(now / CLOCK_SWAP_MS) % 2 === 1 ? "session" : "time";
+}
+function fmtClock(d) {
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+}
+function fmtSession(ms) {
+    const mins = Math.floor(Math.max(0, ms) / 60000);
+    if (mins < 60) return mins + "m";
+    const h = Math.floor(mins / 60);
+    if (h < 24) return h + "h " + String(mins % 60).padStart(2, "0") + "m";
+    return Math.floor(h / 24) + "d " + (h % 24) + "h";
+}
+
+let paintedMode = null;
+let clockFadeTimer = null;
+function paintClock(now) {
+    const mode = clockMode(now);
+    if (mode !== paintedMode) {
+        paintedMode = mode;
+        elTimeIco.innerHTML = mode === "session" ? CLOCK_ICON_SESSION : CLOCK_ICON_TIME;
+    }
+    elTimeTxt.textContent = mode === "session" ? fmtSession(now - mySessionStart) : fmtClock(new Date(now));
+}
+function tickClock() {
+    const now = Date.now();
+    elTime.classList.toggle("hidden", elDragBar.clientWidth < CLOCK_HEADER_MIN_W);
+    if (clockFadeTimer) return;                       // a fade is running; it repaints
+    if (paintedMode !== null && clockMode(now) !== paintedMode) {
+        elTime.classList.add("fading");
+        clockFadeTimer = setTimeout(() => {
+            clockFadeTimer = null;
+            paintClock(Date.now());
+            elTime.classList.remove("fading");
+        }, CLOCK_FADE_MS);
+        return;
+    }
+    paintClock(now);
+}
+tickClock();
+setInterval(tickClock, 1000);
+window.addEventListener("resize", tickClock);
 
 connectEvents();
 </script>
