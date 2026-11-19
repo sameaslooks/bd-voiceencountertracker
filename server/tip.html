@@ -58,23 +58,36 @@ function report() {
 async function renderPing() {
     let d = {};
     try { d = await (await fetch(API + "/ping/history", { cache: "no-store" })).json(); } catch (e) {}
-    const pts = (d.points || []).filter(p => p.v > 0);
+    const WIN = 10 * 60_000, GAP = 3000;               // window; consecutive points > GAP apart = out of voice
+    const now = d.now, t0 = now - WIN;
+    const pts = (d.points || []).filter(p => p.v > 0 && p.t >= t0);
     if (!pts.length) { el.innerHTML = `<span class="muted">No ping data</span>`; return report(); }
     const vals = pts.map(p => p.v);
     const max = Math.max(...vals), avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-    const W = 300, H = 46, t0 = d.now - 10 * 60_000;   // drawn in a fixed box, stretched to the tip's width
+    const newest = pts[pts.length - 1];
+    const inVoice = now - newest.t <= GAP;
+    const W = 300, H = 46;                              // drawn in a fixed box, stretched to the tip's width
     const top = Math.max(100, max * 1.1);
-    const x = (t) => Math.max(0, (t - t0) / (10 * 60_000) * W);
+    const x = (t) => Math.max(0, Math.min(W, (t - t0) / WIN * W));
     const y = (v) => H - Math.min(H, v / top * H);
-    let path = "";
-    pts.forEach((p, i) => { path += (i ? "L" : "M") + x(p.t).toFixed(1) + " " + y(p.v).toFixed(1); });
+    const P = (p) => x(p.t).toFixed(1) + " " + y(p.v).toFixed(1);
+    const segs = [];
+    pts.forEach((p, i) => { if (i === 0 || p.t - pts[i - 1].t > GAP) segs.push([]); segs[segs.length - 1].push(p); });
+    const solid = segs.map(seg => seg.length === 1
+        ? `M${P(seg[0])}h2`
+        : seg.map((p, j) => (j ? "L" : "M") + P(p)).join(""));
+    const bridges = segs.slice(1).map((seg, i) => {
+        const prev = segs[i], last = prev[prev.length - 1];
+        return `M${P(last)}L${P(seg[0])}`;
+    }).join("");
     const l200 = y(200);
     el.innerHTML = `
-        <div class="row"><span>Now <b>${Math.round(vals[vals.length - 1])} ms</b></span><span>avg <b>${Math.round(avg)}</b> · max <b>${Math.round(max)}</b></span></div>
+        <div class="row"><span>Now <b>${inVoice ? Math.round(newest.v) + " ms" : "—"}</b></span><span>avg <b>${Math.round(avg)}</b> · max <b>${Math.round(max)}</b></span></div>
         <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none" style="display:block">
             <rect width="${W}" height="${H}" fill="rgba(255,255,255,0.03)" rx="3"/>
             ${l200 > 0 ? `<line x1="0" x2="${W}" y1="${l200}" y2="${l200}" stroke="#faa61a" stroke-opacity="0.35" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/>` : ""}
-            <path d="${path}" fill="none" stroke="#3ba55d" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+            ${bridges ? `<path d="${bridges}" fill="none" stroke="#72767d" opacity="0.7" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/>` : ""}
+            ${solid.map(dd => `<path d="${dd}" fill="none" stroke="#3ba55d" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`).join("")}
         </svg>
         <div class="row muted"><span>10 min ago</span><span>now</span></div>`;
     report();

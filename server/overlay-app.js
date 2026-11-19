@@ -1120,6 +1120,12 @@ function startServer() {
             jsonReply(res, 200, { ok: true });
             return;
         }
+        if (req.method === "POST" && url === "/video/promote") {
+            let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
+            promoteViewer(d.key);
+            jsonReply(res, 200, { ok: true });
+            return;
+        }
         if (req.method === "POST" && url === "/video/preview") {
             let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
             toggleVideoPreview(viewerFor(d.key));
@@ -1278,6 +1284,7 @@ function startServer() {
                 else if (what === "enabled") { settings.layoutProfilesEnabled = !!d.on; saveSettingsSoon(); }
                 else if (what === "setup" && key) startSetup(key);
                 else if (what === "done") finishSetup(true);
+                else if (what === "tiling" && key) setTiling(key, d.tiling);
                 else if (what === "add-stream") addSetupStreamFrame(null);
                 else if (what === "cancel") finishSetup(false);
                 else if (what === "open") openLayoutsWindow();
@@ -1663,7 +1670,7 @@ function positionNotifyWindow(rec) {
         } else {
             const [ax, ay] = rec.win.getPosition();
             const [aw, ah] = rec.win.getSize();
-            e.win.setBounds({ x: ax, y: ay + ah + 4, width: aw, height: h });
+            e.win.setBounds({ x: ax, y: ay + ah, width: aw, height: h });
         }
     } catch (err) {}
 }
@@ -1857,6 +1864,7 @@ async function noteForegroundForProfiles(pid, gameLike) {
     if (key === _profileKey || setupMode) return;
     const prev = _profileKey;
     _profileKey = key;
+    tileAnchors.clear();
     sseBroadcast("layouts", layoutsInfo());
     if (settings.layoutProfilesEnabled === false) return;
     const profiles = layoutProfiles();
@@ -1886,10 +1894,11 @@ function layoutsInfo() {
         setup: setupMode ? { key: setupMode.key, until: setupMode.until } : null,
         items: [...keys].map(k => ({
             key: k,
-            saved: !!profiles[k],
+            saved: !!profiles[k] && (Object.keys(profiles[k].windows || {}).length > 0 || !!profiles[k].video?.bounds || !!profiles[k].notify),
             savedAt: profiles[k]?.savedAt || 0,
             windows: profiles[k] ? Object.keys(profiles[k].windows || {}).length : 0,
-            lastSeen: k === "default" ? Infinity : (seen[k] || 0)
+            lastSeen: k === "default" ? Infinity : (seen[k] || 0),
+            tiling: tilingOf(profiles[k])
         })).sort((a, b) => (a.key === "default" ? -1 : b.key === "default" ? 1 : (b.lastSeen - a.lastSeen)))
     };
 }
@@ -1989,6 +1998,163 @@ function layoutProfiles() {
     return settings.layoutProfiles;
 }
 
+// ── Edge snapping and attachment ──────────────────────────────────────────
+// A window dropped within SNAP px of another window's edge (or of the work
+// area's edge) snaps flush to it. Flush against a window, it becomes attached
+// to that window: the attached one follows when the other moves or resizes.
+// Ids: "ov:" overlay, "v:" stream viewer, "f:" setup frame. Notify windows are
+// not part of this at all.
+const SNAP = 12;
+const attachments = new Map();   // selfId -> { id: targetId, side, offset }
+let _progDepth = 0;              // > 0 while the app itself moves a window
+
+function winForId(id) {
+    const k = id.slice(id.indexOf(":") + 1);
+    let w = null;
+    if (id.startsWith("ov:")) { const r = windows.get(k); w = r ? r.win : null; }
+    else if (id.startsWith("v:")) { const v = viewers.get(k); w = v ? v.win : null; }
+    else if (id.startsWith("f:")) w = setupFrames[k] || null;
+    return w && !w.isDestroyed() ? w : null;
+}
+
+// Snap sources and targets: visible overlay, stream and setup-frame windows.
+function managedWindows() {
+    const out = [];
+    const ok = (w) => !!w && !w.isDestroyed() && w.isVisible();
+    for (const rec of windows.values()) if (ok(rec.win)) out.push({ id: "ov:" + rec.id, win: rec.win });
+    for (const v of viewers.values()) if (ok(v.win)) out.push({ id: "v:" + v.key, win: v.win });
+    for (const k of Object.keys(setupFrames)) if (k !== "notify" && ok(setupFrames[k])) out.push({ id: "f:" + k, win: setupFrames[k] });
+    return out;
+}
+
+// Windows attached (directly or through others) to id: never its snap targets.
+function descendantsOf(id) {
+    const out = new Set();
+    const q = [id];
+    while (q.length) {
+        const cur = q.shift();
+        for (const [s, t] of attachments) if (t && t.id === cur && !out.has(s)) { out.add(s); q.push(s); }
+    }
+    return out;
+}
+
+function dropAttachments(id) {
+    attachments.delete(id);
+    for (const [s, t] of [...attachments]) if (t && t.id === id) attachments.delete(s);
+}
+
+// Overlay-to-overlay attachments, for the layout profile.
+function attachmentsForSave() {
+    const live = new Set();
+    for (const rec of windows.values()) if (rec.win && !rec.win.isDestroyed()) live.add("ov:" + rec.id);
+    const out = {};
+    for (const [s, t] of attachments) {
+        if (s.startsWith("ov:") && t && t.id.startsWith("ov:") && live.has(s) && live.has(t.id)) out[s] = { ...t };
+    }
+    return out;
+}
+
+// One axis of a snap. horizontal: X (cross axis Y), else Y.
+function snapAxis(b, horizontal, cands, wa) {
+    const a = horizontal ? ["x", "width"] : ["y", "height"];
+    const c2 = horizontal ? ["y", "height"] : ["x", "width"];
+    const p = b[a[0]], n = b[a[1]];
+    const near = (r) => b[c2[0]] < r[c2[0]] + r[c2[1]] + SNAP && r[c2[0]] < b[c2[0]] + b[c2[1]] + SNAP;
+    let best = null;
+    const take = (d, pos, touch) => { if (d <= SNAP && (!best || d < best.d)) best = { d, pos, touch }; };
+    for (const c of cands) {
+        if (!near(c.r)) continue;
+        const cl = c.r[a[0]], cs = c.r[a[1]];
+        take(Math.abs(p - (cl + cs)), cl + cs, { id: c.id, r: c.r, side: horizontal ? "right" : "bottom" });
+        take(Math.abs(p + n - cl), cl - n, { id: c.id, r: c.r, side: horizontal ? "left" : "top" });
+        take(Math.abs(p - cl), cl, null);
+        take(Math.abs(p + n - (cl + cs)), cl + cs - n, null);
+    }
+    const wl = horizontal ? wa.x : wa.y, ws = horizontal ? wa.width : wa.height;
+    take(Math.abs(p - wl), wl, null);
+    take(Math.abs(p + n - (wl + ws)), wl + ws - n, null);
+    return best;
+}
+
+// Snapped bounds for window selfId at b, and the attachment it makes (or null).
+// Moves nothing.
+function snapBounds(selfId, b) {
+    const wa = screen.getDisplayMatching(b).workArea;
+    const skip = descendantsOf(selfId);
+    const cands = managedWindows()
+        .filter(m => m.id !== selfId && !skip.has(m.id))
+        .map(m => ({ id: m.id, r: m.win.getBounds() }));
+    const sx = snapAxis(b, true, cands, wa);
+    const sy = snapAxis(b, false, cands, wa);
+    const out = { x: sx ? sx.pos : b.x, y: sy ? sy.pos : b.y, width: b.width, height: b.height };
+    const tx = sx && sx.touch ? sx : null;
+    const ty = sy && sy.touch ? sy : null;
+    const t = tx && (!ty || tx.d <= ty.d) ? tx : ty;
+    let touch = null;
+    if (t) {
+        const r = t.touch.r;
+        const offset = (t.touch.side === "left" || t.touch.side === "right") ? out.y - r.y : out.x - r.x;
+        touch = { id: t.touch.id, side: t.touch.side, offset };
+    }
+    return { bounds: out, touch };
+}
+
+function setBoundsQuiet(win, b) {
+    _progDepth++;
+    try { win.setBounds(b); } catch (e) {} finally { _progDepth--; }
+}
+
+// After the app moved an overlay: keep its record, notify block and saved layout in step.
+function afterMove(id, b) {
+    if (!id.startsWith("ov:")) return;
+    const rec = windows.get(id.slice(3));
+    if (!rec) return;
+    rec.x = b.x; rec.y = b.y;
+    positionNotifyWindow(rec);
+    scheduleSaveWindows();
+}
+
+function attachedBounds(sb, tb, t) {
+    const w = sb.width, h = sb.height;
+    let x, y;
+    if (t.side === "left") { x = tb.x - w; y = tb.y + t.offset; }
+    else if (t.side === "right") { x = tb.x + tb.width; y = tb.y + t.offset; }
+    else if (t.side === "top") { x = tb.x + t.offset; y = tb.y - h; }
+    else { x = tb.x + t.offset; y = tb.y + tb.height; }
+    return { x, y, width: w, height: h };
+}
+
+// Moves every window attached to targetId to its place, and theirs in turn.
+function followAttached(targetId, seen) {
+    if (_progDepth > 0) return;
+    seen = seen || new Set();
+    if (seen.has(targetId)) return;
+    seen.add(targetId);
+    const t = winForId(targetId);
+    if (!t) return;
+    const tb = t.getBounds();
+    for (const [selfId, touch] of [...attachments]) {
+        if (!touch || touch.id !== targetId) continue;
+        const self = winForId(selfId);
+        if (!self) continue;
+        const sb = self.getBounds();
+        const nb = attachedBounds(sb, tb, touch);
+        if (nb.x !== sb.x || nb.y !== sb.y) { setBoundsQuiet(self, nb); afterMove(selfId, nb); }
+        followAttached(selfId, seen);
+    }
+}
+
+// A window the user just let go of: snap it, record what it touches, pull its attached windows along.
+function settleDrop(selfId) {
+    const w = winForId(selfId);
+    if (!w) return;
+    const cur = w.getBounds();
+    const r = snapBounds(selfId, cur);
+    if (r.bounds.x !== cur.x || r.bounds.y !== cur.y) { setBoundsQuiet(w, r.bounds); afterMove(selfId, r.bounds); }
+    if (r.touch) attachments.set(selfId, r.touch); else attachments.delete(selfId);
+    followAttached(selfId);
+}
+
 // Dragging a window by hand updates the layout that's active right now (the
 // game in front, or Desktop): overlay windows by id, stream windows by their
 // number (#1 main / preview place, #2+ extra places). Programmatic moves don't
@@ -2037,6 +2203,7 @@ function updateActiveLayoutSoon() {
             if (vid.previewBounds) vp.previewBounds = vid.previewBounds;
             vp.extraBounds = vid.extra;
         }
+        p.attach = attachmentsForSave();
         p.savedAt = Date.now();
         profiles[key] = p;
         saveSettingsSoon();
@@ -2047,7 +2214,7 @@ function updateActiveLayoutSoon() {
 
 function saveLayoutProfile(key) {
     const prev = layoutProfiles()[key] || {};
-    const p = { windows: {}, savedAt: Date.now(), video: prev.video || null, notify: prev.notify || null };
+    const p = { windows: {}, savedAt: Date.now(), video: prev.video || null, notify: prev.notify || null, attach: attachmentsForSave() };
     for (const rec of windows.values()) {
         if (!rec.win || rec.win.isDestroyed()) continue;
         const [x, y] = rec.win.getPosition();
@@ -2057,7 +2224,7 @@ function saveLayoutProfile(key) {
     // During setup the frames tell where stream / notifications go.
     const ph = (k) => setupFrames[k] && !setupFrames[k].isDestroyed() ? setupFrames[k].getBounds() : null;
     const big = ph("stream-big"), small = ph("stream-small"), nt = ph("notify");
-    if (big || small) p.video = { bounds: big || p.video?.bounds || null, previewBounds: small || p.video?.previewBounds || null };
+    if (big || small) p.video = { ...(p.video || {}), bounds: big || p.video?.bounds || null, previewBounds: small || p.video?.previewBounds || null };
     // more stream windows (multistream): their places, in order
     const extra = Object.keys(setupFrames).filter(k => /^stream-extra-\d+$/.test(k))
         .sort((a, b) => Number(a.split("-").pop()) - Number(b.split("-").pop()))
@@ -2100,6 +2267,17 @@ function applyLayoutProfile(p) {
             rec.x = pos.x; rec.y = pos.y;
             moved++;
         }
+        // Attachments between overlays: restore those whose two windows are open now,
+        // then pull the attached ones into their places.
+        const liveOv = new Set(live.map(rec => "ov:" + rec.id));
+        for (const [s, t] of [...attachments]) if (s.startsWith("ov:") && t && t.id.startsWith("ov:")) attachments.delete(s);
+        const roots = new Set();
+        for (const [s, t] of Object.entries(p.attach || {})) {
+            if (!liveOv.has(s) || !t || !liveOv.has(t.id) || !["left", "right", "top", "bottom"].includes(t.side)) continue;
+            attachments.set(s, { id: t.id, side: t.side, offset: Number(t.offset) || 0 });
+            roots.add(t.id);
+        }
+        for (const id of roots) followAttached(id);
         // Heal the profile: fallback places are stored under the ids of the
         // windows they were applied to.
         if (fallback.length) {
@@ -2120,16 +2298,18 @@ function applyLayoutProfile(p) {
             // 2nd, 3rd... = the extra places
             // main-group stream windows only, in the order they were opened
             const list = viewersIn("").filter(v => v.win && !v.win.isDestroyed());
-            list.forEach((v, i) => {
+            if (!isTiled(p)) list.forEach((v, i) => {
                 const b = i === 0 ? (v.preview ? p.video.previewBounds : p.video.bounds) : (p.video.extra || [])[i - 1];
                 if (b && boundsOnScreen(b)) {
                     if (i === 0 && !v.preview) v.savedBounds = b;
                     v.place = b;
                     v.win.setBounds(fitToAspect(b, v.aspect));
+                    followAttached("v:" + v.key);
                 }
             });
             saveSettingsSoon();
         }
+        retileAll(p);
     } catch (e) {}
     setTimeout(() => { _applyingProfile = false; }, 300);
     return moved;
@@ -2152,7 +2332,7 @@ function openSetupFrames(key) {
     const small = pick(prof.video?.previewBounds, vp.previewBounds, { x: wa.x + wa.width - 340, y: wa.y + 20, width: 320, height: 180 });
     const nt = prof.notify
         ? { x: prof.notify.x, y: prof.notify.y, width: prof.notify.width, height: 110 }
-        : { x: ab ? ab.x : wa.x + 20, y: ab ? ab.y + ab.height + 4 : wa.y + 200, width: ab ? ab.width : WINDOW_WIDTH, height: 110 };
+        : { x: ab ? ab.x : wa.x + 20, y: ab ? ab.y + ab.height : wa.y + 200, width: ab ? ab.width : WINDOW_WIDTH, height: 110 };
     const make = _setupFrameMake = (kind, b, resizable) => {
         // Stream frames are 16:9 and resize proportionally from any edge.
         const isStream = kind.startsWith("stream");
@@ -2166,23 +2346,31 @@ function openSetupFrames(key) {
         w.setAlwaysOnTop(true, "screen-saver");
         if (isStream) { try { w.setAspectRatio(16 / 9); } catch (e) {} }
         w.loadFile(path.join(__dirname, "placeholder.html"), { query: { kind } });
+        let userMove = false;
+        w.on("will-move", () => { userMove = true; });
         w.on("move", () => setupMoved());
         w.once("ready-to-show", () => { try { w.showInactive(); } catch (e) {} });
-        w.on("moved", () => setupMoved());
-        w.on("resized", () => setupMoved());
+        w.on("moved", () => {
+            const user = userMove; userMove = false;
+            if (user) settleDrop("f:" + kind); else followAttached("f:" + kind);
+            setupMoved();
+        });
+        w.on("resized", () => { followAttached("f:" + kind); setupMoved(); });
         setupFrames[kind] = w;
     };
     make("stream-big", big, true);
-    make("stream-small", small, true);
+    // Tiled layouts: only the anchor (big) frame and notify; the other places are tiled.
+    const tiledSetup = isTiled(prof);
+    if (!tiledSetup) make("stream-small", small, true);
     make("notify", nt, false);
-    (prof.video?.extra || vp.extraBounds || []).filter(b => boundsOnScreen(b)).forEach(b => addSetupStreamFrame(b));
+    if (!tiledSetup) (prof.video?.extra || vp.extraBounds || []).filter(b => boundsOnScreen(b)).forEach(b => addSetupStreamFrame(b));
 }
 
 // One more stream window place (for watching several streams). A new frame
 // opens left of the last one.
 let _setupFrameMake = null;
 function addSetupStreamFrame(bounds) {
-    if (!setupMode) return;
+    if (!setupMode || isTiled(layoutProfiles()[setupMode.key])) return;
     const n = Object.keys(setupFrames).filter(k => k.startsWith("stream-extra-")).length + 1;
     let b = bounds;
     if (!b) {
@@ -2199,6 +2387,7 @@ function addSetupStreamFrame(bounds) {
 
 function closeSetupFrames() {
     for (const k of Object.keys(setupFrames)) {
+        dropAttachments("f:" + k);
         try { if (!setupFrames[k].isDestroyed()) setupFrames[k].close(); } catch (e) {}
         delete setupFrames[k];
     }
@@ -2406,6 +2595,7 @@ function applyAutoResize(rec) {
     rec.height = target;
     scheduleSaveWindows();
     positionNotifyWindow(rec);
+    followAttached("ov:" + rec.id);
 }
 
 function applyAutoResizeAll() {
@@ -2480,11 +2670,14 @@ function createWindowFromRecord(record) {
             rec.x = x; rec.y = y;
             const d = monitorForWindow(win);
             if (d) rec.monitor = displayToMonitorRecord(d);
+            const userDrop = !!rec._userMove;
+            rec._userMove = false;
+            if (userDrop) settleDrop("ov:" + rec.id);     // snap to edges, attach
+            else followAttached("ov:" + rec.id);
             scheduleSaveWindows();
             positionNotifyWindow(rec);
             if (setupMode) setupMoved();
-            else if (rec._userMove) updateActiveLayoutSoon();
-            rec._userMove = false;
+            else if (userDrop) updateActiveLayoutSoon();
         } catch (e) {}
     });
 
@@ -2506,6 +2699,7 @@ function createWindowFromRecord(record) {
             try { if (v.win && !v.win.isDestroyed()) v.win.close(); } catch (e) {}
         }
         windows.delete(rec.id);
+        dropAttachments("ov:" + rec.id);
         // No overlay left: the main-group viewers (no overlay id) go too.
         if (windows.size === 0) {
             for (const v of [...viewers.values()]) {
@@ -2940,7 +3134,12 @@ function groupOf(main, inst) {
 // viewersIn("") = main group; viewersIn(id) = viewers of that other overlay.
 function viewersIn(group) {
     group = String(group || "");
-    return [...viewers.values()].filter(v => group === "" ? !!v.main : (!v.main && v.inst === group));
+    const list = [...viewers.values()].filter(v => group === "" ? !!v.main : (!v.main && v.inst === group));
+    const ord = groupOrder.get(group);      // slot order (tiled layouts); Map order otherwise
+    if (!ord || !ord.length) return list;
+    const rank = (v) => { const i = ord.indexOf(v.key); return i < 0 ? ord.length : i; };
+    return list.map((v, i) => ({ v, i, r: rank(v) }))
+        .sort((a, b) => (a.r - b.r) || (a.i - b.i)).map(x => x.v);
 }
 function viewerKey(base, inst) {
     if (!base) return "";
@@ -2977,9 +3176,256 @@ function reflowViewers(group, fromIndex) {
         if (!pl.bounds) return;
         if (i === 0 && v.main && pl.preview !== v.preview) v.preview = pl.preview;
         v.place = pl.bounds;
-        try { v.win.setBounds(fitToAspect(pl.bounds, v.aspect)); } catch (e) {}
+        try { v.win.setBounds(fitToAspect(pl.bounds, v.aspect)); followAttached("v:" + v.key); } catch (e) {}
         try { v.win.webContents.executeJavaScript(`window.__vetSetPreview && window.__vetSetPreview(${v.preview});`).catch(() => {}); } catch (e) {}
     });
+}
+
+// ── Tiled layout ───────────────────────────────────────────────────────────
+// profile.video.tiling: mode "free" (windows keep their own places) or "tiled"
+// (each group's viewers sit in a grid whose anchor is main slot 0).
+// groupOrder: per group, the viewer keys in slot order (slot 0 = first main).
+const groupOrder = new Map();   // group -> [viewer key]
+const tileAnchors = new Map();  // other-overlay group -> anchor rect, once dragged by hand
+
+function orderOf(group) {
+    group = String(group || "");
+    let a = groupOrder.get(group);
+    if (!a) { a = []; groupOrder.set(group, a); }
+    return a;
+}
+function orderRemove(group, key) {
+    group = String(group || "");
+    const a = groupOrder.get(group);
+    if (!a) return;
+    const i = a.indexOf(key);
+    if (i >= 0) a.splice(i, 1);
+    if (!a.length) groupOrder.delete(group);
+}
+function swapOrder(group, ka, kb) {
+    const a = orderOf(group);
+    const i = a.indexOf(ka), j = a.indexOf(kb);
+    if (i >= 0 && j >= 0) { a[i] = kb; a[j] = ka; }
+}
+function aliveIn(group) {
+    return viewersIn(group).filter(v => v.win && !v.win.isDestroyed());
+}
+
+const TILE_SIDES = ["left", "right", "top", "bottom"];
+const TILE_OPPOSITE = { left: "right", right: "left", top: "bottom", bottom: "top" };
+function normTiling(t) {
+    t = t && typeof t === "object" ? t : {};
+    return {
+        mode: t.mode === "tiled" ? "tiled" : "free",
+        mains: [1, 2, 3].includes(Number(t.mains)) ? Number(t.mains) : 1,
+        arrange: t.arrange === "column" ? "column" : "row",
+        side: TILE_SIDES.includes(t.side) ? t.side : "left",
+        small: [3, 4].includes(Number(t.small)) ? Number(t.small) : 3
+    };
+}
+// Only the valid values of the patch are taken; the rest keep their current value.
+function mergeTiling(cur, patch) {
+    const base = normTiling(cur);
+    const pt = patch && typeof patch === "object" ? patch : {};
+    const pick = (k, ok) => ok(pt[k]) ? pt[k] : base[k];
+    return normTiling({
+        mode: pick("mode", x => x === "free" || x === "tiled"),
+        mains: pick("mains", x => [1, 2, 3].includes(Number(x))),
+        arrange: pick("arrange", x => x === "row" || x === "column"),
+        side: pick("side", x => TILE_SIDES.includes(x)),
+        small: pick("small", x => [3, 4].includes(Number(x)))
+    });
+}
+function tilingOf(p) { return normTiling(p && p.video && p.video.tiling); }
+function isTiled(p) { return tilingOf(p).mode === "tiled"; }
+// The profile whose tiling applies now: the one being set up, else the active one.
+function tilingProfile() {
+    const k = setupMode ? setupMode.key : _profileKey;
+    return layoutProfiles()[k] || null;
+}
+
+function defaultTileAnchor() {
+    const wa = screen.getPrimaryDisplay().workArea;
+    return { x: Math.round(wa.x + wa.width / 2 - 320), y: Math.round(wa.y + wa.height / 2 - 180), width: 640, height: 360 };
+}
+// Anchor = main slot 0's rect: the saved place for the main group; for another
+// overlay its corner (or the place it was dragged to).
+function anchorFor(group, p, list) {
+    if (group === "") {
+        const pb = p && p.video ? p.video.bounds : null;
+        if (boundsOnScreen(pb)) return { x: pb.x, y: pb.y, width: pb.width, height: pb.height };
+        if (list[0]) { try { return list[0].win.getBounds(); } catch (e) {} }
+        return defaultTileAnchor();
+    }
+    if (tileAnchors.has(group)) return tileAnchors.get(group);
+    return overlayPlaceFor(group, 0).bounds || defaultTileAnchor();
+}
+
+// Rects of the group's viewers in slot order (same indexes as aliveIn(group)).
+function tileRects(group, p) {
+    const list = aliveIn(group);
+    if (!list.length) return [];
+    const t = tilingOf(p);
+    const anchor = anchorFor(group, p, list);
+    const M = Math.min(t.mains, list.length);
+    const mains = [{ x: anchor.x, y: anchor.y, width: anchor.width, height: anchor.height }];
+    for (let i = 1; i < M; i++) {
+        mains.push(t.arrange === "column"
+            ? { x: anchor.x, y: anchor.y + i * anchor.height, width: anchor.width, height: anchor.height }
+            : { x: anchor.x + i * anchor.width, y: anchor.y, width: anchor.width, height: anchor.height });
+    }
+    const x0 = Math.min(...mains.map(r => r.x)), y0 = Math.min(...mains.map(r => r.y));
+    const x1 = Math.max(...mains.map(r => r.x + r.width)), y1 = Math.max(...mains.map(r => r.y + r.height));
+    const block = { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+    const w = Math.max(1, Math.round(anchor.width / t.small));
+    const h = Math.max(1, Math.round(w * anchor.height / anchor.width));
+    const n = list.length - M;
+    let smalls = layoutSmalls(n, block, w, h, t.side);
+    if (smalls.some(r => !boundsOnScreen(r))) smalls = layoutSmalls(n, block, w, h, TILE_OPPOSITE[t.side]);
+    return mains.concat(smalls);
+}
+
+// The small (non-main) tiles along one side of the main block, flush to it and to each other.
+function layoutSmalls(n, block, w, h, side) {
+    const out = [];
+    if (side === "left" || side === "right") {
+        const rows = Math.max(1, Math.floor(block.height / h));
+        for (let k = 0; k < n; k++) {
+            const col = Math.floor(k / rows), row = k % rows;
+            const x = side === "left" ? block.x - (col + 1) * w : block.x + block.width + col * w;
+            out.push({ x, y: block.y + row * h, width: w, height: h });
+        }
+    } else {
+        const cols = Math.max(1, Math.floor(block.width / w));
+        for (let k = 0; k < n; k++) {
+            const row = Math.floor(k / cols), col = k % cols;
+            const y = side === "top" ? block.y - (row + 1) * h : block.y + block.height + row * h;
+            out.push({ x: block.x + col * w, y, width: w, height: h });
+        }
+    }
+    return out;
+}
+
+// Puts the group's viewers on their tile rects (when tiled) and tells their pages the tile state.
+function retile(group, p) {
+    if (p === undefined) p = tilingProfile();
+    group = String(group || "");
+    const list = aliveIn(group);
+    if (isTiled(p) && list.length) {
+        const rects = tileRects(group, p);
+        list.forEach((v, i) => {
+            if (!rects[i]) return;
+            v.place = null;
+            setBoundsQuiet(v.win, rects[i]);
+            followAttached("v:" + v.key);
+        });
+    }
+    list.forEach(v => sendTileFlags(v, p, list));
+}
+function retileAll(p) {
+    if (p === undefined) p = tilingProfile();
+    const groups = new Set([...viewers.values()].map(v => groupOf(v.main, v.inst)));
+    for (const g of groups) retile(g, p);
+}
+
+// window.__vetSetTile({tiled, isMain}): isMain = one of the main slots.
+function sendTileFlags(v, p, list) {
+    if (!v.win || v.win.isDestroyed()) return;
+    const t = tilingOf(p);
+    const tiled = t.mode === "tiled";
+    const M = Math.min(t.mains, list.length);
+    const idx = list.indexOf(v);
+    const st = { tiled, isMain: tiled && idx >= 0 && idx < M };
+    try {
+        v.win.webContents.executeJavaScript(`window.__vetSetTile && window.__vetSetTile(${JSON.stringify(st)});`).catch(() => {});
+    } catch (e) {}
+}
+
+// Remembers an anchor rect: the main group's saved place, or another overlay's own anchor.
+function storeAnchor(group, p, r) {
+    const rect = { x: r.x, y: r.y, width: r.width, height: r.height };
+    if (group === "") {
+        if (p) p.video = { ...(p.video || {}), bounds: rect };
+        videoPrefs().bounds = rect;
+        saveSettingsSoon();
+    } else {
+        tileAnchors.set(group, rect);
+    }
+}
+// Two viewers trade slots; the anchor is kept where it was.
+function swapTiles(group, p, a, b) {
+    if (group === "") storeAnchor(group, p, tileRects(group, p)[0]);
+    swapOrder(group, a.key, b.key);
+    retile(group, p);
+}
+
+// A viewer was moved or resized by hand in a tiled layout. A drop onto another
+// tile swaps the two; slot 0 moved or resized moves/resizes the anchor; anything
+// else snaps back. Returns false when the layout is not tiled.
+function tileUserMove(v, what) {
+    const p = tilingProfile();
+    if (!isTiled(p)) return false;
+    const group = groupOf(v.main, v.inst);
+    const list = aliveIn(group);
+    const idx = list.indexOf(v);
+    if (idx < 0 || !v.win || v.win.isDestroyed()) return false;
+    const rects = tileRects(group, p);
+    const b = v.win.getBounds();
+    if (what === "moved") {
+        const cx = b.x + b.width / 2, cy = b.y + b.height / 2;
+        for (let i = 0; i < list.length; i++) {
+            const r = rects[i];
+            if (i === idx || !r) continue;
+            if (cx >= r.x && cx < r.x + r.width && cy >= r.y && cy < r.y + r.height) {
+                swapTiles(group, p, v, list[i]);
+                return true;
+            }
+        }
+    }
+    if (idx === 0) {
+        const cur = rects[0];
+        const nb = what === "resized"
+            ? { x: b.x, y: b.y, width: b.width, height: Math.round(b.width * 9 / 16) }
+            : { x: b.x, y: b.y, width: cur.width, height: cur.height };
+        storeAnchor(group, p, nb);
+    }
+    retile(group, p);
+    return true;
+}
+
+// POST /video/promote: the viewer takes main slot 0 of its group (tiled only).
+function promoteViewer(key) {
+    if (!key) return;
+    const v = viewerFor(key);
+    const p = tilingProfile();
+    if (!v || !isTiled(p)) return;
+    const group = groupOf(v.main, v.inst);
+    const list = aliveIn(group);
+    if (!list.length || list[0] === v) return;
+    swapTiles(group, p, v, list[0]);
+}
+
+// POST /layouts/tiling: merge a partial tiling setting into a layout.
+function setTiling(key, patch) {
+    const profiles = layoutProfiles();
+    if (!profiles[key]) profiles[key] = { windows: {}, savedAt: Date.now(), video: null, notify: null, attach: {} };
+    const p = profiles[key];
+    p.video = p.video && typeof p.video === "object" ? p.video : {};
+    p.video.tiling = mergeTiling(p.video.tiling, patch);
+    // Setup open for this layout: keep where its frames are, then rebuild them
+    // for the new tiling (tiled shows only big + notify, free restores the rest).
+    const inSetup = !!(setupMode && setupMode.key === key);
+    if (inSetup) {
+        const ph = (k) => setupFrames[k] && !setupFrames[k].isDestroyed() ? setupFrames[k].getBounds() : null;
+        const big = ph("stream-big"), small = ph("stream-small"), nt = ph("notify");
+        if (big) p.video.bounds = big;
+        if (small) p.video.previewBounds = small;
+        if (nt) p.notify = { x: nt.x, y: nt.y, width: nt.width };
+    }
+    saveSettingsSoon();
+    if (inSetup) openSetupFrames(key);
+    sseBroadcast("layouts", layoutsInfo());
+    if (key === _profileKey || inSetup) retileAll(p);
 }
 
 function openVideoWindow(params) {
@@ -2998,7 +3444,8 @@ function openVideoWindow(params) {
     const vp = videoPrefs();
     if (typeof vp.alpha === "number") _videoAlpha = Math.max(0.2, Math.min(1, vp.alpha));
     const main = isMainNow(inst);
-    const place = viewerStartPlace(main, inst);
+    // Tiled layouts place every viewer by retile() below, not by its slot.
+    const place = isTiled(tilingProfile()) ? { bounds: null, preview: false } : viewerStartPlace(main, inst);
     const preview = place.preview;
     const startBounds = place.bounds;
     const win = new BrowserWindow({
@@ -3023,12 +3470,14 @@ function openVideoWindow(params) {
         offer: null, offerCandidates: [], answer: null, answerCandidates: []
     };
     viewers.set(key, v);
+    orderOf(groupOf(main, inst)).push(key);
 
     win.setAlwaysOnTop(true, "screen-saver");
     applyVideoClickThrough();
     win.setVisibleOnAllWorkspaces(true);
     try { win.setOpacity(_videoAlpha); } catch (e) {}
     win.loadFile(path.join(__dirname, "video.html"));
+    retile(groupOf(main, inst));
 
     wireVideoWindowIpc(win);
     wireVideoWindowLogging(win);
@@ -3037,9 +3486,17 @@ function openVideoWindow(params) {
     // Moved / resized by hand: it stays where you put it.
     win.on("will-move", () => { v.place = null; v._userMove = true; });
     win.on("will-resize", () => { v.place = null; v._userMove = true; });
-    const userDone = () => { if (v._userMove) { v._userMove = false; updateActiveLayoutSoon(); } };
-    win.on("moved", userDone);
-    win.on("resized", userDone);
+    const userDone = (what) => {
+        const user = !!v._userMove;
+        v._userMove = false;
+        // Tiled layouts: the drag swaps, moves the anchor or snaps back; no edge snapping.
+        if (user && tileUserMove(v, what)) { updateActiveLayoutSoon(); return; }
+        if (user && what === "moved") settleDrop("v:" + key);
+        else followAttached("v:" + key);
+        if (user) updateActiveLayoutSoon();
+    };
+    win.on("moved", () => userDone("moved"));
+    win.on("resized", () => userDone("resized"));
 
     // Runs on every load, including reloads done by reopenVideoStream().
     win.webContents.on("did-finish-load", () => {
@@ -3048,6 +3505,7 @@ function openVideoWindow(params) {
             const ch = win.webContents._vetIpcChannel;
             const resume = v.reopenAttempts;
             v.reopenAttempts = 0;
+            sendTileFlags(v, tilingProfile(), aliveIn(groupOf(v.main, v.inst)));
             // A reload brings the window back onto the taskbar on Windows, and
             // a call right at load time doesn't always stick: repeat it.
             try { win.setSkipTaskbar(true); } catch (e) {}
@@ -3070,20 +3528,24 @@ function openVideoWindow(params) {
     // its place before showing.
     win.once("ready-to-show", () => {
         try {
-            if (v.place) win.setBounds(fitToAspect(v.place, v.aspect));
+            if (v.place) win.setBounds(fitToAspect(v.place, v.aspect)); followAttached("v:" + key);
             win.showInactive();
             win.setSkipTaskbar(true);
             // ...and once more after Windows has settled the new window
-            setTimeout(() => { try { if (v.place && !win.isDestroyed()) win.setBounds(fitToAspect(v.place, v.aspect)); } catch (e) {} }, 300);
+            setTimeout(() => { try { if (v.place && !win.isDestroyed()) win.setBounds(fitToAspect(v.place, v.aspect)); followAttached("v:" + key); } catch (e) {} }, 300);
         } catch (e) {}
     });
 
     win.on("closed", () => {
+        const cur = viewers.get(key);
+        if (!cur || cur === v) dropAttachments("v:" + key);
         if (viewers.get(key) === v) {
             const g = groupOf(v.main, v.inst);
             const idx = viewersIn(g).indexOf(v);
             viewers.delete(key);
-            if (!v._swapped) reflowViewers(g, idx);
+            orderRemove(g, key);
+            if (!aliveIn(g).length) tileAnchors.delete(g);
+            if (!v._swapped) { if (isTiled(tilingProfile())) retile(g); else reflowViewers(g, idx); }
         }
         // "closed": the window is gone for good (not a reconnect), so Discord can stop watching too
         if (!v.local) queuePluginCommand("stop-stream", key, v._swapped ? "" : "closed", v.inst);
@@ -3134,7 +3596,7 @@ function ownStreamToLocal(winId) {
     const nk = viewerKey("local:" + cur.userId, inst);
     const nv = viewers.get(nk);
     if (nv) {
-        if (bounds) { try { nv.win.setBounds(bounds); } catch (e) {} }
+        if (bounds) { try { nv.win.setBounds(bounds); followAttached("v:" + nv.key); } catch (e) {} }
         // put it back where the "own" window was in the order
         const at = order.indexOf(ownKey);
         if (at >= 0) {
@@ -3143,6 +3605,12 @@ function ownStreamToLocal(winId) {
             viewers.clear();
             for (const [k, x] of rest) viewers.set(k, x);
         }
+        // ...and the same slot in its group's order (tiled layouts)
+        const ng = groupOf(nv.main, nv.inst);
+        const ord = orderOf(ng);
+        const oi = ord.indexOf(ownKey), ni = ord.indexOf(nk);
+        if (oi >= 0 && ni >= 0) { ord.splice(ni, 1); ord[oi] = nk; }
+        if (isTiled(tilingProfile())) retile(ng);
     }
 }
 
@@ -3325,7 +3793,12 @@ function applyVideoAspect(v, w, h) {
     v.aspect = aspect;
     try {
         v.win.setAspectRatio(aspect);
-        v.win.setBounds(fitToAspect(v.place || v.win.getBounds(), aspect));
+        // Tiled: the tile rects stay as they are (the stream letterboxes inside them).
+        if (isTiled(tilingProfile())) retile(groupOf(v.main, v.inst));
+        else {
+            v.win.setBounds(fitToAspect(v.place || v.win.getBounds(), aspect));
+            followAttached("v:" + v.key);
+        }
     } catch (e) {}
     videoLog("aspect locked", v.key, w + "x" + h);
 }
@@ -3350,6 +3823,7 @@ function toggleVideoPreview(v) {
         v.preview = false;
         if (target) { v.place = target; v.win.setBounds(fitToAspect(target, v.aspect)); }
     }
+    followAttached("v:" + v.key);
     if (first) { p.preview = v.preview; saveSettings(); }
     try {
         v.win.webContents.executeJavaScript(

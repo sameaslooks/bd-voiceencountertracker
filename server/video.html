@@ -56,6 +56,9 @@
     .btn:hover { background: rgba(255,255,255,0.18); }
     .btn.active { background: rgba(88,101,242,0.85); color: #fff; }
     .btn svg { width: 12px; height: 12px; display: block; }
+    #btn-main { color: #b5bac1; }
+    #btn-main:hover { color: #fff; }
+    #btn-main[hidden] { display: none; }
 
     #alpha-pop {
         position: absolute; top: 28px; right: 34px;
@@ -133,6 +136,9 @@
     <div id="zoom-badge"></div>
     <img id="last-frame" alt="">
     <div id="controls">
+        <button class="btn" id="btn-main" title="Make main" hidden>
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8L12 2.5Z"/></svg>
+        </button>
         <button class="btn" id="btn-alpha" title="Opacity">
             <svg viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2a10 10 0 1 0 0 20V2z" opacity="0.9"/>
@@ -818,6 +824,15 @@ if (window.vetWebRTC) {
 
 document.getElementById("btn-close").addEventListener("click", () => {
     fetch(API_BASE + "/video/close", { method: "POST", body: JSON.stringify({ key: viewKey() }) }).catch(() => {});
+});
+
+// Called by the overlay: this window is one of several stream tiles.
+// The "Make main" button shows only on a tiled small window (not the main one).
+window.__vetSetTile = ({ tiled, isMain } = {}) => {
+    document.getElementById("btn-main").hidden = !(tiled && !isMain);
+};
+document.getElementById("btn-main").addEventListener("click", () => {
+    fetch(API_BASE + "/video/promote", { method: "POST", body: JSON.stringify({ key: viewKey() }) }).catch(() => {});
 });
 
 document.getElementById("btn-pin").addEventListener("click", () => {

@@ -108,12 +108,12 @@ Each action is executed inside Discord within ~1 second.
 
 - **Hold-to-leave** (phone icon, only in voice): hold until the ring around it closes to disconnect.
 - **Stream source** (screen icon, only in voice): pick what you stream — screens and windows with live thumbnails, minimized and borderless games included; only windows that have a taskbar button are listed.
-- **Signal**: hover for the current / average / worst ping and a 10-minute graph.
+- **Signal**: hover for the current / average / worst ping and a 10-minute graph. Time out of voice is a gap; separate voice visits are joined by a grey dashed line.
 
 #### People in voice
 
 - **Right-click a person** for a quick menu: their activity, **user volume** (same scale as Discord's slider), **Message** (opens your DM), **Profile**, **Listen along** (Spotify), **Favorite** and its **join / leave sound**, **Known** (only a manual mark can be removed), copy username / ID.
-- **Favorites** (also from Discord's own user menu → *Add to Favorites*) have their names in a calm gold accent and flash yellow when they join; with the sound on you hear a short tone when they come or go — nobody else makes a sound. Your own row is never gold.
+- **Favorites** (also from Discord's own user menu → *Add to Favorites*) have their names in a calm gold accent and flash yellow when they join; with the sound on (off for a new favorite) you hear a short tone when they actually come or go — nobody else makes a sound, and favoriting someone already in the channel is silent. Your own row is never gold.
 - **Activity**: a game icon or the music platform's icon next to the name; hover it for the art and the full status.
 - **Phone icon** = in voice from mobile. **Red number** on the avatar = unread DMs from them.
 - **Right-click your own card** to write a one-line **session note** under the list (click it to edit, clear it to remove; it's gone when you leave the channel).
@@ -155,6 +155,8 @@ Tray icon → **Window layouts…** lists *Desktop* and every game you've played
 - **Save** stores where the windows are right now; **Apply** moves them there now.
 - Dragging a window by hand also updates the layout that's active at that moment.
 - Profiles match overlay windows by id, then by order if the ids changed; the profile then heals itself to the new ids. The log shows how many windows moved.
+- **Snapping** — a dragged overlay, stream window or setup frame sticks to the edges of other windows and the screen within 12 px, and then follows the window it stuck to when that one moves or resizes. Overlay-to-overlay links are saved in the layout. Pull a window away to unstick it. The message block sits flush under its overlay.
+- **Streams: Tiled** — per layout, under *Streams*: 1–3 main windows (side by side or stacked) and the rest as small windows (1/3 or 1/4 width) in a strip on the left, right, above or below, all flush. The layout rebuilds itself as streams come and go: if a main one closes, the next stream takes its place and the small ones re-stick to the remaining block. Drop a window onto another to swap them, use the star button on a small window to make it the main one, drag or resize the first main window to move or scale the whole block. In setup only the main frame is shown. *Free* keeps the old free placement.
 - A game whose cursor is locked (shooters) can only be set up while it shows a cursor — in its menu, paused, or windowed.
 
 ### Tracker window

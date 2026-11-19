@@ -336,7 +336,7 @@
         font-weight: 600;
         opacity: 0.85;
     }
-    .user.fav .name { color: #e8c35a; }
+    .user.fav .name { color: #d2c193; }
 
     .user .spacer { flex: 1 1 auto; min-width: 0; }
 
@@ -1319,18 +1319,20 @@ function tone(notes) {
 
 function playFavoriteTones(channelId, users) {
     const ids = new Set(users.filter(u => u.favorite && u.favSound).map(u => u.userId));
+    const present = new Set(users.map(u => u.userId));
     // First look at a channel (joined it, overlay just opened): no sounds.
     if (!favPresence || favPresence.channelId !== channelId) {
-        favPresence = { channelId, ids };
+        favPresence = { channelId, ids, present };
         return;
     }
     let joined = false, left = false;
-    for (const id of ids) if (!favPresence.ids.has(id)) joined = true;
+    // Only someone who actually came in, not one who just got favorited or had sound turned on.
+    for (const id of ids) if (!favPresence.ids.has(id) && !favPresence.present.has(id)) joined = true;
     for (const id of favPresence.ids) if (!ids.has(id)) {
         // Only a favorite with sound who actually left, not one whose sound got turned off.
         if (!users.some(u => u.userId === id)) left = true;
     }
-    favPresence = { channelId, ids };
+    favPresence = { channelId, ids, present };
     if (joined) tone([660, 880]);          // up: came in
     else if (left) tone([880, 587]);       // down: went out
 }

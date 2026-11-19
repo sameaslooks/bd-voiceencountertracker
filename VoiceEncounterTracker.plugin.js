@@ -3037,7 +3037,7 @@ module.exports = class VoiceEncounterTracker {
         if (on) {
             const cur = this._favorites.get(userId);
             this._favorites.set(userId, {
-                sound: cur?.sound ?? true,
+                sound: cur?.sound ?? false,
                 notify: cur?.notify ?? true,
                 calls: cur?.calls ?? true
             });
@@ -3399,26 +3399,42 @@ module.exports = class VoiceEncounterTracker {
     }
 
     // Discord stores user volume as an amplitude, while its slider shows a
-    // perceptual scale (50 on the slider is ~25 amplitude). Use Discord's own
-    // converters when they're there; otherwise the same dB curve.
+    // perceptual scale. Use Discord's own converters (cached once found); if
+    // they can't be found, fall back to the dB approximation below and warn once.
+    // Not found is retried at most every 30 s, so overlay pushes don't rescan Webpack.
     _volConv() {
-        if (this._volConvMod !== undefined) return this._volConvMod;
-        try { this._volConvMod = BdApi.Webpack.getByKeys("amplitudeToPerceptual", "perceptualToAmplitude", { searchExports: true }) || null; }
-        catch (e) { this._volConvMod = null; }
-        return this._volConvMod;
+        if (this._volConvMod) return this._volConvMod;
+        if (this._volConvRetryAt && Date.now() < this._volConvRetryAt) return null;
+        const ok = (x) => !!x && typeof x.amplitudeToPerceptual === "function" && typeof x.perceptualToAmplitude === "function";
+        let m = null;
+        try { m = BdApi.Webpack.getByKeys("amplitudeToPerceptual", "perceptualToAmplitude", { searchExports: true }); } catch (e) {}
+        if (!ok(m)) try { m = BdApi.Webpack.getByKeys("amplitudeToPerceptual", "perceptualToAmplitude"); } catch (e) {}
+        if (!ok(m)) try { m = BdApi.Webpack.getModule(x => ok(x)); } catch (e) {}
+        if (!ok(m)) try {
+            m = BdApi.Webpack.getModule(x => !!x && typeof x === "object" && Object.values(x).some(f => typeof f === "function" && /perceptualToAmplitude/.test(f.toString())));
+        } catch (e) {}
+        if (ok(m)) { this._volConvMod = m; return m; }
+        this._volConvRetryAt = Date.now() + 30000;
+        if (!this._volConvWarned) {
+            this._volConvWarned = true;
+            vetLog("warn", "Discord volume converter not found; using dB approximation for user volume");
+        }
+        return null;
     }
     _toPerceptual(a) {
+        if (!(a > 0)) return 0;                             // muted stays 0
+        if (a === 100) return 100;                          // default stays exact
         const m = this._volConv();
-        if (m) { try { return m.amplitudeToPerceptual(a); } catch (e) {} }
-        if (!(a > 0)) return 0;
-        const db = 20 * Math.log10(a / 100);                // 0 dB at 100
-        return a <= 100 ? Math.max(0, 100 + db * 10 / 3) : 100 + db / 6 * 100;   // -30 dB floor
+        if (m) { try { const p = m.amplitudeToPerceptual(a); if (Number.isFinite(p)) return p; } catch (e) {} }
+        const db = 20 * Math.log10(a / 100);                // Discord's curve: -50..0 dB below 100, +6 dB per 100 above
+        return Math.max(0, 100 * (db > 0 ? db / 6 + 1 : (50 + db) / 50));
     }
     _toAmplitude(p) {
+        if (!(p > 0)) return 0;                             // muted stays 0
+        if (p === 100) return 100;                          // default stays exact
         const m = this._volConv();
-        if (m) { try { return m.perceptualToAmplitude(p); } catch (e) {} }
-        if (!(p > 0)) return 0;
-        const db = p <= 100 ? (p - 100) * 0.3 : (p - 100) / 100 * 6;
+        if (m) { try { const a = m.perceptualToAmplitude(p); if (Number.isFinite(a)) return a; } catch (e) {} }
+        const db = p > 100 ? (p - 100) / 100 * 6 : p / 100 * 50 - 50;
         return 100 * Math.pow(10, db / 20);
     }
 
@@ -3433,7 +3449,7 @@ module.exports = class VoiceEncounterTracker {
 
     _setLocalVolume(userId, v) {
         if (!Number.isFinite(v)) return;
-        v = this._toAmplitude(Math.max(0, Math.min(200, v)));
+        v = this._toAmplitude(Math.round(Math.max(0, Math.min(200, v))));
         try {
             const mod = BdApi.Webpack.getByKeys("setLocalVolume", { searchExports: true });
             if (typeof mod?.setLocalVolume !== "function") { vetLog("warn", "setLocalVolume not found"); return; }

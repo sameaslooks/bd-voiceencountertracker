@@ -130,7 +130,7 @@ elMenu.addEventListener("click", (e) => {
     if (d === "listen") { cmd("listen-along"); return close(); }
     if (d === "copyname") { post("/clipboard", { text: user.username }); return close(); }
     if (d === "copyid") { post("/clipboard", { text: user.userId }); return close(); }
-    if (d === "fav") { user.favorite = !user.favorite; if (user.favorite && user.favSound == null) user.favSound = true; if (user.favorite && user.favNotify == null) user.favNotify = true; if (user.favorite && user.favCalls == null) user.favCalls = true; cmd("set-favorite", { sound: user.favorite }); return render(); }
+    if (d === "fav") { user.favorite = !user.favorite; if (user.favorite && user.favSound == null) user.favSound = false; if (user.favorite && user.favNotify == null) user.favNotify = true; if (user.favorite && user.favCalls == null) user.favCalls = true; cmd("set-favorite", { sound: user.favorite }); return render(); }
     if (d === "favsound") { user.favSound = !user.favSound; cmd("set-fav-sound", { sound: user.favSound }); return render(); }
     if (d === "favnotify") { user.favNotify = !user.favNotify; cmd("set-fav-notify", { sound: user.favNotify }); return render(); }
     if (d === "favcalls") { user.favCalls = !user.favCalls; cmd("set-fav-calls", { sound: user.favCalls }); return render(); }
