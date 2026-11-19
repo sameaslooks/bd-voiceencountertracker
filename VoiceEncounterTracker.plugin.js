@@ -4082,62 +4082,29 @@ module.exports = class VoiceEncounterTracker {
         return ms;
     }
 
-    // My voice time for the tracker window: bucketed totals over the selected
-    // range ("7" / "30" = one bucket per calendar day, "all" = one bucket per
-    // week from the week of the first session, capped at 104 weeks) and per
-    // server / channel totals. Includes the session that's running right now.
-    myVoiceSummary(range = "7") {
+    // My own voice time as one encounters-table record (same shape as the others):
+    // saved log + unsaved pending records + the session running right now.
+    // Sessions are returned newest first; live = a session is running now.
+    _myVoiceRecord(me) {
         const now = Date.now();
         const list = [...(this._loadMyVoice() ?? []), ...(this._myVoicePending || [])];
         if (this._mySess) list.push({ ...this._mySess, end: now, live: true });
-        const dayStart = (t) => { const d = new Date(t); d.setHours(0, 0, 0, 0); return d; };
-        const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
-        const weekStart = (t) => { const d = dayStart(t); return addDays(d, -((d.getDay() + 6) % 7)); };
-        const DAY = 86400_000;
-        let buckets = [], unit = "day";
-        if (range === "all") {
-            unit = "week";
-            const firstStart = list.reduce((m, x) => Math.min(m, x.start), now);
-            const thisWeek = weekStart(now);
-            const weeksBack = Math.max(0, Math.round((thisWeek.getTime() - weekStart(firstStart).getTime()) / (7 * DAY)));
-            const n = Math.min(104, weeksBack + 1);
-            const first = addDays(thisWeek, -7 * (n - 1));
-            for (let i = 0; i < n; i++) {
-                const a = addDays(first, 7 * i).getTime(), b = addDays(first, 7 * (i + 1)).getTime();
-                buckets.push({ start: a, end: b, ms: 0 });
-            }
-        } else {
-            const n = Math.max(1, Number(range) || 7);
-            const first = addDays(dayStart(now), -(n - 1));
-            for (let i = 0; i < n; i++) {
-                const a = addDays(first, i).getTime(), b = addDays(first, i + 1).getTime();
-                buckets.push({ start: a, end: b, ms: 0 });
-            }
-        }
-        const from = range === "all" ? null : buckets[0].start;
-        const inRange = from ? list.filter(x => x.end > from) : list;
-        const clip = (x) => x.end - Math.max(x.start, from || 0);
-        const total = inRange.reduce((a, x) => a + clip(x), 0);
-        const servers = new Map();
-        for (const x of inRange) {
-            const gk = x.guildId || "dm";
-            const g = servers.get(gk) || { name: x.guildId ? (x.guildName || this.getGuildName(x.guildId, x.channelId) || "Server") : "Calls / DMs", ms: 0, channels: new Map() };
-            g.ms += clip(x);
-            const ck = x.channelId || "?";
-            const c = g.channels.get(ck) || { name: x.channelName || this.getChannelName(x.channelId) || "channel", ms: 0 };
-            c.ms += clip(x);
-            g.channels.set(ck, c);
-            servers.set(gk, g);
-        }
-        // per bucket (split sessions across bucket edges)
-        for (const bk of buckets) {
-            for (const x of list) { const s1 = Math.max(x.start, bk.start), e1 = Math.min(x.end, bk.end); if (e1 > s1) bk.ms += e1 - s1; }
-        }
+        const asc = list
+            .filter(x => Number.isFinite(x.start) && Number.isFinite(x.end) && x.end > x.start)
+            .sort((a, b) => a.start - b.start);
+        const sessions = asc.map(x => ({
+            startedAt: x.start, endedAt: x.end, durationMs: x.end - x.start,
+            guildId: x.guildId ?? null, channelId: x.channelId ?? null,
+            guildName: x.guildName || this.getGuildName(x.guildId, x.channelId) || "",
+            channelName: x.channelName || this.getChannelName(x.channelId) || "",
+            live: !!x.live
+        }));
+        const firstSeenAt = sessions.length ? sessions[0].startedAt : null;
+        const lastSeenAt = sessions.length ? sessions[sessions.length - 1].endedAt : null;
         return {
-            total, sessions: inRange.length, unit, buckets,
-            servers: [...servers.values()].sort((a, b) => b.ms - a.ms).map(g => ({
-                name: g.name, ms: g.ms, channels: [...g.channels.values()].sort((a, b) => b.ms - a.ms)
-            }))
+            userId: me, sessions,
+            totalMs: sessions.reduce((a, s) => a + s.durationMs, 0),
+            firstSeenAt, lastSeenAt, live: !!this._mySess
         };
     }
 
@@ -4482,35 +4449,6 @@ module.exports = class VoiceEncounterTracker {
                     display: flex; gap: 6px;
                     margin-bottom: 14px;
                 }
-                .vet-me {
-                    margin-bottom: 10px; padding: 10px 16px;
-                    border: 1px solid var(--background-modifier-accent, #3f4147);
-                    border-radius: 4px; background: var(--background-secondary, #2b2d31);
-                    font-size: 12px; line-height: 1.6;
-                }
-                .vet-me-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-                .vet-me-label {
-                    font-weight: 600; font-size: 11px; text-transform: uppercase;
-                    letter-spacing: 0.4px; opacity: 0.7;
-                }
-                .vet-me-head .tot { opacity: .85; }
-                .vet-me-head .tot b { color: #3ba55d; font-weight: 500; font-variant-numeric: tabular-nums; }
-                .vet-seg { display: inline-flex; border: 1px solid var(--background-modifier-accent, #444); border-radius: 4px; overflow: hidden; margin-left: auto; }
-                .vet-seg button { background: none; border: none; color: inherit; height: 20px; box-sizing: border-box; padding: 0 8px; cursor: pointer; font-size: 11px; font-family: inherit; opacity: .7; }
-                .vet-seg button.on { background: rgba(88,101,242,0.35); opacity: 1; }
-                .vet-me-chart { margin: 6px 0 4px; }
-                .vet-me-chart .bar { fill: #5865f2; opacity: .75; }
-                .vet-me-chart .bar.today { opacity: 1; }
-                .vet-me-chart text { fill: currentColor; opacity: .6; font-size: 10px; }
-                .vet-me-list { display: grid; grid-template-columns: minmax(0, 1fr) auto; font-size: 12px; }
-                .vet-me-list > span { padding: 2px 4px; min-width: 0; }
-                .vet-me-list .g, .vet-me-list .c, .vet-me-list .more {
-                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-                }
-                .vet-me-list .g { font-weight: 600; opacity: .85; }
-                .vet-me-list .c { padding-left: 18px; opacity: .85; }
-                .vet-me-list .t { text-align: right; font-variant-numeric: tabular-nums; color: #3ba55d; white-space: nowrap; }
-                .vet-me-list .more { padding-left: 18px; opacity: .5; }
                 .vet-time {
                     margin-bottom: 14px; padding: 10px 12px;
                     border: 1px solid var(--background-modifier-accent, #3f4147);
@@ -4827,20 +4765,6 @@ module.exports = class VoiceEncounterTracker {
                         <button type="button" class="vet-btn" data-action="search-clear">Clear</button>
                     </div>
 
-                    <div class="vet-me">
-                        <div class="vet-me-head">
-                            <span class="vet-me-label">My voice time</span>
-                            <span class="tot" data-role="me-total"></span>
-                            <span class="vet-seg" data-role="me-range">
-                                <button type="button" data-range="7">7 days</button>
-                                <button type="button" data-range="30">30 days</button>
-                                <button type="button" data-range="all">All</button>
-                            </span>
-                        </div>
-                        <div class="vet-me-chart" data-role="me-chart"></div>
-                        <div class="vet-me-list" data-role="me-list"></div>
-                    </div>
-
                     <div class="vet-time">
                         <div class="vet-manual-title">Who was in voice with me</div>
                         <div class="vet-time-row">
@@ -5119,45 +5043,6 @@ module.exports = class VoiceEncounterTracker {
         });
         renderTimeChips();
 
-        // ── My voice time ──
-        const meRange = overlay.querySelector("[data-role='me-range']");
-        const renderMe = () => {
-            const key = this._vetMeRange || "7";
-            meRange.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.getAttribute("data-range") === key));
-            const sum = this.myVoiceSummary(key);
-            overlay.querySelector("[data-role='me-total']").innerHTML =
-                `<b>${this.formatDuration(sum.total)}</b> · ${sum.sessions} session${sum.sessions === 1 ? "" : "s"}`;
-            // one bar per bucket: calendar days for 7 / 30, weeks for all
-            const W = 600, H = 40, buckets = sum.buckets, n = buckets.length, bw = W / n;
-            const max = Math.max(3600_000, ...buckets.map(d => d.ms));
-            const bars = buckets.map((d, i) => {
-                const h = d.ms ? Math.max(2, d.ms / max * (H - 14)) : 0;
-                const dt = new Date(d.start);
-                const tip = `${sum.unit === "week" ? "Week of " : ""}${dt.toLocaleDateString()} — ${this.formatDuration(d.ms)}`;
-                return `<rect class="bar${i === n - 1 ? " today" : ""}" x="${(i * bw + 1).toFixed(1)}" y="${(H - 14 - h).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${h.toFixed(1)}" rx="1.5"><title>${tip}</title></rect>`;
-            }).join("");
-            const lbl = (i) => { const dt = new Date(buckets[i].start); return `${dt.getDate()}.${String(dt.getMonth() + 1).padStart(2, "0")}`; };
-            const rightLbl = sum.unit === "week" ? "this week" : "today";
-            overlay.querySelector("[data-role='me-chart']").innerHTML =
-                `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">${bars}
-                    <text x="0" y="${H - 2}">${lbl(0)}</text><text x="${W / 2}" y="${H - 2}" text-anchor="middle">${lbl(Math.floor(n / 2))}</text>
-                    <text x="${W}" y="${H - 2}" text-anchor="end">${rightLbl}</text></svg>`;
-            overlay.querySelector("[data-role='me-list']").innerHTML = sum.servers.length
-                ? sum.servers.slice(0, 8).map(g =>
-                    `<span class="g" title="${esc(g.name)}">${esc(g.name)}</span><span class="t">${this.formatDuration(g.ms)}</span>` +
-                    g.channels.slice(0, 4).map(c => `<span class="c" title="${esc(c.name)}">#${esc(c.name)}</span><span class="t">${this.formatDuration(c.ms)}</span>`).join("") +
-                    (g.channels.length > 4 ? `<span class="more">+${g.channels.length - 4} more</span><span></span>` : "")).join("")
-                : `<span style="opacity:.6">No voice time recorded yet.</span><span></span>`;
-        };
-        meRange.addEventListener("click", (e) => {
-            const b = e.target.closest("[data-range]");
-            if (!b) return;
-            e.preventDefault(); e.stopPropagation();
-            this._vetMeRange = b.getAttribute("data-range");
-            renderMe();
-        });
-        renderMe();
-
         overlay.querySelector("[data-role='tbody']").addEventListener("click", (e) => {
             const btn = e.target.closest("[data-action]");
             if (btn) {
@@ -5234,6 +5119,7 @@ module.exports = class VoiceEncounterTracker {
                 const userId = sessionEntry.getAttribute("data-user-id");
                 const idx = Number(sessionEntry.getAttribute("data-session-idx"));
                 if (!userId || !Number.isFinite(idx)) return;
+                if (userId === this.getCurrentUserId()) return;   // my sessions: no timeline
                 e.preventDefault(); e.stopPropagation();
 
                 if (this._vetExpandedSession &&
@@ -5362,7 +5248,16 @@ module.exports = class VoiceEncounterTracker {
         const expandedId = this._vetExpandedUser;
         const expandedSession = this._vetExpandedSession;
 
-        const html = entries.map((rec, i) => {
+        // My own row is pinned first: always shown, ignores search and sort.
+        const me = this.getCurrentUserId();
+        if (me) entries = entries.filter(rec => rec.userId !== me);
+        const selfRec = me ? this._myVoiceRecord(me) : null;
+        const allRows = selfRec ? [selfRec, ...entries] : entries;
+        let seq = 0;
+
+        const html = allRows.map((rec) => {
+            const isSelf = !!selfRec && rec.userId === selfRec.userId;
+            const num = isSelf ? "" : ++seq;
             const rawUsername = this.getUserName(rec.userId);
             const username = this._escape(rawUsername);
             const rawDisplay = this.getStoredDisplayName(rec.userId);
@@ -5383,7 +5278,8 @@ module.exports = class VoiceEncounterTracker {
             const nameTitle = this._escape(`${this.getUserName(rec.userId)} (${rec.userId})` +
                 (prevNameLines.length > 1 ? "\nName history:\n" + prevNameLines.join("\n") : ""));
             let glyph, glyphColor, status;
-            if (kind === "blocked")      { glyph = "⊘"; glyphColor = "#ed4245"; status = "blocked"; }
+            if (isSelf)                  { glyph = ""; glyphColor = "#72767d"; status = "—"; }
+            else if (kind === "blocked")      { glyph = "⊘"; glyphColor = "#ed4245"; status = "blocked"; }
             else if (kind === "ignored") { glyph = "⊘"; glyphColor = "#faa61a"; status = "ignored"; }
             else if (kind === "muted")   { glyph = "○"; glyphColor = "#72767d"; status = "muted"; }
             else if (kind === "known")   { glyph = "✓"; glyphColor = "#3ba55d"; status = "—"; }
@@ -5398,22 +5294,22 @@ module.exports = class VoiceEncounterTracker {
             const picked = picking && this._vetTogether.has(rec.userId);
             const jumpCls = this._vetJump?.userId === rec.userId ? " vet-jump" : "";
             const mainRow = `<tr class="vet-main-row${isExpanded ? " expanded" : ""}${jumpCls}" data-user-id="${rec.userId}">
-                <td class="vet-num">${picking
+                <td class="vet-num">${isSelf ? "" : picking
                     ? `<input type="checkbox" class="vet-pick" data-action="t-pick" data-user-id="${rec.userId}" ${picked ? "checked" : ""}>`
-                    : i + 1}</td>
+                    : num}</td>
                 <td class="vet-name" title="${nameTitle}">
                     <span class="vet-expand-arrow">${arrow}</span>${displayName && rawDisplay !== rawUsername
                         ? `${displayName} <span style="opacity:.55">${username}</span>`
-                        : username}
+                        : username}${isSelf ? ` <span style="opacity:.55">(you)</span>` : ""}
                 </td>
                 <td class="vet-id" title="${rec.userId}">${rec.userId}</td>
                 <td class="vet-status" data-status="${status}">${status}</td>
                 <td class="vet-num">${rec.totalMs ? this.formatDuration(rec.totalMs) : "—"}</td>
                 <td class="vet-num">${(rec.sessions || []).length || "—"}</td>
                 <td class="vet-date">${this.formatDate(rec.firstSeenAt)}</td>
-                <td class="vet-date">${this.formatDate(rec.lastSeenAt)}</td>
+                <td class="vet-date">${rec.live ? "now" : this.formatDate(rec.lastSeenAt)}</td>
                 <td class="vet-badge" style="color:${glyphColor};font-weight:700">${glyph}</td>
-                <td class="vet-actions">
+                <td class="vet-actions">${isSelf ? "" : `
                     <button type="button" class="vet-btn history"
                         data-action="history" data-user-id="${rec.userId}"
                         title="Show voice sessions">${isExpanded ? "Hide" : "History"}</button>
@@ -5427,7 +5323,7 @@ module.exports = class VoiceEncounterTracker {
                     </button>
                     <button type="button" class="vet-btn remove"
                         data-action="remove" data-user-id="${rec.userId}"
-                        title="Remove from history">Remove</button>
+                        title="Remove from history">Remove</button>`}
                 </td>
             </tr>`;
 
@@ -5456,7 +5352,7 @@ module.exports = class VoiceEncounterTracker {
                 const dur = this.formatDuration(s.durationMs ?? (s.endedAt - s.startedAt));
                 const guild = s.guildName || (s.guildId ? s.guildId.slice(-6) : "DM");
                 const channel = s.channelName || (s.channelId ? s.channelId.slice(-6) : "—");
-                const sessName = this._escape(s.username
+                const sessName = isSelf ? "" : this._escape(s.username
                     ? (s.globalName && s.globalName !== s.username ? `${s.globalName} (${s.username})` : s.username)
                     : (s.globalName || "—"));
                 const isSessExpanded = expandedSession &&
@@ -5464,7 +5360,7 @@ module.exports = class VoiceEncounterTracker {
                     expandedSession.sessionIndex === idx;
                 const arrowS = isSessExpanded ? "▼" : "▶";
                 const hasEvents = Array.isArray(s.events) && s.events.length > 0;
-                const openLabel = hasEvents
+                const openLabel = isSelf ? "" : hasEvents
                     ? (isSessExpanded ? "Hide" : "Timeline")
                     : "—";
 
@@ -5472,9 +5368,9 @@ module.exports = class VoiceEncounterTracker {
                 const mergedNote = s.mergedFrom > 1 ? ` title="Merged from ${s.mergedFrom} sessions"` : "";
                 return `<div class="vet-session-entry${isSessExpanded ? " expanded" : ""}${isSel ? " selected" : ""}"
                         data-user-id="${rec.userId}" data-session-idx="${idx}">
-                    <span class="vet-session-pick" data-action="merge-toggle"
+                    ${isSelf ? `<span class="vet-session-pick"></span>` : `<span class="vet-session-pick" data-action="merge-toggle"
                         data-user-id="${rec.userId}" data-session-idx="${idx}"
-                        title="Select for merge">${isSel ? "☑" : "☐"}</span>
+                        title="Select for merge">${isSel ? "☑" : "☐"}</span>`}
                     <span class="vet-session-date"${mergedNote}>
                         <span class="vet-session-arrow">${arrowS}</span>${dateStr}
                     </span>
@@ -5498,7 +5394,7 @@ module.exports = class VoiceEncounterTracker {
             const expandedRow = `<tr class="vet-sessions-row" data-parent="${rec.userId}">
                 <td colspan="10">
                     <div class="vet-sessions">
-                        <div class="vet-sessions-header">Voice sessions (newest first) — click a session to see the state timeline, tick ☐ to merge
+                        <div class="vet-sessions-header">Voice sessions (newest first)${isSelf ? "" : " — click a session to see the state timeline, tick ☐ to merge"}
                             ${selCount > 0 ? `<span class="vet-merge-bar">
                                 <button type="button" class="vet-btn" data-action="merge-apply" data-user-id="${rec.userId}"
                                     ${selCount < 2 ? "disabled" : ""}>Merge ${selCount} selected</button>
@@ -5512,7 +5408,7 @@ module.exports = class VoiceEncounterTracker {
             </tr>`;
 
             let timelineRow = "";
-            if (expandedSession && expandedSession.userId === rec.userId) {
+            if (!isSelf && expandedSession && expandedSession.userId === rec.userId) {
                 const sIdx = expandedSession.sessionIndex;
                 const sess = allSessions[sIdx];
                 if (sess) timelineRow = this._renderTimeline(sess);

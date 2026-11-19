@@ -159,7 +159,7 @@ Tray icon → **Window layouts…** lists *Desktop* and every game you've played
 
 Open it from the plugin settings or from a user's context menu → *Open Encounter Tracker*.
 
-- **My voice time** — a compact block with your own time in voice: total, and time per server and channel. The chart follows the selected range (7 / 30 days daily, all weekly). Own time excludes the AFK channel, and your open session survives plugin and Discord restarts.
+- **Your own row** — pinned first in the table and marked *(you)*: your total time in voice, sessions, first and last seen; expand it for your sessions with server and channel. Own time excludes the AFK channel, and your open session survives plugin and Discord restarts.
 - **Who was in voice with me** — set *At / from* and *to (optional)*: get everyone whose sessions overlap the moment or period; leave *to* empty for a single moment. Click a row to jump to that session in the table.
 - **Together…** — tick 2–5 people in the table to see when they were all in voice with you. A *to* time is required.
 - **History → merge** — tick sessions of one person and merge them into one.
