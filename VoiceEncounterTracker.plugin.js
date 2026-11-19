@@ -105,7 +105,12 @@ module.exports = class VoiceEncounterTracker {
             flashIconOnMute: true,
             showPingWarn: true,
             showPingLost: true,
-            knownMinMinutes: 15
+            knownMinMinutes: 15,
+            // Overlay notification scope: "all" | "friends" | "favorites" | "none"
+            notifyDm: "all",
+            notifyMention: "all",
+            notifyCall: "all",
+            notifyDevice: true
         };
 
         this.NATIVE_MUTE_STYLE_ID = "VoiceEncounterTracker-native-mute";
@@ -453,6 +458,18 @@ module.exports = class VoiceEncounterTracker {
                                 label: "Sound When They Join/Leave",
                                 checked: !!fav.sound,
                                 action: () => this.setFavoriteSound(userId, !fav.sound)
+                            });
+                            items.push({
+                                type: "toggle",
+                                label: "Show Their Messages in Overlay",
+                                checked: fav.notify !== false,
+                                action: () => this.setFavoriteNotify(userId, fav.notify === false)
+                            });
+                            items.push({
+                                type: "toggle",
+                                label: "Show Their Calls in Overlay",
+                                checked: fav.calls !== false,
+                                action: () => this.setFavoriteCalls(userId, fav.calls === false)
                             });
                         }
 
@@ -1947,7 +1964,9 @@ module.exports = class VoiceEncounterTracker {
                     streamPreview: s.streaming ? this._streamPreviewUrl(userId, mySession) : null,
                     streamPaused: s.streaming ? this._streamPaused(userId, mySession) : false,
                     favorite: !isSelf && !!this._favorites?.has(userId),
-                    favSound: !isSelf && !!this._favorites?.get(userId)?.sound
+                    favSound: !isSelf && !!this._favorites?.get(userId)?.sound,
+                    favNotify: !isSelf && this._favorites?.get(userId)?.notify !== false,
+                    favCalls: !isSelf && this._favorites?.get(userId)?.calls !== false
                 });
             }
 
@@ -2193,6 +2212,8 @@ module.exports = class VoiceEncounterTracker {
         else if (action === "open-profile") this._openProfile(userId);
         else if (action === "set-favorite") this.setFavorite(userId, cmd.sound === true);
         else if (action === "set-fav-sound") this.setFavoriteSound(userId, cmd.sound === true);
+        else if (action === "set-fav-notify") this.setFavoriteNotify(userId, cmd.sound === true);
+        else if (action === "set-fav-calls") this.setFavoriteCalls(userId, cmd.sound === true);
         else if (action === "set-known") {
             if (cmd.sound === true) this.markUserAsKnown(userId);
             else this.unmarkKnown(userId);
@@ -2989,13 +3010,20 @@ module.exports = class VoiceEncounterTracker {
     // =====================================================================
 
     // Favorites live apart from encounter history, so clearing logs keeps them.
-    // userId -> { sound: bool }
+    // userId -> { sound: bool, notify: bool, calls: bool }
+    // notify = show their messages in overlay, calls = show their calls in overlay
     _loadFavorites() {
         this._favorites = new Map();
         try {
             const raw = BdApi.Data.load(this.meta.name, "favorites");
             if (raw && typeof raw === "object") {
-                for (const [id, v] of Object.entries(raw)) this._favorites.set(id, { sound: !!v?.sound });
+                for (const [id, v] of Object.entries(raw)) {
+                    this._favorites.set(id, {
+                        sound: !!v?.sound,
+                        notify: v?.notify !== false,
+                        calls: v?.calls !== false
+                    });
+                }
             }
         } catch (e) {}
     }
@@ -3006,7 +3034,14 @@ module.exports = class VoiceEncounterTracker {
 
     setFavorite(userId, on) {
         userId = String(userId);
-        if (on) this._favorites.set(userId, { sound: this._favorites.get(userId)?.sound ?? true });
+        if (on) {
+            const cur = this._favorites.get(userId);
+            this._favorites.set(userId, {
+                sound: cur?.sound ?? true,
+                notify: cur?.notify ?? true,
+                calls: cur?.calls ?? true
+            });
+        }
         else this._favorites.delete(userId);
         this._saveFavorites();
         this.scheduleOverlayPush();
@@ -3015,9 +3050,45 @@ module.exports = class VoiceEncounterTracker {
     setFavoriteSound(userId, on) {
         userId = String(userId);
         if (!this._favorites.has(userId)) return;
-        this._favorites.set(userId, { sound: !!on });
+        this._favorites.set(userId, { ...this._favorites.get(userId), sound: !!on });
         this._saveFavorites();
         this.scheduleOverlayPush();
+    }
+
+    setFavoriteNotify(userId, on) {
+        userId = String(userId);
+        if (!this._favorites.has(userId)) return;
+        this._favorites.set(userId, { ...this._favorites.get(userId), notify: !!on });
+        this._saveFavorites();
+        this.scheduleOverlayPush();
+    }
+
+    setFavoriteCalls(userId, on) {
+        userId = String(userId);
+        if (!this._favorites.has(userId)) return;
+        this._favorites.set(userId, { ...this._favorites.get(userId), calls: !!on });
+        this._saveFavorites();
+        this.scheduleOverlayPush();
+    }
+
+    // Decides whether an overlay notification for userId is allowed by a scope mode.
+    // mode: "all" | "friends" | "favorites" | "none"; favFlag: "notify" | "calls".
+    _notifyAllowed(userId, mode, favFlag) {
+        if (!userId) return mode === "all";
+        const id = String(userId);
+        const rel = this._sc?.RelationshipStore ?? BdApi.Webpack.getStore("RelationshipStore");
+        const blocked = rel?.isBlocked ? rel.isBlocked(id) : false;
+        const ignored = rel?.isIgnored
+            ? !!rel.isIgnored(id)
+            : (rel?.getIgnoredIDs?.() ?? []).includes(id);
+        if (blocked || ignored) return false;
+        const fav = this._favorites?.get(id);
+        if (fav) return fav[favFlag] !== false;
+        if (mode === "all") return true;
+        if (mode === "friends") return rel?.isFriend ? rel.isFriend(id) === true
+            : rel?.getRelationshipType ? rel.getRelationshipType(id) === 1
+            : (rel?.getFriendIDs?.() ?? []).includes(id);
+        return false;
     }
 
     _voiceStore() {
@@ -3204,6 +3275,9 @@ module.exports = class VoiceEncounterTracker {
             const sel = (this._sc?.SelectedChannelStore ?? BdApi.Webpack.getStore("SelectedChannelStore"))?.getChannelId?.();
             if (document.hasFocus() && sel === msg.channel_id) return;
         } catch (e) {}
+
+        // Scope from settings; a favorite's own "Show messages" toggle overrides it.
+        if (!this._notifyAllowed(authorId, isDM ? this.prefs.notifyDm : this.prefs.notifyMention, "notify")) return;
 
         let text = String(msg.content || "").replace(/<@!?(\d+)>/g, (_, id) => "@" + (this.getDisplayName(id, ch?.guild_id ?? null) || "user"))
             .replace(/<#(\d+)>/g, (_, id) => "#" + (this.getChannelName(id) || "channel"))
@@ -3457,6 +3531,8 @@ module.exports = class VoiceEncounterTracker {
             callerId = Object.keys(states).find(id => id !== me) || null;
         } catch (e) {}
         callerId = callerId || others[0] || null;
+        // _ringingCall stays set above, so the later CALL_DELETE clear still matches.
+        if (!this._notifyAllowed(callerId, this.prefs.notifyCall, "calls")) return;
         const us = this._sc?.UserStore ?? BdApi.Webpack.getStore("UserStore");
         const u = callerId ? us?.getUser?.(callerId) : null;
         this._postJSON("/call", {
@@ -3781,6 +3857,7 @@ module.exports = class VoiceEncounterTracker {
         if (prev.output !== cur.output || name(prev.outputs, prev.output) !== name(cur.outputs, cur.output)) devices.push({ kind: "output", name: name(cur.outputs, cur.output) });
         if (!devices.length) return;
         vetLog("info", "audio device changed:", devices.map(d => d.kind + "=" + d.name).join(", "));
+        if (!this.prefs.notifyDevice) return;
         this._postJSON("/notify", {
             id: "device-" + Date.now(), kind: "device", authorId: "", name: "Audio device changed",
             avatar: null, channelId: "device", guildId: null, where: null,
@@ -4766,6 +4843,39 @@ module.exports = class VoiceEncounterTracker {
                                 style="width:64px;padding:2px 4px;background:var(--background-secondary,#2b2d31);color:inherit;border:1px solid var(--background-modifier-accent,#444);border-radius:4px">
                             <span>Minutes together in voice before a user counts as known (✓)</span>
                         </label>
+                        <div class="vet-pref-section" style="margin-top:10px;font-weight:600">Overlay notifications</div>
+                        <label class="vet-pref-label">
+                            <select data-pref-sel="notifyDm" style="padding:2px 4px;background:var(--background-tertiary,#1e1f22);color:inherit;border:1px solid var(--background-modifier-accent,#444);border-radius:4px;font:inherit">
+                                <option value="all">All</option>
+                                <option value="friends">Friends</option>
+                                <option value="favorites">Favorites only</option>
+                                <option value="none">Nobody</option>
+                            </select>
+                            <span>Direct messages</span>
+                        </label>
+                        <label class="vet-pref-label">
+                            <select data-pref-sel="notifyMention" style="padding:2px 4px;background:var(--background-tertiary,#1e1f22);color:inherit;border:1px solid var(--background-modifier-accent,#444);border-radius:4px;font:inherit">
+                                <option value="all">All</option>
+                                <option value="friends">Friends</option>
+                                <option value="favorites">Favorites only</option>
+                                <option value="none">Nobody</option>
+                            </select>
+                            <span>Mentions</span>
+                        </label>
+                        <label class="vet-pref-label">
+                            <select data-pref-sel="notifyCall" style="padding:2px 4px;background:var(--background-tertiary,#1e1f22);color:inherit;border:1px solid var(--background-modifier-accent,#444);border-radius:4px;font:inherit">
+                                <option value="all">All</option>
+                                <option value="friends">Friends</option>
+                                <option value="favorites">Favorites only</option>
+                                <option value="none">Nobody</option>
+                            </select>
+                            <span>Incoming calls</span>
+                        </label>
+                        <label class="vet-pref-label">
+                            <input type="checkbox" data-pref="notifyDevice">
+                            <span>Audio device changes</span>
+                        </label>
+                        <div style="opacity:.6;font-size:12px;margin-top:4px">Favorites follow their own Show messages / Show calls toggles. Blocked and ignored users are never shown.</div>
                     </div>
 
                     <div class="vet-search">
@@ -4879,6 +4989,16 @@ module.exports = class VoiceEncounterTracker {
                 }
                 try { this.injectBadges(); } catch (e) {}
                 try { this.pushStateToOverlay(); } catch (e) {}
+            });
+        });
+
+        overlay.querySelectorAll("select[data-pref-sel]").forEach(sel => {
+            sel.addEventListener("change", () => {
+                const key = sel.getAttribute("data-pref-sel");
+                const allowed = ["all", "friends", "favorites", "none"];
+                if (!allowed.includes(sel.value)) { sel.value = this.prefs[key]; return; }
+                this.prefs[key] = sel.value;
+                this.savePrefs();
             });
         });
 
@@ -5250,6 +5370,11 @@ module.exports = class VoiceEncounterTracker {
         overlay.querySelector("input[data-pref='hideMuteForBlocked']").checked = this.prefs.hideMuteForBlocked;
         overlay.querySelector("input[data-pref='flashIconOnMute']").checked = this.prefs.flashIconOnMute;
         overlay.querySelector("input[data-pref-num='knownMinMinutes']").value = this.prefs.knownMinMinutes ?? 15;
+        for (const key of ["notifyDm", "notifyMention", "notifyCall"]) {
+            const sel = overlay.querySelector(`select[data-pref-sel='${key}']`);
+            if (sel) sel.value = this.prefs[key] ?? "all";
+        }
+        overlay.querySelector("input[data-pref='notifyDevice']").checked = this.prefs.notifyDevice !== false;
 
         const tbody = overlay.querySelector("[data-role='tbody']");
         if (!tbody) return;

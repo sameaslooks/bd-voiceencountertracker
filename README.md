@@ -135,6 +135,8 @@ What the block can show:
 - **Audio device changed** — a short notice with the new input / output device.
 - **Someone unexpected started watching your stream** — see below.
 
+Who gets through is set in the plugin settings under *Overlay notifications*: direct messages, mentions and incoming calls each have *All / Friends / Favorites only / Nobody*, and audio device notices can be turned off. Favorites follow their own *Show messages in overlay* / *Show calls in overlay* toggles (overlay user menu or Discord context menu, both on by default) regardless of those choices. Blocked and ignored users are never shown.
+
 ### Streams
 
 - **Watch**: click **LIVE** on someone's card. Every stream (and **camera** — click the camera icon) opens in its own window, so you can watch several at once. Hover **LIVE** for Discord's preview of the stream. Every overlay window can open streams on its own, and the same stream can be open in several overlays: Discord watches each stream once, and every window gets a clone of the same track over its own local loopback connection (no extra network). Discord stops watching a stream only after the last window of it closes.
