@@ -4608,9 +4608,10 @@ module.exports = class VoiceEncounterTracker {
                 .vet-session-pick:hover { opacity: 1; }
                 .vet-session-entry.selected { background: rgba(59,165,93,0.12); }
                 .vet-session-entry.selected .vet-session-pick { opacity: 1; color: #3ba55d; }
-                .vet-merge-bar { margin-left: 12px; text-transform: none; letter-spacing: 0; }
-                .vet-merge-bar .vet-btn { margin-left: 4px; }
-                .vet-merge-bar .vet-btn[disabled] { opacity: .45; cursor: default; }
+                .vet-sel-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0 8px; }
+                .vet-sel-bar:empty { display: none; }
+                .vet-sel-bar .vet-sel-count { margin-right: 6px; font-size: 12px; opacity: .8; }
+                .vet-sel-bar .vet-btn[disabled] { opacity: .45; cursor: default; }
                 .vet-session-del-wrap { display: flex; align-items: center; justify-content: center; }
                 .vet-session-del {
                     background: none; border: none; padding: 2px; margin: 0; line-height: 0;
@@ -4618,7 +4619,6 @@ module.exports = class VoiceEncounterTracker {
                     transition: color .15s, opacity .15s;
                 }
                 .vet-session-del:hover { color: #ed4245; opacity: 1; }
-                .vet-session-del.armed { color: #ed4245; opacity: 1; }
                 .vet-sess-spacer { width: 100%; }
                 .vet-session-entry {
                     display: grid;
@@ -4802,6 +4802,8 @@ module.exports = class VoiceEncounterTracker {
                         </div>
                         <div class="vet-manual-status" data-role="manual-status"></div>
                     </div>
+
+                    <div class="vet-sel-bar" data-role="sel-bar"></div>
 
                     <div class="vet-table-wrap">
                         <table class="vet-table">
@@ -5054,6 +5056,16 @@ module.exports = class VoiceEncounterTracker {
         });
         renderTimeChips();
 
+        overlay.querySelector("[data-role='sel-bar']").addEventListener("click", (e) => {
+            const btn = e.target.closest("[data-action]");
+            if (!btn || btn.disabled) return;
+            e.preventDefault(); e.stopPropagation();
+            const action = btn.getAttribute("data-action");
+            if (action === "sel-clear") { this._vetSel?.clear(); rerender(); }
+            else if (action === "sel-delete") this._vetSelDelete(overlay, rerender);
+            else if (action === "sel-merge") this._vetSelMerge(overlay, rerender);
+        });
+
         overlay.querySelector("[data-role='tbody']").addEventListener("click", (e) => {
             const btn = e.target.closest("[data-action]");
             if (btn) {
@@ -5069,60 +5081,21 @@ module.exports = class VoiceEncounterTracker {
                 if (action === "history") {
                     this._vetExpandedUser = this._vetExpandedUser === userId ? null : userId;
                     this._vetExpandedSession = null;
-                    this._vetMergeSel = null;
                     rerender();
-                } else if (action === "merge-toggle") {
+                } else if (action === "sel-toggle") {
                     const key = btn.getAttribute("data-session-key");
                     if (!key) return;
-                    if (!this._vetMergeSel || this._vetMergeSel.userId !== userId) {
-                        this._vetMergeSel = { userId, keys: new Set() };
-                    }
-                    const set = this._vetMergeSel.keys;
+                    if (!this._vetSel) this._vetSel = new Map();
+                    let set = this._vetSel.get(userId);
+                    if (!set) { set = new Set(); this._vetSel.set(userId, set); }
                     if (set.has(key)) set.delete(key); else set.add(key);
+                    if (!set.size) this._vetSel.delete(userId);
                     rerender();
-                } else if (action === "merge-clear") {
-                    this._vetMergeSel = null;
-                    rerender();
-                } else if (action === "merge-apply") {
-                    const sel = this._vetMergeSel;
-                    if (!sel || sel.userId !== userId || sel.keys.size < 2) return;
-                    const keys = [...sel.keys];
-                    this._vetConfirm(overlay,
-                        "Merge sessions",
-                        `Merge ${keys.length} sessions into one continuous session, as if you never left? ` +
-                        `Gaps between them will count as time together. This cannot be undone.`,
-                        {
-                            confirmText: "Merge",
-                            cancelText: "Cancel",
-                            onConfirm: () => {
-                                if (userId === this.getCurrentUserId()) this._mergeOwnSessions(keys);
-                                else this.mergeSessions(userId, keys
-                                    .map(k => rec.sessions.findIndex(s => this._vetSessKey(s) === k))
-                                    .filter(i => i >= 0));
-                                this._vetMergeSel = null;
-                                this._vetExpandedSession = null;
-                                rerender();
-                            }
-                        }
-                    );
                 } else if (action === "session-del") {
                     const key = btn.getAttribute("data-session-key");
                     if (!key) return;
-                    const armKey = `${userId}|${key}`;
-                    if (this._vetDelArm !== armKey) {
-                        // First click arms the icon; it disarms after 3 s.
-                        this._vetDelArm = armKey;
-                        this._addTimer(setTimeout(() => {
-                            if (this._vetDelArm !== armKey) return;
-                            this._vetDelArm = null;
-                            if (overlay.isConnected) rerender();
-                        }, 3000));
-                        rerender();
-                        return;
-                    }
-                    this._vetDelArm = null;
-                    if (this._deleteSession(userId, key)) {
-                        if (this._vetMergeSel?.userId === userId) this._vetMergeSel.keys.delete(key);
+                    if (this._deleteSession(userId, [key])) {
+                        this._vetSel?.get(userId)?.delete(key);
                         if (this._vetExpandedSession?.userId === userId) this._vetExpandedSession = null;
                         this._vetJump = null;
                     }
@@ -5290,6 +5263,7 @@ module.exports = class VoiceEncounterTracker {
         if (me) entries = entries.filter(rec => rec.userId !== me);
         const selfRec = me ? this._myVoiceRecord(me) : null;
         const allRows = selfRec ? [selfRec, ...entries] : entries;
+        this._vetPruneSel((uid) => (uid === me ? selfRec : this.encounters.get(uid)));
         let seq = 0;
 
         const renderRow = (rec) => {
@@ -5370,8 +5344,7 @@ module.exports = class VoiceEncounterTracker {
             const allSessions = Array.isArray(rec.sessions) ? rec.sessions : [];
             const reversed = allSessions.map((s, idx) => ({ s, idx })).reverse();
             const jumpIdx = this._vetJump?.userId === rec.userId ? this._vetJump.idx : null;
-            const mergeSel = this._vetMergeSel;
-            const selCount = mergeSel && mergeSel.userId === rec.userId ? mergeSel.keys.size : 0;
+            const userSel = this._vetSel?.get(rec.userId);
             const SESS_CHUNK = 30;
             const totalChunks = Math.ceil(reversed.length / SESS_CHUNK);
             const TRASH_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`;
@@ -5398,17 +5371,16 @@ module.exports = class VoiceEncounterTracker {
                     ? (isSessExpanded ? "Hide" : "Timeline")
                     : "—";
 
-                const isSel = !!(mergeSel && mergeSel.userId === rec.userId && mergeSel.keys.has(key));
+                const isSel = !!(userSel && userSel.has(key));
                 const mergedNote = s.mergedFrom > 1 ? ` title="Merged from ${s.mergedFrom} sessions"` : "";
-                const armed = this._vetDelArm === `${rec.userId}|${key}`;
-                const delBtn = s.live ? "" : `<button type="button" class="vet-session-del${armed ? " armed" : ""}"
+                const delBtn = s.live ? "" : `<button type="button" class="vet-session-del"
                             data-action="session-del" data-user-id="${rec.userId}" data-session-key="${key}"
-                            title="${armed ? "Click again to delete" : "Delete session"}">${TRASH_SVG}</button>`;
+                            title="Delete session">${TRASH_SVG}</button>`;
                 return `<div class="vet-session-entry${isSessExpanded ? " expanded" : ""}${isSel ? " selected" : ""}"
                         data-user-id="${rec.userId}" data-session-idx="${idx}" data-session-key="${key}">
-                    ${s.live ? `<span class="vet-session-pick"></span>` : `<span class="vet-session-pick" data-action="merge-toggle"
+                    ${s.live ? `<span class="vet-session-pick"></span>` : `<span class="vet-session-pick" data-action="sel-toggle"
                         data-user-id="${rec.userId}" data-session-key="${key}"
-                        title="Select for merge">${isSel ? "☑" : "☐"}</span>`}
+                        title="Select">${isSel ? "☑" : "☐"}</span>`}
                     <span class="vet-session-date"${mergedNote}>
                         <span class="vet-session-arrow">${arrowS}</span>${dateStr}
                     </span>
@@ -5450,13 +5422,7 @@ module.exports = class VoiceEncounterTracker {
             const expandedRow = `<tr class="vet-sessions-row" data-parent="${rec.userId}">
                 <td colspan="10">
                     <div class="vet-sessions">
-                        <div class="vet-sessions-header">Voice sessions (newest first)${isSelf ? " — tick ☐ to merge" : " — click a session to see the state timeline, tick ☐ to merge"}
-                            ${selCount > 0 ? `<span class="vet-merge-bar">
-                                <button type="button" class="vet-btn" data-action="merge-apply" data-user-id="${rec.userId}"
-                                    ${selCount < 2 ? "disabled" : ""}>Merge ${selCount} selected</button>
-                                <button type="button" class="vet-btn" data-action="merge-clear" data-user-id="${rec.userId}">Clear</button>
-                            </span>` : ""}
-                        </div>
+                        <div class="vet-sessions-header">Voice sessions (newest first)${isSelf ? " — tick ☐ to select" : " — click a session to see the state timeline, tick ☐ to select"}</div>
                         ${sessionLines || sessionsEmpty}
                     </div>
                 </td>
@@ -5476,6 +5442,8 @@ module.exports = class VoiceEncounterTracker {
             return ""; } }).join("");
 
         tbody.innerHTML = html || `<tr><td colspan="10" class="vet-empty">No data yet.</td></tr>`;
+        const selBar = overlay.querySelector("[data-role='sel-bar']");
+        if (selBar) selBar.innerHTML = this._vetSelBarHtml();
         this._vetSetupSessionObservers(tbody);
     }
 
@@ -5573,15 +5541,18 @@ module.exports = class VoiceEncounterTracker {
 
     // ---- Per-session delete (others: encounter record; me: myVoice log) ----
 
-    // key = "start-end" for a session; returns false when nothing was removed.
-    _deleteSession(userId, key) {
-        if (userId === this.getCurrentUserId()) return this._deleteOwnSession(key);
+    // keys = ["start-end", ...]; returns false when nothing was removed.
+    _deleteSession(userId, keys) {
+        if (userId === this.getCurrentUserId()) return this._deleteOwnSession(keys);
         const rec = this.encounters.get(userId);
         if (!rec || !Array.isArray(rec.sessions)) return false;
-        const idx = rec.sessions.findIndex(s => this._vetSessKey(s) === key);
-        if (idx < 0) return false;
-        rec.sessions.splice(idx, 1);
+        const keySet = new Set(keys);
         const ss = rec.sessions;
+        let removed = false;
+        for (let i = ss.length - 1; i >= 0; i--) {
+            if (keySet.has(this._vetSessKey(ss[i]))) { ss.splice(i, 1); removed = true; }
+        }
+        if (!removed) return false;
         rec.totalMs = ss.reduce((a, s) => a + (s.durationMs ?? (s.endedAt - s.startedAt)), 0);
         if (ss.length) {
             rec.firstSeenAt = Math.min(...ss.map(s => s.startedAt));
@@ -5592,14 +5563,15 @@ module.exports = class VoiceEncounterTracker {
         return true;
     }
 
-    _deleteOwnSession(key) {
+    _deleteOwnSession(keys) {
         const loaded = this._loadMyVoice();
         if (loaded === null) {
             BdApi.UI.showToast("Could not read your voice log; nothing deleted", { type: "error" });
             return false;
         }
         const pending = this._myVoicePending || [];
-        const matches = x => `${x.start}-${x.end}` === key;
+        const keySet = new Set(keys);
+        const matches = x => keySet.has(`${x.start}-${x.end}`);
         const next = loaded.filter(x => !matches(x));
         const restPending = pending.filter(x => !matches(x));
         if (next.length === loaded.length && restPending.length === pending.length) return false;
@@ -5610,6 +5582,91 @@ module.exports = class VoiceEncounterTracker {
         }
         this._myVoicePending = restPending;
         return true;
+    }
+
+    // ---- Session selection (this._vetSel: Map userId -> Set(sessionKey); live sessions never selected) ----
+
+    _vetSelPlan() {
+        return [...(this._vetSel?.entries() || [])].map(([userId, set]) => ({ userId, keys: [...set] }));
+    }
+
+    // Drop selected keys whose session no longer exists (after delete/merge); recOf(userId) returns the record.
+    _vetPruneSel(recOf) {
+        const sel = this._vetSel;
+        if (!sel) return;
+        for (const [userId, set] of sel) {
+            const rec = recOf(userId);
+            const existing = new Set((Array.isArray(rec?.sessions) ? rec.sessions : []).map(s => this._vetSessKey(s)));
+            for (const k of set) if (!existing.has(k)) set.delete(k);
+            if (!set.size) sel.delete(userId);
+        }
+    }
+
+    _vetSelBarHtml() {
+        if (!this._vetSel || !this._vetSel.size) return "";
+        let n = 0, mergeable = 0;
+        for (const set of this._vetSel.values()) { n += set.size; if (set.size >= 2) mergeable++; }
+        if (!n) return "";
+        const users = this._vetSel.size;
+        return `<span class="vet-sel-count">${n} selected · ${users} ${users === 1 ? "user" : "users"}</span>
+            <button type="button" class="vet-btn" data-action="sel-merge"${mergeable ? "" : " disabled"}>Merge</button>
+            <button type="button" class="vet-btn" data-action="sel-delete">Delete</button>
+            <button type="button" class="vet-btn" data-action="sel-clear">Clear</button>`;
+    }
+
+    _vetSelDelete(overlay, done) {
+        const plan = this._vetSelPlan();
+        const total = plan.reduce((n, p) => n + p.keys.length, 0);
+        if (!total) return;
+        this._vetConfirm(overlay,
+            `Delete ${total} session${total === 1 ? "" : "s"}?`,
+            "The selected sessions will be removed from the history. This cannot be undone.",
+            {
+                confirmText: "Delete",
+                cancelText: "Cancel",
+                danger: true,
+                onConfirm: () => {
+                    for (const { userId, keys } of plan) { this._vetSel?.delete(userId); this._deleteSession(userId, keys); }
+                    if (this._vetExpandedSession && plan.some(p => p.userId === this._vetExpandedSession.userId)) {
+                        this._vetExpandedSession = null;
+                    }
+                    this._vetJump = null;
+                    done();
+                }
+            });
+    }
+
+    // Merges per person: each user's selected sessions (>= 2) are merged on their own.
+    _vetSelMerge(overlay, done) {
+        const all = this._vetSelPlan();
+        const plan = all.filter(p => p.keys.length >= 2);
+        if (!plan.length) return;
+        const total = plan.reduce((n, p) => n + p.keys.length, 0);
+        const skipped = all.length - plan.length;
+        let text = `Merge ${total} sessions into one continuous session per person, as if they never left? ` +
+            `Gaps between them will count as time together. This cannot be undone.`;
+        if (all.length > 1) {
+            text += " Sessions of different people are not merged with each other — selected sessions are merged per person.";
+        }
+        if (skipped) {
+            text += ` ${skipped} ${skipped === 1 ? "person has" : "people have"} only one selected session and will be skipped.`;
+        }
+        this._vetConfirm(overlay, "Merge sessions", text, {
+            confirmText: "Merge",
+            cancelText: "Cancel",
+            onConfirm: () => {
+                const me = this.getCurrentUserId();
+                for (const { userId, keys } of plan) {
+                    this._vetSel?.delete(userId);
+                    if (userId === me) { this._mergeOwnSessions(keys); continue; }
+                    const ss = this.encounters.get(userId)?.sessions || [];
+                    const idx = keys.map(k => ss.findIndex(s => this._vetSessKey(s) === k)).filter(i => i >= 0);
+                    this.mergeSessions(userId, idx);
+                }
+                this._vetExpandedSession = null;
+                done();
+            }
+        });
     }
 
     // Merge selected own sessions (keys "start-end") into one, persisted to myVoice.

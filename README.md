@@ -160,7 +160,7 @@ Tray icon → **Window layouts…** lists *Desktop* and every game you've played
 Open it from the plugin settings or from a user's context menu → *Open Encounter Tracker*.
 
 - **Your own row** — pinned first in the table and marked *(you)*: your total time in voice, sessions, first and last seen; expand it for your sessions with server and channel. Your sessions can be merged like anyone else's.
-- **Deleting sessions** — every session line has a small trash button (click twice to confirm); totals are recalculated. Long session lists load in chunks of 30 as you scroll. Own time excludes the AFK channel, and your open session survives plugin and Discord restarts.
+- **Deleting and merging sessions** — every session line has a trash button that deletes it at once. Tick sessions (across several people) to delete or merge them from the bar above the table; merging joins only each person's own selected sessions. Totals are recalculated. Long session lists load in chunks of 30 as you scroll. Own time excludes the AFK channel, and your open session survives plugin and Discord restarts.
 - **Who was in voice with me** — set *At / from* and *to (optional)*: get everyone whose sessions overlap the moment or period; leave *to* empty for a single moment. Click a row to jump to that session in the table.
 - **Together…** — tick 2–5 people in the table to see when they were all in voice with you. A *to* time is required.
 - **History → merge** — tick sessions of one person and merge them into one.
