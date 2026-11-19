@@ -303,6 +303,7 @@ module.exports = class VoiceEncounterTracker {
         }
         this._domNodes = [];
 
+        try { this._vetSessDisconnect(); } catch (e) {}
         if (this._vetOverlay) {
             try { this._vetOverlay.remove(); } catch (e) {}
             this._vetOverlay = null;
@@ -4610,9 +4611,18 @@ module.exports = class VoiceEncounterTracker {
                 .vet-merge-bar { margin-left: 12px; text-transform: none; letter-spacing: 0; }
                 .vet-merge-bar .vet-btn { margin-left: 4px; }
                 .vet-merge-bar .vet-btn[disabled] { opacity: .45; cursor: default; }
+                .vet-session-del-wrap { display: flex; align-items: center; justify-content: center; }
+                .vet-session-del {
+                    background: none; border: none; padding: 2px; margin: 0; line-height: 0;
+                    cursor: pointer; color: var(--text-muted, #72767d); opacity: .6;
+                    transition: color .15s, opacity .15s;
+                }
+                .vet-session-del:hover { color: #ed4245; opacity: 1; }
+                .vet-session-del.armed { color: #ed4245; opacity: 1; }
+                .vet-sess-spacer { width: 100%; }
                 .vet-session-entry {
                     display: grid;
-                    grid-template-columns: 22px 90px 140px 80px minmax(140px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr) 90px;
+                    grid-template-columns: 22px 90px 140px 80px minmax(140px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr) 90px 18px;
                     gap: 12px;
                     padding: 5px 4px;
                     border-bottom: 1px solid rgba(255,255,255,0.04);
@@ -4833,6 +4843,7 @@ module.exports = class VoiceEncounterTracker {
         });
 
         const close = () => {
+            this._vetSessDisconnect();
             try { overlay.remove(); } catch (e) {}
             this._vetOverlay = null;
             this._vetSearchQuery = "";
@@ -5061,36 +5072,61 @@ module.exports = class VoiceEncounterTracker {
                     this._vetMergeSel = null;
                     rerender();
                 } else if (action === "merge-toggle") {
-                    const idx = Number(btn.getAttribute("data-session-idx"));
-                    if (!Number.isFinite(idx)) return;
+                    const key = btn.getAttribute("data-session-key");
+                    if (!key) return;
                     if (!this._vetMergeSel || this._vetMergeSel.userId !== userId) {
-                        this._vetMergeSel = { userId, idx: new Set() };
+                        this._vetMergeSel = { userId, keys: new Set() };
                     }
-                    const set = this._vetMergeSel.idx;
-                    if (set.has(idx)) set.delete(idx); else set.add(idx);
+                    const set = this._vetMergeSel.keys;
+                    if (set.has(key)) set.delete(key); else set.add(key);
                     rerender();
                 } else if (action === "merge-clear") {
                     this._vetMergeSel = null;
                     rerender();
                 } else if (action === "merge-apply") {
                     const sel = this._vetMergeSel;
-                    if (!sel || sel.userId !== userId || sel.idx.size < 2) return;
-                    const idxs = [...sel.idx];
+                    if (!sel || sel.userId !== userId || sel.keys.size < 2) return;
+                    const keys = [...sel.keys];
                     this._vetConfirm(overlay,
                         "Merge sessions",
-                        `Merge ${idxs.length} sessions into one continuous session, as if you never left? ` +
+                        `Merge ${keys.length} sessions into one continuous session, as if you never left? ` +
                         `Gaps between them will count as time together. This cannot be undone.`,
                         {
                             confirmText: "Merge",
                             cancelText: "Cancel",
                             onConfirm: () => {
-                                this.mergeSessions(userId, idxs);
+                                if (userId === this.getCurrentUserId()) this._mergeOwnSessions(keys);
+                                else this.mergeSessions(userId, keys
+                                    .map(k => rec.sessions.findIndex(s => this._vetSessKey(s) === k))
+                                    .filter(i => i >= 0));
                                 this._vetMergeSel = null;
                                 this._vetExpandedSession = null;
                                 rerender();
                             }
                         }
                     );
+                } else if (action === "session-del") {
+                    const key = btn.getAttribute("data-session-key");
+                    if (!key) return;
+                    const armKey = `${userId}|${key}`;
+                    if (this._vetDelArm !== armKey) {
+                        // First click arms the icon; it disarms after 3 s.
+                        this._vetDelArm = armKey;
+                        this._addTimer(setTimeout(() => {
+                            if (this._vetDelArm !== armKey) return;
+                            this._vetDelArm = null;
+                            if (overlay.isConnected) rerender();
+                        }, 3000));
+                        rerender();
+                        return;
+                    }
+                    this._vetDelArm = null;
+                    if (this._deleteSession(userId, key)) {
+                        if (this._vetMergeSel?.userId === userId) this._vetMergeSel.keys.delete(key);
+                        if (this._vetExpandedSession?.userId === userId) this._vetExpandedSession = null;
+                        this._vetJump = null;
+                    }
+                    rerender();
                 } else if (action === "toggle-block") {
                     const willBeBlocked = !rec?.blocked;
                     if (willBeBlocked) rel?.blockUser?.(userId);
@@ -5245,6 +5281,7 @@ module.exports = class VoiceEncounterTracker {
         const tbody = overlay.querySelector("[data-role='tbody']");
         if (!tbody) return;
 
+        this._vetSessDisconnect();
         const expandedId = this._vetExpandedUser;
         const expandedSession = this._vetExpandedSession;
 
@@ -5255,7 +5292,7 @@ module.exports = class VoiceEncounterTracker {
         const allRows = selfRec ? [selfRec, ...entries] : entries;
         let seq = 0;
 
-        const html = allRows.map((rec) => {
+        const renderRow = (rec) => {
             const isSelf = !!selfRec && rec.userId === selfRec.userId;
             const num = isSelf ? "" : ++seq;
             const rawUsername = this.getUserName(rec.userId);
@@ -5309,7 +5346,7 @@ module.exports = class VoiceEncounterTracker {
                 <td class="vet-date">${this.formatDate(rec.firstSeenAt)}</td>
                 <td class="vet-date">${rec.live ? "now" : this.formatDate(rec.lastSeenAt)}</td>
                 <td class="vet-badge" style="color:${glyphColor};font-weight:700">${glyph}</td>
-                <td class="vet-actions">${isSelf ? "" : `
+                <td class="vet-actions">${isSelf ? `<button type="button" class="vet-btn" tabindex="-1" aria-hidden="true" style="visibility:hidden;pointer-events:none">History</button>` : `
                     <button type="button" class="vet-btn history"
                         data-action="history" data-user-id="${rec.userId}"
                         title="Show voice sessions">${isExpanded ? "Hide" : "History"}</button>
@@ -5327,23 +5364,19 @@ module.exports = class VoiceEncounterTracker {
                 </td>
             </tr>`;
 
+            if (this._vetSessState?.userId === rec.userId && !isExpanded) this._vetSessState = null;
             if (!isExpanded) return mainRow;
 
             const allSessions = Array.isArray(rec.sessions) ? rec.sessions : [];
             const reversed = allSessions.map((s, idx) => ({ s, idx })).reverse();
-            let from = 0;
             const jumpIdx = this._vetJump?.userId === rec.userId ? this._vetJump.idx : null;
-            if (jumpIdx != null) {
-                const pos = reversed.findIndex(x => x.idx === jumpIdx);
-                if (pos >= 20) from = Math.max(0, pos - 10);
-            }
-            const shownSessions = reversed.slice(from, from + 20);
-
-            const hiddenCount = allSessions.length - shownSessions.length;
             const mergeSel = this._vetMergeSel;
-            const selCount = mergeSel && mergeSel.userId === rec.userId ? mergeSel.idx.size : 0;
+            const selCount = mergeSel && mergeSel.userId === rec.userId ? mergeSel.keys.size : 0;
+            const SESS_CHUNK = 30;
+            const totalChunks = Math.ceil(reversed.length / SESS_CHUNK);
+            const TRASH_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`;
 
-            const sessionLines = shownSessions.map(({ s, idx }) => {
+            const sessionLine = ({ s, idx }) => {
                 const start = new Date(s.startedAt);
                 const end = new Date(s.endedAt);
                 const dateStr = `${start.getFullYear()}-${String(start.getMonth()+1).padStart(2,"0")}-${String(start.getDate()).padStart(2,"0")}`;
@@ -5355,6 +5388,7 @@ module.exports = class VoiceEncounterTracker {
                 const sessName = isSelf ? "" : this._escape(s.username
                     ? (s.globalName && s.globalName !== s.username ? `${s.globalName} (${s.username})` : s.username)
                     : (s.globalName || "—"));
+                const key = this._vetSessKey(s);
                 const isSessExpanded = expandedSession &&
                     expandedSession.userId === rec.userId &&
                     expandedSession.sessionIndex === idx;
@@ -5364,12 +5398,16 @@ module.exports = class VoiceEncounterTracker {
                     ? (isSessExpanded ? "Hide" : "Timeline")
                     : "—";
 
-                const isSel = !!(mergeSel && mergeSel.userId === rec.userId && mergeSel.idx.has(idx));
+                const isSel = !!(mergeSel && mergeSel.userId === rec.userId && mergeSel.keys.has(key));
                 const mergedNote = s.mergedFrom > 1 ? ` title="Merged from ${s.mergedFrom} sessions"` : "";
+                const armed = this._vetDelArm === `${rec.userId}|${key}`;
+                const delBtn = s.live ? "" : `<button type="button" class="vet-session-del${armed ? " armed" : ""}"
+                            data-action="session-del" data-user-id="${rec.userId}" data-session-key="${key}"
+                            title="${armed ? "Click again to delete" : "Delete session"}">${TRASH_SVG}</button>`;
                 return `<div class="vet-session-entry${isSessExpanded ? " expanded" : ""}${isSel ? " selected" : ""}"
-                        data-user-id="${rec.userId}" data-session-idx="${idx}">
-                    ${isSelf ? `<span class="vet-session-pick"></span>` : `<span class="vet-session-pick" data-action="merge-toggle"
-                        data-user-id="${rec.userId}" data-session-idx="${idx}"
+                        data-user-id="${rec.userId}" data-session-idx="${idx}" data-session-key="${key}">
+                    ${s.live ? `<span class="vet-session-pick"></span>` : `<span class="vet-session-pick" data-action="merge-toggle"
+                        data-user-id="${rec.userId}" data-session-key="${key}"
                         title="Select for merge">${isSel ? "☑" : "☐"}</span>`}
                     <span class="vet-session-date"${mergedNote}>
                         <span class="vet-session-arrow">${arrowS}</span>${dateStr}
@@ -5380,21 +5418,39 @@ module.exports = class VoiceEncounterTracker {
                     <span class="vet-session-channel" title="${channel}">${channel}</span>
                     <span class="vet-session-name" title="${sessName}">${sessName}</span>
                     <span class="vet-session-open">${openLabel}</span>
+                    <span class="vet-session-del-wrap">${delBtn}</span>
                 </div>`;
-            }).join("");
+            };
+
+            // Sessions load in chunks of SESS_CHUNK; far-away chunks are swapped for spacers
+            // by the observers set up after render (see _vetSetupSessionObservers).
+            const chunkHtml = (k) => reversed.slice(k * SESS_CHUNK, (k + 1) * SESS_CHUNK).map(sessionLine).join("");
+            if (!this._vetSessState || this._vetSessState.userId !== rec.userId) {
+                this._vetSessState = { userId: rec.userId, chunks: 1, total: 0, render: null };
+            }
+            const sessState = this._vetSessState;
+            sessState.total = totalChunks;
+            sessState.render = chunkHtml;
+            if (jumpIdx != null) {
+                const pos = reversed.findIndex(x => x.idx === jumpIdx);
+                if (pos >= 0) sessState.chunks = Math.max(sessState.chunks, Math.floor(pos / SESS_CHUNK) + 1);
+            }
+            sessState.chunks = Math.min(Math.max(sessState.chunks, 1), Math.max(totalChunks, 1));
+            const loadedChunks = Array.from({ length: sessState.chunks }, (_, k) =>
+                `<div class="vet-sess-chunk" data-chunk="${k}">${chunkHtml(k)}</div>`).join("");
+            const moreSentinel = sessState.chunks < totalChunks
+                ? `<div class="vet-sess-sentinel" data-role="sess-more"></div>` : "";
+            const sessionLines = allSessions.length
+                ? `<div class="vet-sess-list">${loadedChunks}${moreSentinel}</div>` : "";
 
             const sessionsEmpty = allSessions.length === 0
                 ? `<div class="vet-session-more">No sessions recorded.</div>`
                 : "";
 
-            const sessionsMore = hiddenCount > 0
-                ? `<div class="vet-session-more">… and ${hiddenCount} more session${hiddenCount > 1 ? "s" : ""}</div>`
-                : "";
-
             const expandedRow = `<tr class="vet-sessions-row" data-parent="${rec.userId}">
                 <td colspan="10">
                     <div class="vet-sessions">
-                        <div class="vet-sessions-header">Voice sessions (newest first)${isSelf ? "" : " — click a session to see the state timeline, tick ☐ to merge"}
+                        <div class="vet-sessions-header">Voice sessions (newest first)${isSelf ? " — tick ☐ to merge" : " — click a session to see the state timeline, tick ☐ to merge"}
                             ${selCount > 0 ? `<span class="vet-merge-bar">
                                 <button type="button" class="vet-btn" data-action="merge-apply" data-user-id="${rec.userId}"
                                     ${selCount < 2 ? "disabled" : ""}>Merge ${selCount} selected</button>
@@ -5402,7 +5458,6 @@ module.exports = class VoiceEncounterTracker {
                             </span>` : ""}
                         </div>
                         ${sessionLines || sessionsEmpty}
-                        ${sessionsMore}
                     </div>
                 </td>
             </tr>`;
@@ -5415,9 +5470,198 @@ module.exports = class VoiceEncounterTracker {
             }
 
             return mainRow + expandedRow + timelineRow;
-        }).join("");
+        };
+        const html = allRows.map((rec) => { try { return renderRow(rec); } catch (err) {
+            vetLog("error", "tracker row render failed", rec?.userId, err?.stack || err);
+            return ""; } }).join("");
 
         tbody.innerHTML = html || `<tr><td colspan="10" class="vet-empty">No data yet.</td></tr>`;
+        this._vetSetupSessionObservers(tbody);
+    }
+
+    // ---- Lazy session list: chunk loading and unloading (IntersectionObserver) ----
+
+    _vetScrollRoot(el) {
+        for (let p = el?.parentElement; p; p = p.parentElement) {
+            const oy = getComputedStyle(p).overflowY;
+            if ((oy === "auto" || oy === "scroll") && p.clientHeight < p.scrollHeight) return p;
+        }
+        return null;
+    }
+
+    _vetSessKey(s) { return `${s.startedAt}-${s.endedAt}`; }
+
+    _vetSessDisconnect() {
+        const o = this._vetSessObs;
+        this._vetSessObs = null;
+        if (!o) return;
+        try { o.chunkObs.disconnect(); o.moreObs.disconnect(); } catch (e) {}
+    }
+
+    _vetSetupSessionObservers(tbody) {
+        this._vetSessDisconnect();
+        const st = this._vetSessState;
+        const list = tbody.querySelector(".vet-sess-list");
+        if (!st || !list || typeof IntersectionObserver !== "function") return;
+        const root = this._vetScrollRoot(tbody);
+        const H = Math.max(200, root ? root.clientHeight : window.innerHeight);
+        const chunkObs = new IntersectionObserver((entries) => {
+            for (const en of entries) {
+                const el = en.target;
+                if (!el.isConnected) continue;
+                if (el.classList.contains("vet-sess-spacer")) {
+                    if (en.isIntersecting) this._vetRestoreChunk(el, chunkObs, st);
+                } else if (!en.isIntersecting) {
+                    this._vetUnloadChunk(el, chunkObs);
+                }
+            }
+        }, { root, rootMargin: `${2 * H}px 0px ${2 * H}px 0px` });
+        const moreObs = new IntersectionObserver((entries) => {
+            if (list.isConnected && entries.some(en => en.isIntersecting)) {
+                this._vetLoadMoreChunks(list, st, chunkObs, moreObs);
+            }
+        }, { root, rootMargin: `${H}px 0px ${H}px 0px` });
+        this._vetSessObs = { chunkObs, moreObs };
+        list.querySelectorAll(".vet-sess-chunk").forEach(c => chunkObs.observe(c));
+        const more = list.querySelector("[data-role='sess-more']");
+        if (more) moreObs.observe(more);
+    }
+
+    _vetLoadMoreChunks(list, st, chunkObs, moreObs) {
+        const sentinel = list.querySelector("[data-role='sess-more']");
+        if (!sentinel || st.chunks >= st.total) {
+            moreObs.disconnect();
+            sentinel?.remove();
+            return;
+        }
+        const k = st.chunks++;
+        const chunk = document.createElement("div");
+        chunk.className = "vet-sess-chunk";
+        chunk.dataset.chunk = String(k);
+        chunk.innerHTML = st.render(k);
+        sentinel.before(chunk);
+        chunkObs.observe(chunk);
+        if (st.chunks >= st.total) {
+            moreObs.disconnect();
+            sentinel.remove();
+        } else {
+            // Re-observing fires again at once if the sentinel is still near view.
+            moreObs.unobserve(sentinel);
+            moreObs.observe(sentinel);
+        }
+    }
+
+    _vetUnloadChunk(el, chunkObs) {
+        const sp = document.createElement("div");
+        sp.className = "vet-sess-spacer";
+        sp.dataset.chunk = el.dataset.chunk;
+        sp.style.height = `${el.offsetHeight}px`;
+        chunkObs.unobserve(el);
+        el.replaceWith(sp);
+        chunkObs.observe(sp);
+    }
+
+    _vetRestoreChunk(sp, chunkObs, st) {
+        const el = document.createElement("div");
+        el.className = "vet-sess-chunk";
+        el.dataset.chunk = sp.dataset.chunk;
+        el.innerHTML = st.render(Number(sp.dataset.chunk));
+        chunkObs.unobserve(sp);
+        sp.replaceWith(el);
+        chunkObs.observe(el);
+    }
+
+    // ---- Per-session delete (others: encounter record; me: myVoice log) ----
+
+    // key = "start-end" for a session; returns false when nothing was removed.
+    _deleteSession(userId, key) {
+        if (userId === this.getCurrentUserId()) return this._deleteOwnSession(key);
+        const rec = this.encounters.get(userId);
+        if (!rec || !Array.isArray(rec.sessions)) return false;
+        const idx = rec.sessions.findIndex(s => this._vetSessKey(s) === key);
+        if (idx < 0) return false;
+        rec.sessions.splice(idx, 1);
+        const ss = rec.sessions;
+        rec.totalMs = ss.reduce((a, s) => a + (s.durationMs ?? (s.endedAt - s.startedAt)), 0);
+        if (ss.length) {
+            rec.firstSeenAt = Math.min(...ss.map(s => s.startedAt));
+            rec.lastSeenAt = Math.max(...ss.map(s => s.endedAt));
+        }
+        this.scheduleSave();
+        this.scheduleOverlayPush();
+        return true;
+    }
+
+    _deleteOwnSession(key) {
+        const loaded = this._loadMyVoice();
+        if (loaded === null) {
+            BdApi.UI.showToast("Could not read your voice log; nothing deleted", { type: "error" });
+            return false;
+        }
+        const pending = this._myVoicePending || [];
+        const matches = x => `${x.start}-${x.end}` === key;
+        const next = loaded.filter(x => !matches(x));
+        const restPending = pending.filter(x => !matches(x));
+        if (next.length === loaded.length && restPending.length === pending.length) return false;
+        try { BdApi.Data.save(this.meta.name, "myVoice", next); }
+        catch (e) {
+            BdApi.UI.showToast("Could not save your voice log; nothing deleted", { type: "error" });
+            return false;
+        }
+        this._myVoicePending = restPending;
+        return true;
+    }
+
+    // Merge selected own sessions (keys "start-end") into one, persisted to myVoice.
+    // Sessions lying inside the merged span (fully or partially) are absorbed too, so the
+    // history never overlaps; the merged one takes the earliest absorbed guild/channel.
+    // The live session (this._mySess) is never in the stored/pending lists, so it is not touched.
+    _mergeOwnSessions(keys) {
+        const loaded = this._loadMyVoice();
+        if (loaded === null) {
+            BdApi.UI.showToast("Could not read your voice log; nothing merged", { type: "error" });
+            return false;
+        }
+        const keySet = new Set(keys);
+        const pending = this._myVoicePending || [];
+        const all = [...loaded, ...pending];
+        const picked = all.filter(x => Number.isFinite(x.start) && Number.isFinite(x.end) &&
+            keySet.has(`${x.start}-${x.end}`));
+        if (picked.length < 2) return false;
+        let spanStart = Math.min(...picked.map(x => x.start));
+        let spanEnd = Math.max(...picked.map(x => x.end));
+        const absorbed = new Set(picked);
+        let grew = true;
+        while (grew) {
+            grew = false;
+            for (const x of all) {
+                if (absorbed.has(x) || !Number.isFinite(x.start) || !Number.isFinite(x.end)) continue;
+                if (x.start < spanEnd && x.end > spanStart) {
+                    absorbed.add(x);
+                    if (x.start < spanStart) spanStart = x.start;
+                    if (x.end > spanEnd) spanEnd = x.end;
+                    grew = true;
+                }
+            }
+        }
+        const involved = all.filter(x => absorbed.has(x)).sort((a, b) => a.start - b.start);
+        const earliest = involved[0];
+        const merged = {
+            start: spanStart,
+            end: spanEnd,
+            guildId: earliest.guildId ?? null,
+            channelId: earliest.channelId ?? null,
+            guildName: earliest.guildName,
+            channelName: earliest.channelName
+        };
+        const next = [...all.filter(x => !absorbed.has(x)), merged].sort((a, b) => a.start - b.start);
+        try { BdApi.Data.save(this.meta.name, "myVoice", next); }
+        catch (e) {
+            BdApi.UI.showToast("Could not save your voice log; nothing merged", { type: "error" });
+            return false;
+        }
+        this._myVoicePending = [];
+        return true;
     }
 
     // =====================================================================
