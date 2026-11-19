@@ -114,10 +114,18 @@ const elCall = document.getElementById("call");
 let call = null;
 let replying = false;
 
+// Main process sets the id of this window's overlay after load.
+function winBody(extra) {
+    return Object.assign({ win: window.__vetWinId || null }, extra || {});
+}
+window.__vetSetWin = (id) => { window.__vetWinId = id; reportSize(); };
+
 function reportSize() {
     requestAnimationFrame(() => {
+        // Not yet bound to an overlay: __vetSetWin calls reportSize() again.
+        if (window.__vetWinId == null) return;
         const h = (call ? elCall.offsetHeight + 4 : 0) + elList.offsetHeight;
-        if (h > 0) post("/notify/size", { height: Math.ceil(h) });
+        post("/notify/size", winBody({ height: h > 0 ? Math.ceil(h) : 0 }));
     });
 }
 
@@ -157,7 +165,7 @@ function renderCall() {
 
 function stopReply() {
     replying = false;
-    post("/notify/typing", { on: false });
+    post("/notify/typing", winBody({ on: false }));
     renderCall();
 }
 
@@ -169,7 +177,7 @@ elCall.addEventListener("click", (e) => {
     else if (c === "decline") post("/command", { action: "call-decline", channelId: call.channelId });
     else if (c === "reply") {
         replying = true;
-        post("/notify/typing", { on: true });
+        post("/notify/typing", winBody({ on: true }));
         renderCall();
     }
 });
@@ -198,7 +206,7 @@ function render(items) {
 function apply(d) {
     const prev = call ? call.channelId : null;
     call = d.call || null;
-    if ((call ? call.channelId : null) !== prev) { if (replying) post("/notify/typing", { on: false }); replying = false; elCall.innerHTML = ""; }
+    if ((call ? call.channelId : null) !== prev) { if (replying) post("/notify/typing", winBody({ on: false })); replying = false; elCall.innerHTML = ""; }
     renderCall();
     render(d.items);
 }

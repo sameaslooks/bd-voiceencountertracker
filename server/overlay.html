@@ -336,6 +336,7 @@
         font-weight: 600;
         opacity: 0.85;
     }
+    .user.fav .name { color: #e8c35a; }
 
     .user .spacer { flex: 1 1 auto; min-width: 0; }
 
@@ -1263,13 +1264,21 @@ elUsers.addEventListener("click", (e) => {
     const userId = btn.getAttribute("data-uid");
     if (!action) return;
 
-    if (action === "watch-camera") { postCommand({ action: "watch-camera", userId }); return; }
-    if (action === "watch-own") { closeTip(); fetch("http://127.0.0.1:17842/video/own", { method: "POST" }).catch(() => {}); return; }
+    if (action === "watch-camera") { postCommand({ action: "watch-camera", userId, sourceId: window.__vetWinId || "" }); return; }
+    if (action === "watch-own") {
+        closeTip();
+        fetch("http://127.0.0.1:17842/video/own", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ winId: window.__vetWinId || "" })
+        }).catch(() => {});
+        return;
+    }
     if (action === "watch-stream") {
         fetch(API_COMMAND, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "watch-stream", userId })
+            body: JSON.stringify({ action: "watch-stream", userId, sourceId: window.__vetWinId || "" })
         }).catch(() => {});
         return;
     }

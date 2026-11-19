@@ -113,7 +113,7 @@ Each action is executed inside Discord within ~1 second.
 #### People in voice
 
 - **Right-click a person** for a quick menu: their activity, **user volume** (same scale as Discord's slider), **Message** (opens your DM), **Profile**, **Listen along** (Spotify), **Favorite** and its **join / leave sound**, **Known** (only a manual mark can be removed), copy username / ID.
-- **Favorites** (also from Discord's own user menu → *Add to Favorites*) flash yellow when they join; with the sound on you hear a short tone when they come or go — nobody else makes a sound.
+- **Favorites** (also from Discord's own user menu → *Add to Favorites*) have their names in a calm gold accent and flash yellow when they join; with the sound on you hear a short tone when they come or go — nobody else makes a sound. Your own row is never gold.
 - **Activity**: a game icon or the music platform's icon next to the name; hover it for the art and the full status.
 - **Phone icon** = in voice from mobile. **Red number** on the avatar = unread DMs from them.
 - **Right-click your own card** to write a one-line **session note** under the list (click it to edit, clear it to remove; it's gone when you leave the channel).
@@ -126,7 +126,9 @@ Each action is executed inside Discord within ~1 second.
 
 ### Messages and calls
 
-A separate block docked under the overlay appears only when there's something to show:
+Each overlay window has its own block docked under it, shown only when there's something to show. It hides and closes together with its overlay. No cards or calls are shown or queued while no overlay is visible; hiding all overlays (`Ctrl+Alt+H`) or closing the last one clears the cards and the pending call.
+
+What the block can show:
 
 - **DMs and mentions** — one card per chat, gone after 12 s or as soon as you read it in Discord. With the cursor visible, click a card to open the chat in Discord.
 - **Incoming calls** — *Accept*, *Decline*, or *Message*: type a reply (the box grows as you type), press Enter, and the call is declined with your message sent.
@@ -135,31 +137,31 @@ A separate block docked under the overlay appears only when there's something to
 
 ### Streams
 
-- **Watch**: click **LIVE** on someone's card. Every stream (and **camera** — click the camera icon) opens in its own window, so you can watch several at once. Hover **LIVE** for Discord's preview of the stream.
+- **Watch**: click **LIVE** on someone's card. Every stream (and **camera** — click the camera icon) opens in its own window, so you can watch several at once. Hover **LIVE** for Discord's preview of the stream. Every overlay window can open streams on its own, and the same stream can be open in several overlays: Discord watches each stream once, and every window gets a clone of the same track over its own local loopback connection (no extra network). Discord stops watching a stream only after the last window of it closes.
 - **Your own stream**: click your own **LIVE**. It comes from Discord's own pipeline (what it captured to send) at a light 360p / 25 fps, or, if Discord doesn't have it, from a local capture of the streamed window that follows source switches.
 - **Viewers**: the number next to your LIVE is how many people watch; hover it to see who. A small yellow dot marks someone who came into the channel while you were streaming and opened it within 3 minutes (cleared after 3 minutes).
 - **In the stream window**: drag to move, resize from the edges (the aspect ratio stays), the pin button switches between full and preview size, the half-moon button sets opacity. **Magnifier** (windows at least 300 px wide, cursor visible): click to zoom 2× there and click again to go back, wheel to zoom 1–4×, drag to pan; remembered per streamer.
 - **Paused**: when the streamer minimizes their window, Discord pauses the stream — the window shows the last frame blurred with *Stream paused* instead of reconnecting.
-- **Closing** a stream window also stops watching that stream in Discord.
-- Windows open in order: #1 in the main place, #2, #3… in the places set up for them (see layouts); if one in the middle closes, the later ones move up.
+- **Closing** a stream window closes only that window. Closing an overlay closes its stream windows.
+- Windows open in order: #1 in the main place, #2, #3… in the places set up for them (see layouts); if one in the middle closes, the later ones move up. Viewer windows of extra overlays open next to their overlay; saved layout places apply to the main (first) overlay's viewers.
 
 ### Window layouts
 
-Tray icon → **Window layouts…** lists *Desktop* and every game you've played with the overlay running. A layout is where the overlay, the stream windows (#1, its preview size, #2, #3…) and the message block go; it's applied automatically when that game is in front (*Desktop* everywhere else).
+Tray icon → **Window layouts…** lists *Desktop* and every game you've played with the overlay running. A layout is where the overlay, the stream windows (#1, its preview size, #2, #3…) and the message block go; it's applied automatically when that game is in front (*Desktop* everywhere else). Auto-switch fires when a game is fullscreen with a hidden cursor.
 
 - **Setup** — for 30 s the overlay stays clickable even inside the game, turns translucent, and numbered frames appear for the stream windows and the message block. Switch to the game and drag them; **+ Stream window** adds a place for one more stream. It's saved 5 s after your last move (the timer holds while you're dragging), or press **Done**.
 - **Save** stores where the windows are right now; **Apply** moves them there now.
 - Dragging a window by hand also updates the layout that's active at that moment.
+- Profiles match overlay windows by id, then by order if the ids changed; the profile then heals itself to the new ids. The log shows how many windows moved.
 - A game whose cursor is locked (shooters) can only be set up while it shows a cursor — in its menu, paused, or windowed.
 
 ### Tracker window
 
 Open it from the plugin settings or from a user's context menu → *Open Encounter Tracker*.
 
-- **My voice time** — your own time in voice for 7 / 30 days / all: total, a 30-day chart, and time per server and channel.
-- **Who was in voice with me** — pick a moment or a period and get everyone whose sessions overlap it; click a row to jump to that session in the table.
-- **Together…** — tick 2–5 people in the table to see when they were all in voice with you.
-- **Invite** (per row) — send the person a server invite or a link to the voice channel you're in, by DM.
+- **My voice time** — a compact block with your own time in voice: total, and time per server and channel. The chart follows the selected range (7 / 30 days daily, all weekly). Own time excludes the AFK channel, and your open session survives plugin and Discord restarts.
+- **Who was in voice with me** — set *At / from* and *to (optional)*: get everyone whose sessions overlap the moment or period; leave *to* empty for a single moment. Click a row to jump to that session in the table.
+- **Together…** — tick 2–5 people in the table to see when they were all in voice with you. A *to* time is required.
 - **History → merge** — tick sessions of one person and merge them into one.
 
 ## How it works
@@ -198,7 +200,7 @@ The overlay is optional. When running, the plugin pushes the current state to `h
 **Encounters aren't recorded**
 
 - The plugin only records sessions while *you* are in a voice channel. Sitting in a text channel or having Discord closed does not produce encounters.
-- A session with a user is recorded only after the session ends — one of you leaves the channel, switches to another channel, or Discord closes. If you both stay in the same channel, no session is written until then.
+- A session with a user is recorded only after the session ends — one of you leaves the channel, switches to another channel, or Discord closes. If you both stay in the same channel, it shows up in history only then. Open sessions are saved as they start, so after a crash they are closed at the last 30 s alive mark on the next start.
 - Check the console for `[VoiceEncounterTracker]` errors around `VOICE_STATE_UPDATES`.
 
 **Overlay shows "Server offline"**
@@ -240,6 +242,11 @@ All data is stored locally by BetterDiscord under the plugin's data folder:
 - `favorites` — your favorites and their sound setting (kept apart from the history).
 - `myVoice` — your own voice sessions for the last year.
 - `lastVoice` — the last channel you were in (for *Return to channel*).
+- `myVoiceOpen` — your currently open voice session.
+- `openSessions` — sessions in progress for everyone, saved as they happen.
+- `aliveAt` — heartbeat mark, written every 30 s.
+
+On the next start, open sessions resume if you're still in the same channel (within 2 min); otherwise they are closed at the last `aliveAt`. Each meeting is recorded once.
 
 The overlay keeps its settings (window places, layouts, stream window prefs) in Electron's user-data folder, and logs in `server/logs/` — `plugin.log` (the plugin's log) and `video.log` (stream windows and click-through).
 

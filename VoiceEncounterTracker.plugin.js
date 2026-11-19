@@ -182,8 +182,15 @@ module.exports = class VoiceEncounterTracker {
         this.hookDispatcher();
         this.hookSrcObject();
         this.seedSelfSession();
+        // Sessions left open by a crash or restart are resumed or closed before new ones are seeded.
+        try { this._recoverOpenSessions(); } catch (e) { vetLog("warn", "recover open sessions:", e); }
         this.syncActiveFromStore();
+        // Recovery reads the old aliveAt, so it runs before anything refreshes it.
+        try { this._recoverOwnSession(); } catch (e) { vetLog("warn", "recover own session:", e); }
+        try { this._trackOwnSession(); } catch (e) {}
+        try { this._reopenMeetings(); this._syncOpenSessions(); } catch (e) {}
         this.patchUserContextMenu();
+        this._addTimer(setInterval(() => this._touchAlive(), 30_000));
 
         this._addTimer(setInterval(() => {
             try { this.heartbeat(); } catch (e) {}
@@ -230,6 +237,8 @@ module.exports = class VoiceEncounterTracker {
 
     stop() {
         vetLog("info", "Stopping...");
+        // End my open voice session first (no leave-stats card on stop).
+        try { if (this._mySess) this._endOwnSession(Date.now(), false); } catch (e) {}
         this._cmdLoopGen = (this._cmdLoopGen || 0) + 1; // ends the command long-poll loop
 
         for (const t of this._timers) {
@@ -276,6 +285,9 @@ module.exports = class VoiceEncounterTracker {
             }
         }
         this.active.clear();
+        // Everything was finalized above, so no open session remains.
+        this._openMap = new Map(); this._openJson = "[]";
+        this._writeOpenNow();
 
         try { this._stopFramePump(); } catch (e) {}
         this.flushEncounters();
@@ -653,6 +665,7 @@ module.exports = class VoiceEncounterTracker {
                     }
                     try { self._rememberOwnChannel(); } catch (e) {}
                     try { self._trackOwnSession(); } catch (e) {}
+                    try { self._reopenMeetings(); self._syncOpenSessions(); } catch (e) {}
                     // I came into a channel: Discord sends no updates for the people
                     // already there (they're only in its store), so read them now
                     // and push the full list right away.
@@ -1169,6 +1182,8 @@ module.exports = class VoiceEncounterTracker {
             for (const [otherId, otherSession] of this.active) {
                 if (otherId === me) continue;
                 this.finalizeMeeting(otherId, session, otherSession, endedAt, trusted);
+                // The meeting with them is closed until I am in their channel again.
+                otherSession.meetClosed = true;
             }
         } else {
             const mySession = this.active.get(me);
@@ -1184,6 +1199,10 @@ module.exports = class VoiceEncounterTracker {
         this._pruneGhosts();
         for (const s of this.active.values()) s.lastSeen = now;
         this.syncActiveFromStore();
+        // Dropped connection: I am no longer in voice per store, so the session ends here.
+        try { this._trackOwnSession(); } catch (e) {}
+        // Crash-safe open sessions of everyone tracked (aliveAt has its own 30 s timer).
+        try { this._reopenMeetings(); this._syncOpenSessions(); } catch (e) {}
     }
 
     _pruneGhosts() {
@@ -1235,6 +1254,10 @@ module.exports = class VoiceEncounterTracker {
         }
         if (mySession.channelId !== otherSession.channelId) {
             vetLog("info", `[meeting] skip ${name}: different channel`);
+            return;
+        }
+        if (otherSession.meetClosed) {
+            vetLog("info", `[meeting] skip ${name}: meeting already closed`);
             return;
         }
 
@@ -2070,7 +2093,7 @@ module.exports = class VoiceEncounterTracker {
         if (action === "watch-stream") {
             if (!userId) return;
             vetLog("info", "watch-stream requested for", userId);
-            this._watchStream(userId, { reconnect: cmd.name === "reconnect" });
+            this._watchStream(userId, { reconnect: cmd.name === "reconnect", inst: cmd.sourceId || "" });
             return;
         }
 
@@ -2083,12 +2106,13 @@ module.exports = class VoiceEncounterTracker {
             if (key) this._bumpWatchToken(key);
             // Viewer closed for good: after our handle is released, stop watching
             // that stream in Discord as well (others' streams only).
-            const leaveDiscord = cmd.name === "closed" && key && /^\d+$/.test(key);
+            const leaveDiscord = cmd.name === "closed" && key && /^\d+$/.test(this.baseOf(key));
             const stop = async () => {
                 this._stopFramePump(key);
                 if (leaveDiscord) {
                     await new Promise(res => setTimeout(res, 300));
-                    if (!this._pumps.has(key)) this._stopWatchingInDiscord(key);
+                    const base = this.baseOf(key);
+                    if (this.pumpsForBase(base).length === 0) this._stopWatchingInDiscord(base);
                 }
             };
             this._watchChain = (this._watchChain || Promise.resolve()).then(stop, stop);
@@ -2127,11 +2151,11 @@ module.exports = class VoiceEncounterTracker {
             return;
         }
         if (action === "watch-camera") {
-            if (userId) this._watchCamera(String(userId));
+            if (userId) this._watchCamera(String(userId), cmd.sourceId || "");
             return;
         }
         if (action === "watch-own") {
-            if (userId) this._watchOwn(String(userId));
+            if (userId) this._watchOwn(String(userId), cmd.sourceId || "");
             return;
         }
         if (action === "leave-voice") {
@@ -2358,6 +2382,22 @@ module.exports = class VoiceEncounterTracker {
         }
     }
 
+    // Overlay instance: a viewer key is viewerKey = base + "@" + inst, where base
+    // is userId | "cam:"+userId | "own:"+userId. Discord-side state is per base.
+    viewerKeyOf(base, inst) {
+        return String(base) + (inst ? "@" + inst : "");
+    }
+
+    baseOf(key) {
+        return String(key).split("@")[0];
+    }
+
+    // [key, entry] pairs of this._pumps whose base matches.
+    pumpsForBase(base) {
+        const b = String(base);
+        return [...this._pumps].filter(([k]) => this.baseOf(k) === b);
+    }
+
     // Watch requests run one at a time: two overlapping watches (one holding
     // Discord's native track while the other makes Discord rejoin the stream)
     // crash Discord. A request that is superseded while waiting is dropped.
@@ -2367,7 +2407,7 @@ module.exports = class VoiceEncounterTracker {
     }
 
     _watchStream(userId, opts = {}) {
-        const key = String(userId);
+        const key = this.viewerKeyOf(String(userId), opts.inst || "");
         const token = this._bumpWatchToken(key);
         const run = async () => {
             if (token !== this._watchTokens[key]) {
@@ -2380,7 +2420,7 @@ module.exports = class VoiceEncounterTracker {
         return this._watchChain;
     }
 
-    async _watchStreamImpl(userId, { reconnect = false } = {}) {
+    async _watchStreamImpl(userId, { reconnect = false, inst = "" } = {}) {
         try {
             const me = this.getCurrentUserId();
             const mySession = this.active.get(me);
@@ -2394,8 +2434,9 @@ module.exports = class VoiceEncounterTracker {
                 : `call:${mySession.channelId}:${userId}`;
             vetLog("info", "_watchStream: key =", streamKey);
 
-            const key = String(userId);
-            if (!reconnect) this._postJSON("/video/open", { key, userId, streamKey });
+            const base = String(userId);
+            const key = this.viewerKeyOf(base, inst);
+            if (!reconnect) this._postJSON("/video/open", { key, userId, streamKey, inst });
 
             if (!reconnect && this._pumps.has(key)) {
                 vetLog("info", "_watchStream: already watching, reusing");
@@ -2411,9 +2452,12 @@ module.exports = class VoiceEncounterTracker {
             const frozen = this._frozenSource && this._frozenSource.userId === String(userId);
             const lastRewatch = (this._lastRewatchAt ||= {})[userId] || 0;
             const rewatch = frozen && Date.now() - lastRewatch > 30000;
+            let otherKeys = [];
             if (rewatch) {
                 this._lastRewatchAt[userId] = Date.now();
-                this._stopFramePump(String(userId));
+                // Every viewer of this stream sits on the frozen upstream.
+                otherKeys = this.pumpsForBase(base).map(([k]) => k).filter(k => k !== key);
+                for (const [k] of this.pumpsForBase(base)) this._stopFramePump(k);
                 // Let Discord's pipeline let go of the old track before it rejoins.
                 await new Promise(res => setTimeout(res, 1000));
             }
@@ -2426,7 +2470,15 @@ module.exports = class VoiceEncounterTracker {
                 return false;
             }
 
-            await this._startWatchStreamPeer(stream, String(userId));
+            // Other viewers of this stream lost their pumps in the rewatch: give
+            // each a clone of the new track.
+            const srcTrack = stream.getVideoTracks()[0];
+            const extra = rewatch && srcTrack ? otherKeys.map(k => [k, srcTrack.clone()]) : [];
+            await this._startWatchStreamPeer(stream, key);
+            for (const [k, t] of extra) {
+                if (this._pumps.has(k)) continue;
+                await this._startWatchStreamPeer(new MediaStream([t]), k);
+            }
             return true;
         } catch (e) {
             vetLog("error", "_watchStream:", e);
@@ -2445,7 +2497,7 @@ module.exports = class VoiceEncounterTracker {
             return null;
         }
 
-        if (!rewatch && this._pumps.has(String(userId))) {
+        if (!rewatch && this.pumpsForBase(String(userId)).length > 0) {
             const existing = this._findLiveVideoForStream();
             if (existing) {
                 vetLog("info", "_watchStreamByUserId: already live, reusing");
@@ -2722,7 +2774,8 @@ module.exports = class VoiceEncounterTracker {
         const pc = new RTCPeerConnection({ iceServers: [] });
         let statsTimer = null;
         let statsPrevPackets = 0;
-        const pumpUserId = /^(cam|own):/.test(key) ? null : key;   // frozen-source check is for others' streams
+        const pumpBase = this.baseOf(key);
+        const pumpUserId = /^(cam|own):/.test(pumpBase) ? null : pumpBase;   // frozen-source check is for others' streams
         const pumpSid = sid;
         const pumpStartedAt = Date.now();
         const entry = {
@@ -2850,7 +2903,7 @@ module.exports = class VoiceEncounterTracker {
                                     Date.now() - pumpStartedAt > 5000 && pumpUserId &&
                                     !this._streamPaused(pumpUserId, this.active.get(this.getCurrentUserId())) &&
                                     !(this._frozenSource && this._frozenSource.userId === pumpUserId)) {
-                                    this._frozenSource = { userId: pumpUserId, sid: pumpSid };
+                                    this._frozenSource = { userId: pumpUserId, sid: pumpSid ?? this._streamIdByUser?.[pumpUserId] ?? null };
                                     vetLog("warn", "watch source frozen (0 frames encoded), sid", pumpSid);
                                 }
                                 const pktPerSec = r.packetsSent - (statsPrevPackets || r.packetsSent);
@@ -3572,14 +3625,26 @@ module.exports = class VoiceEncounterTracker {
         } catch (e) { return null; }
     }
 
+    // Native handle for a new pump of `base`. Every viewer's pump keeps its own
+    // handle (picked up by _startWatchStreamPeer into its entry and released when
+    // that pump stops). A later viewer gets a clone of the track, so the clone
+    // stays valid while the upstream is kept alive by the first viewer's handle.
+    _adoptWatchHandle(base, handle, sid, track) {
+        this._nativeStreamHandle = handle;
+        this._sourceSid = String(sid);
+        if (this.pumpsForBase(base).length === 0) return track;
+        try { return track.clone(); } catch (e) { return track; }
+    }
+
     // A camera goes through the same viewer window as streams. Discord only
     // receives someone's camera while its call view subscribes to it.
     // My own stream, taken from Discord's own pipeline (the frames it captured
     // to send, before encoding) through the same native handle as others'
     // streams. If Discord has no such stream, the overlay falls back to a local
     // capture of the streamed window.
-    async _watchOwn(userId) {
-        const key = "own:" + userId;
+    async _watchOwn(userId, inst = "") {
+        const base = "own:" + userId;
+        const key = this.viewerKeyOf(base, inst);
         const token = this._bumpWatchToken(key);
         const run = async () => {
             if (token !== this._watchTokens[key]) return;
@@ -3592,23 +3657,23 @@ module.exports = class VoiceEncounterTracker {
                 if (!t) {
                     vetLog("info", "watch-own: Discord has no own stream track (sid", sid, ") — local capture");
                     try { handle?.release?.(); } catch (e) {}
-                    this._postJSON("/video/own-local", {});
+                    this._postJSON("/video/own-local", { inst });
                     return;
                 }
                 vetLog("info", "watch-own: Discord's own stream track via sid", sid);
-                this._nativeStreamHandle = handle;
-                this._sourceSid = String(sid);
-                await this._startWatchStreamPeer(new MediaStream([t]), key, { low: true });
+                const track = this._adoptWatchHandle(base, handle, sid, t);
+                await this._startWatchStreamPeer(new MediaStream([track]), key, { low: true });
             } catch (e) {
                 vetLog("error", "_watchOwn:", e);
-                this._postJSON("/video/own-local", {});
+                this._postJSON("/video/own-local", { inst });
             }
         };
         this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
     }
 
-    async _watchCamera(userId) {
-        const key = "cam:" + userId;
+    async _watchCamera(userId, inst = "") {
+        const base = "cam:" + userId;
+        const key = this.viewerKeyOf(base, inst);
         const token = this._bumpWatchToken(key);
         const run = async () => {
             if (token !== this._watchTokens[key]) return;
@@ -3624,17 +3689,16 @@ module.exports = class VoiceEncounterTracker {
                     try { handle?.release?.(); } catch (e) {}
                     return;
                 }
-                this._postJSON("/video/open", { key, userId, camera: true });
-                this._nativeStreamHandle = handle;
-                this._sourceSid = String(sid);
-                await this._startWatchStreamPeer(new MediaStream([t]), key);
+                this._postJSON("/video/open", { key, userId, camera: true, inst });
+                const track = this._adoptWatchHandle(base, handle, sid, t);
+                await this._startWatchStreamPeer(new MediaStream([track]), key);
             } catch (e) { vetLog("error", "_watchCamera:", e); }
         };
         this._watchChain = (this._watchChain || Promise.resolve()).then(run, run);
     }
 
     // =====================================================================
-    // Tracker: who was there, together, invites
+    // Tracker: who was there, together
     // =====================================================================
 
     // Everyone whose sessions with me overlap [from, to] (a single moment when
@@ -3689,75 +3753,6 @@ module.exports = class VoiceEncounterTracker {
         }));
     }
 
-    _inviteDialog(host, userId) {
-        const me = this.getCurrentUserId();
-        const mine = me ? this.active.get(me) : null;
-        if (!mine?.channelId || !mine.guildId) {
-            BdApi.UI.showToast("Join a server voice channel first", { type: "warning" });
-            return;
-        }
-        const channelName = this.getChannelName(mine.channelId) || "voice";
-        const link = `https://discord.com/channels/${mine.guildId}/${mine.channelId}`;
-        const name = this.getStoredDisplayName(userId) || this.getUserName(userId);
-        const back = document.createElement("div");
-        back.style.cssText = "position:absolute;inset:0;z-index:10;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;";
-        const btn = "border:none;border-radius:4px;padding:8px 14px;font-size:14px;font-weight:500;cursor:pointer;color:#fff;";
-        back.innerHTML = `<div style="background:#313338;color:#dbdee1;border-radius:8px;width:min(460px,90vw);box-shadow:0 8px 24px rgba(0,0,0,.5);overflow:hidden">
-            <div style="padding:16px 16px 6px;font-size:18px;font-weight:600;color:#f2f3f5">Invite ${this._escape(name)} to #${this._escape(channelName)}</div>
-            <div style="padding:0 16px 16px;font-size:13px;line-height:1.45;opacity:.85">
-                <b>Server invite</b> — a real Discord invite (works even if they aren't on the server; some servers don't allow creating invites).<br>
-                <b>Channel link</b> — opens the channel; works only for members of the server.</div>
-            <div style="display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;background:#2b2d31">
-                <button data-r="cancel" style="${btn}background:transparent;color:#dbdee1">Cancel</button>
-                <button data-r="link" style="${btn}background:#4e5058">Send channel link</button>
-                <button data-r="invite" style="${btn}background:#5865f2">Send server invite</button>
-            </div></div>`;
-        const done = () => { document.removeEventListener("keydown", onKey, true); back.remove(); };
-        const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); done(); } };
-        document.addEventListener("keydown", onKey, true);
-        back.addEventListener("click", async (e) => {
-            e.stopPropagation();
-            if (e.target === back) return done();
-            const r = e.target.closest("[data-r]")?.getAttribute("data-r");
-            if (!r) return;
-            done();
-            if (r === "cancel") return;
-            let text = link;
-            if (r === "invite") {
-                const code = await this._createInvite(mine.channelId);
-                if (code) text = `https://discord.gg/${code}`;
-                else BdApi.UI.showToast("Couldn't create an invite here — sending the channel link instead", { type: "warning" });
-            }
-            const ok = await this._sendDM(userId, text);
-            BdApi.UI.showToast(ok ? `Sent to ${name}` : "Couldn't open a DM", { type: ok ? "success" : "error" });
-        });
-        host.appendChild(back);
-    }
-
-    async _createInvite(channelId) {
-        try {
-            const mod = BdApi.Webpack.getByKeys("createInvite", { searchExports: true });
-            if (typeof mod?.createInvite !== "function") { vetLog("warn", "createInvite not found"); return null; }
-            const inv = await mod.createInvite(channelId, { max_age: 86400, max_uses: 0, temporary: false }, "Voice Encounter Tracker");
-            return inv?.code || null;
-        } catch (e) { vetLog("warn", "createInvite failed:", e?.message || e); return null; }
-    }
-
-    async _sendDM(userId, text) {
-        try {
-            let cid = this._dmChannelId(userId);
-            if (!cid) {
-                const mod = BdApi.Webpack.getByKeys("getOrEnsurePrivateChannel", { searchExports: true })
-                         || BdApi.Webpack.getByKeys("ensurePrivateChannel", { searchExports: true });
-                const fn = mod?.getOrEnsurePrivateChannel || mod?.ensurePrivateChannel;
-                if (typeof fn === "function") cid = await fn.call(mod, String(userId));
-            }
-            if (!cid) return false;
-            this._sendMessage(String(cid), text);
-            return true;
-        } catch (e) { vetLog("error", "_sendDM:", e); return false; }
-    }
-
     // A short heads-up when the microphone or output device changes (plugged
     // in a headset, Windows switched the default, ...). The first look only
     // records the current devices.
@@ -3796,43 +3791,229 @@ module.exports = class VoiceEncounterTracker {
     // Own voice time + a short stats card after leaving voice
     // =====================================================================
 
-    // My own voice sessions (for "today"), kept for 14 days.
+    // My own voice sessions (for the "My voice time" chart), kept for 365 days.
+    // Returns null when the stored list could not be read (distinct from empty).
     _loadMyVoice() {
         try {
             const v = BdApi.Data.load(this.meta.name, "myVoice");
             return Array.isArray(v) ? v : [];
-        } catch (e) { return []; }
+        } catch (e) { return null; }
+    }
+
+    // My voice target for session tracking, or null when I am not in voice or
+    // sit in my server's AFK channel (AFK time does not count).
+    _ownVoiceChannel() {
+        const me = this.getCurrentUserId();
+        const mine = me ? this.active.get(me) : null;
+        if (!mine?.channelId) return null;
+        if (mine.guildId) {
+            let afk = null;
+            try { afk = (this._sc?.GuildStore ?? BdApi.Webpack.getStore("GuildStore"))?.getGuild?.(mine.guildId)?.afkChannelId; } catch (e) {}
+            if (afk && afk === mine.channelId) return null;
+        }
+        return mine;
     }
 
     _trackOwnSession() {
-        const me = this.getCurrentUserId();
-        const mine = me ? this.active.get(me) : null;
+        const mine = this._ownVoiceChannel();
         const now = Date.now();
-        if (mine?.channelId) {
+        if (mine) {
             if (!this._mySess || this._mySess.channelId !== mine.channelId) {
                 if (this._mySess) this._endOwnSession(now, false);   // moved: one session per channel
                 this._mySess = {
                     start: mine.startedAt || now, channelId: mine.channelId, guildId: mine.guildId ?? null,
                     channelName: this.getChannelName(mine.channelId), guildName: this.getGuildName(mine.guildId, mine.channelId)
                 };
+                this._saveOpenOwn();
+                this._touchAlive();
             }
             return;
         }
         if (this._mySess) this._endOwnSession(now, true);
     }
 
+    // Crash-safe copy of the running session, refreshed on every heartbeat.
+    _saveOpenOwn() {
+        const s = this._mySess;
+        if (!s) return;
+        try {
+            BdApi.Data.save(this.meta.name, "myVoiceOpen", {
+                start: s.start, guildId: s.guildId ?? null, channelId: s.channelId
+            });
+        } catch (e) {}
+    }
+
+    _clearOpenOwn() {
+        try { BdApi.Data.save(this.meta.name, "myVoiceOpen", null); } catch (e) {}
+    }
+
+    // Last heartbeat time (key "aliveAt"), or null when missing.
+    _readAliveAt() {
+        try {
+            const v = BdApi.Data.load(this.meta.name, "aliveAt");
+            return Number.isFinite(v) ? v : null;
+        } catch (e) { return null; }
+    }
+
+    // Live voice state of userId if the store still has them in channelId, else null.
+    _storeVoiceStateFor(userId, guildId, channelId) {
+        let store = null;
+        try { store = this._sc?.VoiceStateStore ?? BdApi.Webpack.getStore("VoiceStateStore"); } catch (e) {}
+        if (!store || typeof store.getVoiceState !== "function") return null;
+        let live = null;
+        try { live = store.getVoiceState(guildId ?? null, userId); } catch (e) {}
+        if (!live && !guildId) {
+            try {
+                const arr = store.getVoiceStatesForChannel?.(channelId);
+                live = arr ? (Object.values(arr).find(v => v?.userId === userId) ?? null) : null;
+            } catch (e) {}
+        }
+        return live?.channelId === channelId ? live : null;
+    }
+
+    _touchAlive() {
+        try { BdApi.Data.save(this.meta.name, "aliveAt", Date.now()); } catch (e) {}
+    }
+
+    // After I (re)join a channel, meetings with the people already there open again;
+    // their span starts at my join (finalizeMeeting uses max of both starts).
+    _reopenMeetings() {
+        const me = this.getCurrentUserId();
+        const mine = me ? this.active.get(me) : null;
+        if (!mine?.channelId) return;
+        for (const [userId, s] of this.active) {
+            if (userId !== me && s.channelId === mine.channelId) s.meetClosed = false;
+        }
+    }
+
+    // Crash-safe open sessions of everyone tracked (not me): userId -> {start, guildId, channelId, myStart, events, meetClosed}.
+    // Mirrors `active`; writes are debounced, removals are written at once.
+    _syncOpenSessions() {
+        const me = this.getCurrentUserId();
+        const myStart = me ? (this.active.get(me)?.startedAt ?? null) : null;
+        const next = new Map();
+        for (const [userId, s] of this.active) {
+            if (userId === me) continue;
+            next.set(userId, {
+                start: s.startedAt, guildId: s.guildId ?? null, channelId: s.channelId,
+                myStart, events: Array.isArray(s.events) ? s.events : [], meetClosed: !!s.meetClosed
+            });
+        }
+        const json = JSON.stringify([...next]);
+        if (json === this._openJson) return;
+        const old = this._openMap || new Map();
+        const removed = [...old.keys()].some(k => !next.has(k));
+        const flipped = [...next].some(([k, v]) => old.has(k) && old.get(k).meetClosed !== v.meetClosed);
+        const started = [...next].some(([k, v]) => !old.has(k) || old.get(k).start !== v.start);
+        this._openMap = next;
+        this._openJson = json;
+        if (started) this._touchAlive();
+        // Removals and meeting open/close flips are written at once; the rest is debounced.
+        if (removed || flipped) { this._writeOpenNow(); return; }
+        if (!this._openTimer) {
+            this._openTimer = this._addTimer(setTimeout(() => {
+                this._openTimer = null;
+                try { this._writeOpenNow(); } catch (e) {}
+            }, 1000));
+        }
+    }
+
+    _writeOpenNow() {
+        if (this._openTimer) {
+            try { clearTimeout(this._openTimer); } catch (e) {}
+            this._openTimer = null;
+        }
+        try { BdApi.Data.save(this.meta.name, "openSessions", Object.fromEntries(this._openMap || [])); } catch (e) {}
+    }
+
+    // Called on start() after my own seed, before syncActiveFromStore seeds anyone new.
+    // For each saved open session: resume it (original start kept) if the store still
+    // has the user in that channel and aliveAt is within 2 minutes; otherwise finalize it
+    // through finalizeMeeting with end = aliveAt (clamped to [start, now]). Nothing is
+    // finalized twice: resumed users are already in `active`, so seeding skips them.
+    _recoverOpenSessions() {
+        let saved = null;
+        try { saved = BdApi.Data.load(this.meta.name, "openSessions"); } catch (e) { return; }
+        const alive = this._readAliveAt();
+        const now = Date.now();
+        const me = this.getCurrentUserId();
+        if (saved && typeof saved === "object") {
+            for (const [userId, e] of Object.entries(saved)) {
+                if (!e || userId === me || !Number.isFinite(e.start) || !e.channelId) continue;
+                const guildId = e.guildId ?? null;
+                const events = Array.isArray(e.events) ? e.events : [];
+                const live = this._storeVoiceStateFor(userId, guildId, e.channelId);
+                if (live && alive != null && now - alive <= 120_000) {
+                    const sess = this._makeSessionFromVoiceState(userId, live, guildId, now);
+                    sess.startedAt = e.start;
+                    if (events.length) sess.events = events;
+                    if (e.meetClosed) sess.meetClosed = true;
+                    this.active.set(userId, sess);
+                    const mineS = me ? this.active.get(me) : null;
+                    if (mineS && mineS.channelId === e.channelId && Number.isFinite(e.myStart) && e.myStart < mineS.startedAt) {
+                        mineS.startedAt = e.myStart;
+                    }
+                    continue;
+                }
+                // Meeting already recorded (closed by my leave/switch) or no meeting open: nothing to record.
+                if (e.meetClosed || !Number.isFinite(e.myStart)) continue;
+                const end = alive != null ? Math.min(Math.max(alive, e.start), now) : e.start;
+                const mine = { startedAt: Number.isFinite(e.myStart) ? e.myStart : e.start, channelId: e.channelId, guildId, lastSeen: end };
+                const other = { startedAt: e.start, channelId: e.channelId, guildId, events, lastSeen: end };
+                try { this.finalizeMeeting(userId, mine, other, end, false); }
+                catch (er) { vetLog("warn", "recover open session:", er); }
+            }
+        }
+        // Handled: clear. Live sessions are written again by _syncOpenSessions.
+        this._openMap = new Map(); this._openJson = "[]";
+        this._writeOpenNow();
+    }
+
+    // Called once on start(): resume a session that was open at the last save if
+    // I am still in that channel and it was seen within 2 minutes, otherwise
+    // close it at its last-seen time (aliveAt, falling back to the saved values).
+    _recoverOwnSession() {
+        let saved = null;
+        try { saved = BdApi.Data.load(this.meta.name, "myVoiceOpen"); } catch (e) { return; }
+        if (!saved) return;
+        if (!Number.isFinite(saved.start) || !saved.channelId) { this._clearOpenOwn(); return; }
+        const now = Date.now();
+        const lastSeen = Math.min(Math.max(this._readAliveAt() ?? saved.start, saved.start), now);
+        const cur = this._ownVoiceChannel();
+        const guildId = saved.guildId ?? null;
+        this._mySess = {
+            start: saved.start, channelId: saved.channelId, guildId,
+            channelName: this.getChannelName(saved.channelId), guildName: this.getGuildName(guildId, saved.channelId)
+        };
+        if (cur && cur.channelId === saved.channelId && now - lastSeen <= 120_000) return;
+        this._endOwnSession(lastSeen, false);
+    }
+
     _endOwnSession(end, left) {
         const sess = this._mySess;
         this._mySess = null;
-        if (!sess || end - sess.start < 5000) return;
-        // My own voice log (with or without anyone else there), kept for a year.
-        const list = this._loadMyVoice().filter(x => x.end > end - 365 * 86400_000);
-        list.push({
+        if (!sess) return;
+        this._clearOpenOwn();
+        if (end - sess.start < 5000) return;
+        const rec = {
             start: sess.start, end, channelId: sess.channelId, guildId: sess.guildId,
             channelName: sess.channelName || this.getChannelName(sess.channelId),
             guildName: sess.guildName || this.getGuildName(sess.guildId, sess.channelId)
-        });
-        try { BdApi.Data.save(this.meta.name, "myVoice", list); } catch (e) {}
+        };
+        // My own voice log (with or without anyone else there), kept for a year.
+        // If the history could not be read, keep the record in memory and retry on
+        // the next end; never write over the saved list.
+        const pending = this._myVoicePending || [];
+        const loaded = this._loadMyVoice();
+        let list;
+        if (loaded === null) {
+            this._myVoicePending = [...pending, rec];
+            list = [...pending, rec];
+        } else {
+            list = [...loaded.filter(x => x.end > end - 365 * 86400_000), ...pending, rec];
+            try { BdApi.Data.save(this.meta.name, "myVoice", list); this._myVoicePending = []; }
+            catch (e) { this._myVoicePending = [...pending, rec]; }
+        }
         if (!left) return;
         // People's sessions are written when I leave; read them a moment later.
         this._addTimer(setTimeout(() => {
@@ -3901,13 +4082,39 @@ module.exports = class VoiceEncounterTracker {
         return ms;
     }
 
-    // My voice time for the tracker window: per-day totals and per server /
-    // channel totals since `from` (null = everything). Includes the session
-    // that's running right now.
-    myVoiceSummary(from = null) {
+    // My voice time for the tracker window: bucketed totals over the selected
+    // range ("7" / "30" = one bucket per calendar day, "all" = one bucket per
+    // week from the week of the first session, capped at 104 weeks) and per
+    // server / channel totals. Includes the session that's running right now.
+    myVoiceSummary(range = "7") {
         const now = Date.now();
-        const list = this._loadMyVoice().slice();
+        const list = [...(this._loadMyVoice() ?? []), ...(this._myVoicePending || [])];
         if (this._mySess) list.push({ ...this._mySess, end: now, live: true });
+        const dayStart = (t) => { const d = new Date(t); d.setHours(0, 0, 0, 0); return d; };
+        const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+        const weekStart = (t) => { const d = dayStart(t); return addDays(d, -((d.getDay() + 6) % 7)); };
+        const DAY = 86400_000;
+        let buckets = [], unit = "day";
+        if (range === "all") {
+            unit = "week";
+            const firstStart = list.reduce((m, x) => Math.min(m, x.start), now);
+            const thisWeek = weekStart(now);
+            const weeksBack = Math.max(0, Math.round((thisWeek.getTime() - weekStart(firstStart).getTime()) / (7 * DAY)));
+            const n = Math.min(104, weeksBack + 1);
+            const first = addDays(thisWeek, -7 * (n - 1));
+            for (let i = 0; i < n; i++) {
+                const a = addDays(first, 7 * i).getTime(), b = addDays(first, 7 * (i + 1)).getTime();
+                buckets.push({ start: a, end: b, ms: 0 });
+            }
+        } else {
+            const n = Math.max(1, Number(range) || 7);
+            const first = addDays(dayStart(now), -(n - 1));
+            for (let i = 0; i < n; i++) {
+                const a = addDays(first, i).getTime(), b = addDays(first, i + 1).getTime();
+                buckets.push({ start: a, end: b, ms: 0 });
+            }
+        }
+        const from = range === "all" ? null : buckets[0].start;
         const inRange = from ? list.filter(x => x.end > from) : list;
         const clip = (x) => x.end - Math.max(x.start, from || 0);
         const total = inRange.reduce((a, x) => a + clip(x), 0);
@@ -3922,17 +4129,12 @@ module.exports = class VoiceEncounterTracker {
             g.channels.set(ck, c);
             servers.set(gk, g);
         }
-        // per calendar day, last 30 days (split sessions across midnight)
-        const days = [];
-        const d0 = new Date(now); d0.setHours(0, 0, 0, 0);
-        for (let i = 29; i >= 0; i--) {
-            const a = d0.getTime() - i * 86400_000, b = a + 86400_000;
-            let ms = 0;
-            for (const x of list) { const s1 = Math.max(x.start, a), e1 = Math.min(x.end, b); if (e1 > s1) ms += e1 - s1; }
-            days.push({ day: a, ms });
+        // per bucket (split sessions across bucket edges)
+        for (const bk of buckets) {
+            for (const x of list) { const s1 = Math.max(x.start, bk.start), e1 = Math.min(x.end, bk.end); if (e1 > s1) bk.ms += e1 - s1; }
         }
         return {
-            total, sessions: inRange.length, days,
+            total, sessions: inRange.length, unit, buckets,
             servers: [...servers.values()].sort((a, b) => b.ms - a.ms).map(g => ({
                 name: g.name, ms: g.ms, channels: [...g.channels.values()].sort((a, b) => b.ms - a.ms)
             }))
@@ -3947,7 +4149,17 @@ module.exports = class VoiceEncounterTracker {
             if (!e) continue;
             this._pumps.delete(k);
             try { e.stop(); } catch (er) {}
-            if (e.handle) { try { e.handle.release(); } catch (er) {} }
+            if (e.handle) {
+                // Another viewer of the same stream still needs the upstream and has no handle of its own: hand the handle over; otherwise release.
+                const heir = key != null ? this.pumpsForBase(this.baseOf(k)).find(([, h]) => !h.handle) : null;
+                if (heir) {
+                    heir[1].handle = e.handle;
+                    heir[1].sid = e.sid;
+                    vetLog("info", "native handle moved to", heir[0]);
+                } else {
+                    try { e.handle.release(); } catch (er) {}
+                }
+            }
             vetLog("info", "frame pump stopped", k);
         }
         if (key == null && this._nativeStreamHandle) {
@@ -4271,25 +4483,34 @@ module.exports = class VoiceEncounterTracker {
                     margin-bottom: 14px;
                 }
                 .vet-me {
-                    margin-bottom: 14px; padding: 10px 12px;
+                    margin-bottom: 10px; padding: 10px 16px;
                     border: 1px solid var(--background-modifier-accent, #3f4147);
                     border-radius: 4px; background: var(--background-secondary, #2b2d31);
+                    font-size: 12px; line-height: 1.6;
                 }
-                .vet-me-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-                .vet-me-head .tot { font-size: 13px; opacity: .85; }
-                .vet-me-head .tot b { font-size: 15px; opacity: 1; }
+                .vet-me-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+                .vet-me-label {
+                    font-weight: 600; font-size: 11px; text-transform: uppercase;
+                    letter-spacing: 0.4px; opacity: 0.7;
+                }
+                .vet-me-head .tot { opacity: .85; }
+                .vet-me-head .tot b { color: #3ba55d; font-weight: 500; font-variant-numeric: tabular-nums; }
                 .vet-seg { display: inline-flex; border: 1px solid var(--background-modifier-accent, #444); border-radius: 4px; overflow: hidden; margin-left: auto; }
-                .vet-seg button { background: none; border: none; color: inherit; padding: 3px 9px; cursor: pointer; font-size: 12px; opacity: .7; }
+                .vet-seg button { background: none; border: none; color: inherit; height: 20px; box-sizing: border-box; padding: 0 8px; cursor: pointer; font-size: 11px; font-family: inherit; opacity: .7; }
                 .vet-seg button.on { background: rgba(88,101,242,0.35); opacity: 1; }
-                .vet-me-chart { margin: 8px 0 6px; }
+                .vet-me-chart { margin: 6px 0 4px; }
                 .vet-me-chart .bar { fill: #5865f2; opacity: .75; }
                 .vet-me-chart .bar.today { opacity: 1; }
-                .vet-me-chart text { fill: currentColor; opacity: .5; font-size: 10px; }
-                .vet-me-list { display: grid; grid-template-columns: 1fr auto; gap: 2px 14px; font-size: 13px; }
-                .vet-me-list .g { font-weight: 600; }
-                .vet-me-list .c { padding-left: 14px; opacity: .75; }
-                .vet-me-list .t { text-align: right; font-variant-numeric: tabular-nums; opacity: .85; }
-                .vet-me-list .more { padding-left: 14px; opacity: .5; font-size: 12px; }
+                .vet-me-chart text { fill: currentColor; opacity: .6; font-size: 10px; }
+                .vet-me-list { display: grid; grid-template-columns: minmax(0, 1fr) auto; font-size: 12px; }
+                .vet-me-list > span { padding: 2px 4px; min-width: 0; }
+                .vet-me-list .g, .vet-me-list .c, .vet-me-list .more {
+                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                }
+                .vet-me-list .g { font-weight: 600; opacity: .85; }
+                .vet-me-list .c { padding-left: 18px; opacity: .85; }
+                .vet-me-list .t { text-align: right; font-variant-numeric: tabular-nums; color: #3ba55d; white-space: nowrap; }
+                .vet-me-list .more { padding-left: 18px; opacity: .5; }
                 .vet-time {
                     margin-bottom: 14px; padding: 10px 12px;
                     border: 1px solid var(--background-modifier-accent, #3f4147);
@@ -4299,8 +4520,12 @@ module.exports = class VoiceEncounterTracker {
                 .vet-time-row input[type=datetime-local] {
                     background: var(--background-tertiary, #1e1f22); color: inherit;
                     border: 1px solid var(--background-modifier-accent, #444); border-radius: 4px;
-                    padding: 4px 6px; color-scheme: dark;
+                    padding: 0 6px; height: 28px; box-sizing: border-box;
+                    font-family: inherit; font-size: 12px; color-scheme: dark;
                 }
+                .vet-time-row .vet-btn { height: 28px; box-sizing: border-box; padding-top: 0; padding-bottom: 0; display: inline-flex; align-items: center; }
+                .vet-time-label { font-size: 12px; color: var(--text-muted, #949ba4); }
+                .vet-time-hint { margin-top: 6px; font-size: 12px; color: var(--text-muted, #949ba4); }
                 .vet-time-res { margin-top: 8px; display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow: auto; }
                 .vet-time-res .r {
                     display: flex; gap: 10px; align-items: baseline; padding: 4px 6px; border-radius: 3px;
@@ -4604,7 +4829,7 @@ module.exports = class VoiceEncounterTracker {
 
                     <div class="vet-me">
                         <div class="vet-me-head">
-                            <span class="vet-manual-title" style="margin:0">My voice time</span>
+                            <span class="vet-me-label">My voice time</span>
                             <span class="tot" data-role="me-total"></span>
                             <span class="vet-seg" data-role="me-range">
                                 <button type="button" data-range="7">7 days</button>
@@ -4619,15 +4844,16 @@ module.exports = class VoiceEncounterTracker {
                     <div class="vet-time">
                         <div class="vet-manual-title">Who was in voice with me</div>
                         <div class="vet-time-row">
-                            <span style="opacity:.7">From</span>
+                            <span class="vet-time-label">At / from</span>
                             <input type="datetime-local" data-role="t-from">
-                            <span style="opacity:.7">to</span>
+                            <span class="vet-time-label">to (optional)</span>
                             <input type="datetime-local" data-role="t-to" title="Leave empty to look at one moment">
                             <button type="button" class="vet-btn primary" data-action="t-find">Find</button>
                             <button type="button" class="vet-btn" data-action="t-together"
                                 title="Tick 2-3 people in the table, then see when you were all together">Together…</button>
                             <span data-role="t-chips" style="display:flex;gap:4px;flex-wrap:wrap"></span>
                         </div>
+                        <div class="vet-time-hint">Leave 'to' empty to see who was in voice at that exact moment.</div>
                         <div class="vet-time-res" data-role="t-res"></div>
                     </div>
 
@@ -4864,6 +5090,7 @@ module.exports = class VoiceEncounterTracker {
         });
         tTogetherBtn.addEventListener("click", (e) => {
             e.preventDefault(); e.stopPropagation();
+            if (!tTo.value) { BdApi.UI.showToast("Set a 'to' time for Together", { type: "warning" }); return; }
             if (!this._vetTogether) { this._vetTogether = new Set(); renderTimeChips(); rerender(); return; }
             if (this._vetTogether.size < 2) return;
             const rg = readRange();
@@ -4897,28 +5124,28 @@ module.exports = class VoiceEncounterTracker {
         const renderMe = () => {
             const key = this._vetMeRange || "7";
             meRange.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.getAttribute("data-range") === key));
-            const from = key === "all" ? null : Date.now() - Number(key) * 86400_000;
-            const sum = this.myVoiceSummary(from);
+            const sum = this.myVoiceSummary(key);
             overlay.querySelector("[data-role='me-total']").innerHTML =
-                `<b>${this.formatDuration(sum.total)}</b> in ${sum.sessions} session${sum.sessions === 1 ? "" : "s"}`;
-            // last 30 days, one bar per day
-            const W = 600, H = 70, n = sum.days.length, bw = W / n;
-            const max = Math.max(3600_000, ...sum.days.map(d => d.ms));
-            const bars = sum.days.map((d, i) => {
+                `<b>${this.formatDuration(sum.total)}</b> · ${sum.sessions} session${sum.sessions === 1 ? "" : "s"}`;
+            // one bar per bucket: calendar days for 7 / 30, weeks for all
+            const W = 600, H = 40, buckets = sum.buckets, n = buckets.length, bw = W / n;
+            const max = Math.max(3600_000, ...buckets.map(d => d.ms));
+            const bars = buckets.map((d, i) => {
                 const h = d.ms ? Math.max(2, d.ms / max * (H - 14)) : 0;
-                const dt = new Date(d.day);
-                const tip = `${dt.toLocaleDateString()} — ${this.formatDuration(d.ms)}`;
+                const dt = new Date(d.start);
+                const tip = `${sum.unit === "week" ? "Week of " : ""}${dt.toLocaleDateString()} — ${this.formatDuration(d.ms)}`;
                 return `<rect class="bar${i === n - 1 ? " today" : ""}" x="${(i * bw + 1).toFixed(1)}" y="${(H - 14 - h).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${h.toFixed(1)}" rx="1.5"><title>${tip}</title></rect>`;
             }).join("");
-            const lbl = (i) => { const dt = new Date(sum.days[i].day); return `${dt.getDate()}.${String(dt.getMonth() + 1).padStart(2, "0")}`; };
+            const lbl = (i) => { const dt = new Date(buckets[i].start); return `${dt.getDate()}.${String(dt.getMonth() + 1).padStart(2, "0")}`; };
+            const rightLbl = sum.unit === "week" ? "this week" : "today";
             overlay.querySelector("[data-role='me-chart']").innerHTML =
                 `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">${bars}
                     <text x="0" y="${H - 2}">${lbl(0)}</text><text x="${W / 2}" y="${H - 2}" text-anchor="middle">${lbl(Math.floor(n / 2))}</text>
-                    <text x="${W}" y="${H - 2}" text-anchor="end">today</text></svg>`;
+                    <text x="${W}" y="${H - 2}" text-anchor="end">${rightLbl}</text></svg>`;
             overlay.querySelector("[data-role='me-list']").innerHTML = sum.servers.length
                 ? sum.servers.slice(0, 8).map(g =>
-                    `<span class="g">${esc(g.name)}</span><span class="t">${this.formatDuration(g.ms)}</span>` +
-                    g.channels.slice(0, 4).map(c => `<span class="c">#${esc(c.name)}</span><span class="t">${this.formatDuration(c.ms)}</span>`).join("") +
+                    `<span class="g" title="${esc(g.name)}">${esc(g.name)}</span><span class="t">${this.formatDuration(g.ms)}</span>` +
+                    g.channels.slice(0, 4).map(c => `<span class="c" title="${esc(c.name)}">#${esc(c.name)}</span><span class="t">${this.formatDuration(c.ms)}</span>`).join("") +
                     (g.channels.length > 4 ? `<span class="more">+${g.channels.length - 4} more</span><span></span>` : "")).join("")
                 : `<span style="opacity:.6">No voice time recorded yet.</span><span></span>`;
         };
@@ -4992,8 +5219,6 @@ module.exports = class VoiceEncounterTracker {
                 } else if (action === "remove") {
                     this.removeUser(userId);
                     rerender();
-                } else if (action === "invite") {
-                    this._inviteDialog(overlay, userId);
                 } else if (action === "t-pick") {
                     if (!this._vetTogether) return;
                     if (this._vetTogether.has(userId)) this._vetTogether.delete(userId);
@@ -5200,9 +5425,6 @@ module.exports = class VoiceEncounterTracker {
                         data-action="toggle-ignore" data-user-id="${rec.userId}">
                         ${rec.ignored ? "Unignore" : "Ignore"}
                     </button>
-                    <button type="button" class="vet-btn"
-                        data-action="invite" data-user-id="${rec.userId}"
-                        title="Invite to the voice channel you're in">Invite</button>
                     <button type="button" class="vet-btn remove"
                         data-action="remove" data-user-id="${rec.userId}"
                         title="Remove from history">Remove</button>

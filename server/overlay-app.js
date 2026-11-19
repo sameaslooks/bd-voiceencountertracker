@@ -144,9 +144,10 @@ const windows = new Map();
 const waitingWindows = new Map();
 let popupWindow = null;
 // Stream viewers, one window each. Key: a streamer's user id, "cam:<id>" for a
-// camera, "local:<id>" for my own stream captured locally.
+// camera, "local:<id>" for my own stream captured locally, "own:<id>" for my
+// own stream from Discord; with an overlay instance id appended ("@<inst>").
 const viewers = new Map();
-let notifyWindow = null;
+const notifyWindows = new Map();   // overlay id -> { win, contentH, typing }
 let menuWindow = null;
 let tipWindow = null;
 let senderWindow = null;
@@ -1108,12 +1109,14 @@ function startServer() {
             return;
         }
         if (req.method === "POST" && url === "/video/own-local") {
-            ownStreamToLocal();
+            let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
+            ownStreamToLocal(d.inst);
             jsonReply(res, 200, { ok: true });
             return;
         }
         if (req.method === "POST" && url === "/video/own") {
-            openOwnStream();
+            let d = {}; try { d = JSON.parse(await readBody(req) || "{}"); } catch (e) {}
+            openOwnStream(d.winId);
             jsonReply(res, 200, { ok: true });
             return;
         }
@@ -1318,7 +1321,7 @@ function startServer() {
         if (req.method === "POST" && url === "/call") {
             try {
                 const d = JSON.parse(await readBody(req) || "{}");
-                if (d.channelId) incomingCall = {
+                if (d.channelId && anyOverlayVisible()) incomingCall = {
                     channelId: String(d.channelId), callerId: d.callerId ? String(d.callerId) : null,
                     name: String(d.name || "Someone"), avatar: d.avatar || null, group: d.group || null
                 };
@@ -1332,7 +1335,7 @@ function startServer() {
                 const d = JSON.parse(await readBody(req) || "{}");
                 if (!d.channelId || (incomingCall && incomingCall.channelId === String(d.channelId))) {
                     incomingCall = null;
-                    setNotifyTyping(false);
+                    setNotifyTyping(null, false);
                     notifyChanged();
                 }
             } catch (e) {}
@@ -1341,14 +1344,19 @@ function startServer() {
         }
         if (req.method === "POST" && url === "/notify/size") {
             try {
-                const h = Number(JSON.parse(await readBody(req) || "{}").height);
-                if (Number.isFinite(h) && h > 0 && h !== notifyContentH) { notifyContentH = h; positionNotifyWindow(); }
+                const d = JSON.parse(await readBody(req) || "{}");
+                const h = Number(d.height);
+                const win = d.win != null && d.win !== "" ? String(d.win) : null;
+                if (win && Number.isFinite(h) && h >= 0) setNotifyContentH(win, h);
             } catch (e) {}
             jsonReply(res, 200, { ok: true });
             return;
         }
         if (req.method === "POST" && url === "/notify/typing") {
-            try { setNotifyTyping(!!JSON.parse(await readBody(req) || "{}").on); } catch (e) {}
+            try {
+                const d = JSON.parse(await readBody(req) || "{}");
+                setNotifyTyping(d.win ? String(d.win) : null, !!d.on);
+            } catch (e) {}
             jsonReply(res, 200, { ok: true });
             return;
         }
@@ -1523,11 +1531,19 @@ const NOTIFY_MAX     = 4;
 const NOTIFY_ITEM_H  = 54;
 let notifications = [];      // newest first
 let incomingCall = null;     // { channelId, callerId, name, avatar, group }
-let notifyContentH = 0;      // height the page reports for its content
-let notifyTyping = false;    // reply box open: the window takes keyboard + mouse
+
+// True when at least one overlay window is on screen. Cards and calls only
+// exist while this holds; nothing is queued for later.
+function anyOverlayVisible() {
+    for (const rec of windows.values()) {
+        if (rec.win && !rec.win.isDestroyed() && rec.win.isVisible()) return true;
+    }
+    return false;
+}
 
 function addNotification(n) {
     if (!n || !n.id || !n.channelId) return;
+    if (!anyOverlayVisible()) return;
     n = {
         id: String(n.id), kind: ["mention", "device"].includes(n.kind) ? n.kind : "dm",
         authorId: String(n.authorId || ""), name: String(n.name || "user"), avatar: n.avatar || null,
@@ -1543,100 +1559,166 @@ function addNotification(n) {
 
 function notifyChanged() {
     sseBroadcast("notify", { items: notifications, call: incomingCall });
-    if (notifications.length === 0 && !incomingCall) {
-        if (notifyWindow && !notifyWindow.isDestroyed()) { try { notifyWindow.hide(); } catch (e) {} }
-        return;
+    const hasContent = notifications.length > 0 || !!incomingCall;
+    for (const rec of windows.values()) {
+        const visible = !!rec.win && !rec.win.isDestroyed() && rec.win.isVisible();
+        if (!visible || !hasContent) { hideNotifyWindow(rec.id); continue; }
+        ensureNotifyWindow(rec);
+        positionNotifyWindow(rec);
+        const e = notifyWindows.get(rec.id);
+        if (e && !e.win.isDestroyed() && e.win.webContents.isLoading() === false && !e.win.isVisible()) {
+            try { e.win.showInactive(); } catch (err) {}
+        }
     }
-    ensureNotifyWindow();
-    positionNotifyWindow();
-    if (notifyWindow && !notifyWindow.isDestroyed() && notifyWindow.webContents.isLoading() === false && !notifyWindow.isVisible()) {
-        try { notifyWindow.showInactive(); } catch (e) {}
+    // Notify windows of overlays that no longer exist
+    for (const id of [...notifyWindows.keys()]) {
+        if (!windows.has(id)) destroyNotifyWindow(id);
     }
+}
+
+// Overlays hidden or gone: drop the cards and any pending call, and end a reply in progress.
+function clearNotifyState() {
+    notifications = [];
+    incomingCall = null;
+    setNotifyTyping(null, false);
+    notifyChanged();
 }
 
 setInterval(() => {
     const now = Date.now();
     const before = notifications.length;
     // Cards don't expire while a reply is being typed.
-    if (notifyTyping) return;
+    if (isNotifyTyping()) return;
     notifications = notifications.filter(n => n.expiresAt > now);
     if (notifications.length !== before) notifyChanged();
 }, 1000);
 
-function notifyAnchor() {
+function firstVisibleOverlay() {
     for (const rec of windows.values()) {
-        if (rec.win && !rec.win.isDestroyed() && rec.win.isVisible()) return rec.win;
+        if (rec.win && !rec.win.isDestroyed() && rec.win.isVisible()) return rec;
     }
     return null;
 }
 
-function ensureNotifyWindow() {
-    if (notifyWindow && !notifyWindow.isDestroyed()) return;
-    notifyWindow = new BrowserWindow({
+// One notify window per overlay; each shows the same cards, docked under its overlay.
+function ensureNotifyWindow(rec) {
+    const cur = notifyWindows.get(rec.id);
+    if (cur && !cur.win.isDestroyed()) return cur;
+    const win = new BrowserWindow({
         width: WINDOW_WIDTH, height: NOTIFY_ITEM_H,
         frame: false, transparent: true, backgroundColor: "#00000000",
         alwaysOnTop: true, resizable: false, skipTaskbar: true, hasShadow: false,
         focusable: false, show: false,
         webPreferences: { nodeIntegration: false, contextIsolation: true, backgroundThrottling: false }
     });
-    notifyWindow.setAlwaysOnTop(true, "screen-saver");
-    notifyWindow.setVisibleOnAllWorkspaces(true);
-    applyNotifyClickThrough();
-    notifyWindow.loadFile(path.join(__dirname, "notify.html"));
-    notifyWindow.webContents.on("did-finish-load", () => {
+    win.setAlwaysOnTop(true, "screen-saver");
+    win.setVisibleOnAllWorkspaces(true);
+    const entry = { win, contentH: 0, typing: false };
+    notifyWindows.set(rec.id, entry);
+    applyEntryClickThrough(entry);
+    win.loadFile(path.join(__dirname, "notify.html"));
+    win.webContents.on("did-finish-load", () => {
+        if (win.isDestroyed()) return;
+        const id = JSON.stringify(rec.id);
         try {
-            notifyWindow.webContents.executeJavaScript(
-                `document.body.classList.toggle("click-through", ${_clickThroughState});`).catch(() => {});
+            win.webContents.executeJavaScript(
+                `window.__vetWinId = ${id}; window.__vetSetWin && window.__vetSetWin(${id});`).catch(() => {});
         } catch (e) {}
-        if (notifications.length) { positionNotifyWindow(); try { notifyWindow.showInactive(); } catch (e) {} }
+        applyEntryClickThrough(entry);
+        if ((notifications.length || incomingCall) && rec.win && !rec.win.isDestroyed() && rec.win.isVisible()) {
+            positionNotifyWindow(rec);
+            try { win.showInactive(); } catch (e) {}
+        }
     });
-    notifyWindow.on("closed", () => { notifyWindow = null; });
+    win.on("closed", () => {
+        if (notifyWindows.get(rec.id) === entry) notifyWindows.delete(rec.id);
+    });
+    return entry;
+}
+
+function destroyNotifyWindow(id) {
+    const e = notifyWindows.get(id);
+    if (!e) return;
+    notifyWindows.delete(id);
+    if (!e.win.isDestroyed()) { try { e.win.destroy(); } catch (err) {} }
+}
+
+function hideNotifyWindow(id) {
+    const e = notifyWindows.get(id);
+    if (!e || e.win.isDestroyed()) return;
+    try { if (e.win.isVisible()) e.win.hide(); } catch (err) {}
 }
 
 let notifyPos = null;   // { x, y, width } from the active layout; null = docked under the voice window
 
-function positionNotifyWindow() {
-    if (!notifyWindow || notifyWindow.isDestroyed()) return;
-    const anchor = notifyAnchor();
-    const h = notifyContentH > 0 ? notifyContentH
+function positionNotifyWindow(rec) {
+    const e = notifyWindows.get(rec.id);
+    if (!e || e.win.isDestroyed() || !rec.win || rec.win.isDestroyed()) return;
+    const h = e.contentH > 0 ? e.contentH
         : Math.max(1, notifications.length + (incomingCall ? 2 : 0)) * NOTIFY_ITEM_H;
+    const isFirst = windows.keys().next().value === rec.id;
     try {
-        if (notifyPos && boundsOnScreen({ ...notifyPos, height: h })) {
-            notifyWindow.setBounds({ x: notifyPos.x, y: notifyPos.y, width: notifyPos.width, height: h });
-        } else if (anchor) {
-            const [ax, ay] = anchor.getPosition();
-            const [aw, ah] = anchor.getSize();
-            notifyWindow.setBounds({ x: ax, y: ay + ah + 4, width: aw, height: h });
+        if (isFirst && notifyPos && boundsOnScreen({ ...notifyPos, height: h })) {
+            e.win.setBounds({ x: notifyPos.x, y: notifyPos.y, width: notifyPos.width, height: h });
         } else {
-            const [w] = notifyWindow.getSize();
-            const [x, y] = notifyWindow.getPosition();
-            notifyWindow.setBounds({ x, y, width: w, height: h });
+            const [ax, ay] = rec.win.getPosition();
+            const [aw, ah] = rec.win.getSize();
+            e.win.setBounds({ x: ax, y: ay + ah + 4, width: aw, height: h });
         }
-    } catch (e) {}
+    } catch (err) {}
+}
+
+function positionAllNotifyWindows() {
+    for (const rec of windows.values()) positionNotifyWindow(rec);
+}
+
+// Content height reported by a notify page (win missing = all, for older pages).
+function setNotifyContentH(winId, h) {
+    const ids = winId ? [winId] : [...notifyWindows.keys()];
+    for (const id of ids) {
+        const e = notifyWindows.get(id);
+        if (!e || e.win.isDestroyed() || e.contentH === h) continue;
+        e.contentH = h;
+        const rec = windows.get(id);
+        if (rec) positionNotifyWindow(rec);
+    }
+}
+
+function isNotifyTyping() {
+    for (const e of notifyWindows.values()) if (e.typing) return true;
+    return false;
 }
 
 // Typing a reply needs keyboard focus; otherwise the window never takes focus
 // (so it can't pull the game out of fullscreen).
-function setNotifyTyping(on) {
-    notifyTyping = !!on;
-    if (!notifyWindow || notifyWindow.isDestroyed()) return;
-    try {
-        notifyWindow.setFocusable(notifyTyping);
-        if (notifyTyping) notifyWindow.focus();
-    } catch (e) {}
+// winId null = every notify window (older pages send no id).
+function setNotifyTyping(winId, on) {
+    const targets = winId ? [notifyWindows.get(winId)].filter(Boolean) : [...notifyWindows.values()];
+    for (const e of targets) {
+        if (e.win.isDestroyed()) continue;
+        e.typing = !!on;
+        try {
+            e.win.setFocusable(e.typing);
+            if (e.typing) e.win.focus();
+        } catch (err) {}
+    }
     applyNotifyClickThrough();
 }
 
 // In a game (cursor hidden) the cards are display-only; with the cursor
 // visible they can be clicked (open chat / dismiss).
 function applyNotifyClickThrough() {
-    if (!notifyWindow || notifyWindow.isDestroyed()) return;
-    const ignore = _clickThroughState && !notifyTyping;
-    try { notifyWindow.setIgnoreMouseEvents(ignore, { forward: false }); } catch (e) {}
+    for (const e of notifyWindows.values()) applyEntryClickThrough(e);
+}
+
+function applyEntryClickThrough(e) {
+    if (e.win.isDestroyed()) return;
+    const ignore = _clickThroughState && !e.typing;
+    try { e.win.setIgnoreMouseEvents(ignore, { forward: false }); } catch (err) {}
     try {
-        notifyWindow.webContents.executeJavaScript(
+        e.win.webContents.executeJavaScript(
             `document.body.classList.toggle("click-through", ${_clickThroughState});`).catch(() => {});
-    } catch (e) {}
+    } catch (err) {}
 }
 
 // =====================================================================
@@ -1778,8 +1860,8 @@ async function noteForegroundForProfiles(pid, gameLike) {
     sseBroadcast("layouts", layoutsInfo());
     if (settings.layoutProfilesEnabled === false) return;
     const profiles = layoutProfiles();
-    if (profiles[key]) applyLayoutProfile(profiles[key]);
-    videoLog("[layout] profile", prev, "->", key, profiles[key] ? "(applied)" : "(none saved)");
+    const moved = profiles[key] ? applyLayoutProfile(profiles[key]) : 0;
+    videoLog("[layout] profile", prev, "->", key, profiles[key] ? `(applied, moved ${moved} windows)` : "(none saved)");
 }
 
 function noteSeenGame(exe) {
@@ -1920,13 +2002,27 @@ function updateActiveLayoutSoon() {
         if (!key || key === "__setup__") return;
         const profiles = layoutProfiles();
         const p = profiles[key] || { windows: {}, video: null, notify: null };
-        p.windows = p.windows || {};
+        // live windows first; then stale saved entries (ids not open now) kept
+        // for the order-fallback, capped at max(live count, previous count)
+        const prevWin = p.windows || {};
+        const liveEntries = [];
         for (const rec of windows.values()) {
             if (!rec.win || rec.win.isDestroyed()) continue;
             const [x, y] = rec.win.getPosition();
-            p.windows[rec.id] = { x, y };
+            liveEntries.push([rec.id, { x, y }]);
         }
-        const list = [...viewers.values()].filter(v => v.win && !v.win.isDestroyed());
+        if (liveEntries.length) {
+            const cap = Math.max(liveEntries.length, Object.keys(prevWin).length);
+            const liveIds = new Set(liveEntries.map(([id]) => id));
+            const nw = {};
+            for (const [id, pos] of liveEntries) nw[id] = pos;
+            for (const k of Object.keys(prevWin)) {
+                if (Object.keys(nw).length >= cap) break;
+                if (!liveIds.has(k) && !(k in nw)) nw[k] = prevWin[k];
+            }
+            p.windows = nw;
+        }
+        const list = viewersIn("").filter(v => v.win && !v.win.isDestroyed());
         if (list.length) {
             const vid = { ...(p.video || {}) };
             vid.extra = Array.isArray(vid.extra) ? vid.extra.slice() : [];
@@ -1972,19 +2068,49 @@ function saveLayoutProfile(key) {
     saveSettingsSoon();
 }
 
+// Returns the number of overlay windows moved.
 function applyLayoutProfile(p) {
     _applyingProfile = true;
+    let moved = 0;
     try {
-        for (const rec of windows.values()) {
-            const pos = p.windows?.[rec.id];
-            if (!pos || !rec.win || rec.win.isDestroyed()) continue;
+        const saved = p.windows || {};
+        const live = [...windows.values()].filter(rec => rec.win && !rec.win.isDestroyed());
+        // Pass 1: a window whose id is in the profile gets that place.
+        // Pass 2: the rest take the unused saved places in order (ids are
+        // random and get orphaned when windows are closed and recreated).
+        const target = new Map(); // rec -> saved key
+        const used = new Set();
+        for (const rec of live) {
+            if (saved[rec.id]) { target.set(rec, rec.id); used.add(rec.id); }
+        }
+        const free = Object.keys(saved).filter(k => !used.has(k));
+        const fallback = []; // [savedKey, rec.id]
+        for (const rec of live) {
+            if (target.has(rec) || !free.length) continue;
+            const k = free.shift();
+            target.set(rec, k);
+            fallback.push([k, rec.id]);
+        }
+        for (const rec of live) {
+            const key = target.get(rec);
+            if (key === undefined) continue;
+            const pos = saved[key];
             if (!boundsOnScreen({ x: pos.x, y: pos.y, width: rec.width || WINDOW_WIDTH, height: rec.height || HEIGHT_IDLE })) continue;
             rec.win.setPosition(pos.x, pos.y);
             rec.x = pos.x; rec.y = pos.y;
+            moved++;
+        }
+        // Heal the profile: fallback places are stored under the ids of the
+        // windows they were applied to.
+        if (fallback.length) {
+            const pairs = fallback.map(([k, id]) => [id, saved[k]]);
+            for (const [k] of fallback) delete p.windows[k];
+            for (const [id, pos] of pairs) p.windows[id] = pos;
+            saveSettingsSoon();
         }
         scheduleSaveWindows();
         notifyPos = p.notify || null;
-        positionNotifyWindow();
+        positionAllNotifyWindows();
         if (p.video) {
             const vp = videoPrefs();
             if (p.video.bounds) vp.bounds = p.video.bounds;
@@ -1992,7 +2118,8 @@ function applyLayoutProfile(p) {
             if (Array.isArray(p.video.extra)) vp.extraBounds = p.video.extra;
             // stream windows in the order they were opened: 1st = main place,
             // 2nd, 3rd... = the extra places
-            const list = [...viewers.values()].filter(v => v.win && !v.win.isDestroyed());
+            // main-group stream windows only, in the order they were opened
+            const list = viewersIn("").filter(v => v.win && !v.win.isDestroyed());
             list.forEach((v, i) => {
                 const b = i === 0 ? (v.preview ? p.video.previewBounds : p.video.bounds) : (p.video.extra || [])[i - 1];
                 if (b && boundsOnScreen(b)) {
@@ -2005,6 +2132,7 @@ function applyLayoutProfile(p) {
         }
     } catch (e) {}
     setTimeout(() => { _applyingProfile = false; }, 300);
+    return moved;
 }
 
 // ── Setup frames: empty stand-ins for the stream viewer (big + preview) and
@@ -2015,9 +2143,9 @@ function openSetupFrames(key) {
     closeSetupFrames();
     const prof = layoutProfiles()[key] || {};
     const vp = videoPrefs();
-    const anchor = notifyAnchor();
+    const anchorRec = firstVisibleOverlay();
     let ab = null;
-    try { if (anchor) ab = anchor.getBounds(); } catch (e) {}
+    try { if (anchorRec) ab = anchorRec.win.getBounds(); } catch (e) {}
     const wa = screen.getPrimaryDisplay().workArea;
     const pick = (...c) => c.find(b => b && boundsOnScreen(b)) || null;
     const big = pick(prof.video?.bounds, vp.bounds, { x: wa.x + Math.round(wa.width / 2 - 320), y: wa.y + Math.round(wa.height / 2 - 180), width: 640, height: 360 });
@@ -2277,7 +2405,7 @@ function applyAutoResize(rec) {
     rec.win.setBounds({ x, y, width: w, height: target });
     rec.height = target;
     scheduleSaveWindows();
-    positionNotifyWindow();
+    positionNotifyWindow(rec);
 }
 
 function applyAutoResizeAll() {
@@ -2353,7 +2481,7 @@ function createWindowFromRecord(record) {
             const d = monitorForWindow(win);
             if (d) rec.monitor = displayToMonitorRecord(d);
             scheduleSaveWindows();
-            positionNotifyWindow();
+            positionNotifyWindow(rec);
             if (setupMode) setupMoved();
             else if (rec._userMove) updateActiveLayoutSoon();
             rec._userMove = false;
@@ -2372,9 +2500,23 @@ function createWindowFromRecord(record) {
         rebuildTrayMenu();
     });
     win.on("closed", () => {
+        // Stream windows that belong to this overlay go with it.
+        for (const v of [...viewers.values()]) {
+            if (v.inst !== rec.id) continue;
+            try { if (v.win && !v.win.isDestroyed()) v.win.close(); } catch (e) {}
+        }
         windows.delete(rec.id);
+        // No overlay left: the main-group viewers (no overlay id) go too.
+        if (windows.size === 0) {
+            for (const v of [...viewers.values()]) {
+                if (v.inst !== "") continue;
+                try { if (v.win && !v.win.isDestroyed()) v.win.close(); } catch (e) {}
+            }
+        }
+        destroyNotifyWindow(rec.id);
         scheduleSaveWindows();
         rebuildTrayMenu();
+        if (!anyOverlayVisible()) clearNotifyState();
     });
 
     rebuildTrayMenu();
@@ -2660,6 +2802,8 @@ function toggleAllWindows() {
         if (!rec.win || rec.win.isDestroyed()) continue;
         try { if (anyVisible) rec.win.hide(); else rec.win.show(); } catch (e) {}
     }
+    if (anyVisible) clearNotifyState();
+    else notifyChanged();
 }
 
 function setOpacityAll(val) {
@@ -2725,9 +2869,9 @@ function wireVideoWindowIpc(win) {
 // What the plugin has to do to (re)start a viewer's picture.
 function pluginStartCommand(v) {
     if (v.local) return null;
-    if (v.camera) return ["watch-camera", v.userId];
-    if (v.own) return ["watch-own", v.userId];
-    return ["watch-stream", v.userId];
+    if (v.camera) return ["watch-camera", v.userId, v.inst];
+    if (v.own) return ["watch-own", v.userId, v.inst];
+    return ["watch-stream", v.userId, v.inst];
 }
 
 // Reconnect = the same thing as closing and reopening the viewer, minus
@@ -2736,12 +2880,12 @@ function pluginStartCommand(v) {
 // A local capture just reloads and captures again.
 function reopenVideoStream(v, attempt) {
     if (!v || !v.win || v.win.isDestroyed()) return;
-    if (!v.local) queuePluginCommand("stop-stream", v.key);
+    if (!v.local) queuePluginCommand("stop-stream", v.key, "", v.inst);
     v.offer = null; v.offerCandidates = []; v.answer = null; v.answerCandidates = [];
     v.reopenAttempts = Math.max(1, attempt || 1);
     try { v.win.webContents.reload(); } catch (e) {}
     const cmd = pluginStartCommand(v);
-    if (cmd) queuePluginCommand(cmd[0], cmd[1]);
+    if (cmd) queuePluginCommand(cmd[0], cmd[1], "", cmd[2]);
 }
 
 // Where a new viewer opens: the saved place for the first, the next ones
@@ -2778,18 +2922,60 @@ function placeForIndex(n) {
     return { bounds: boundsOnScreen(b) ? b : { ...base, x: base.x + n * 32, y: base.y + n * 32 }, preview: false };
 }
 
-function viewerStartPlace() {
-    return placeForIndex(viewers.size);
+// Viewers of one overlay instance. The main group ("") is the one that uses the
+// saved layout places. A viewer's membership (v.main) is decided when it opens:
+// no overlay id, or the first overlay window at that moment. Later changes in
+// window order don't move existing viewers between groups.
+function mainOverlayId() {
+    const k = windows.keys().next().value;
+    return k == null ? "" : String(k);
+}
+function isMainNow(inst) {
+    return !inst || inst === mainOverlayId();
+}
+// Group of a viewer (or of a new one): "" = main group, else the overlay id.
+function groupOf(main, inst) {
+    return main ? "" : String(inst || "");
+}
+// viewersIn("") = main group; viewersIn(id) = viewers of that other overlay.
+function viewersIn(group) {
+    group = String(group || "");
+    return [...viewers.values()].filter(v => group === "" ? !!v.main : (!v.main && v.inst === group));
+}
+function viewerKey(base, inst) {
+    if (!base) return "";
+    return base + (inst ? "@" + inst : "");
+}
+
+// Other overlay instances: a 640x360 box to the left of that overlay (to the
+// right when there is no room), stepped by index within its group.
+function overlayPlaceFor(inst, n) {
+    const rec = windows.get(inst);
+    if (!rec || !rec.win || rec.win.isDestroyed()) return { bounds: null, preview: false };
+    let ob;
+    try { ob = rec.win.getBounds(); } catch (e) { return { bounds: null, preview: false }; }
+    const W = 640, H = 360, STEP = 652;
+    let b = { x: ob.x - STEP - n * STEP, y: ob.y, width: W, height: H };
+    if (!boundsOnScreen(b)) b = { x: ob.x + ob.width + 12 + n * STEP, y: ob.y, width: W, height: H };
+    return { bounds: b, preview: false };
+}
+
+function placeFor(main, inst, n) {
+    return main ? placeForIndex(n) : overlayPlaceFor(inst, n);
+}
+
+function viewerStartPlace(main, inst) {
+    return placeFor(main, inst, viewersIn(groupOf(main, inst)).length);
 }
 
 // A window in the middle closed: the ones after it move up one place
-// (e.g. #3 takes #2's place when #2 goes away).
-function reflowViewers(fromIndex) {
-    [...viewers.values()].forEach((v, i) => {
+// (e.g. #3 takes #2's place when #2 goes away). Only its own group.
+function reflowViewers(group, fromIndex) {
+    viewersIn(group).forEach((v, i) => {
         if (i < fromIndex || !v.win || v.win.isDestroyed()) return;
-        const pl = placeForIndex(i);
+        const pl = placeFor(v.main, v.inst, i);
         if (!pl.bounds) return;
-        if (i === 0 && pl.preview !== v.preview) v.preview = pl.preview;
+        if (i === 0 && v.main && pl.preview !== v.preview) v.preview = pl.preview;
         v.place = pl.bounds;
         try { v.win.setBounds(fitToAspect(pl.bounds, v.aspect)); } catch (e) {}
         try { v.win.webContents.executeJavaScript(`window.__vetSetPreview && window.__vetSetPreview(${v.preview});`).catch(() => {}); } catch (e) {}
@@ -2799,7 +2985,9 @@ function reflowViewers(fromIndex) {
 function openVideoWindow(params) {
     params = params || {};
     const userId = params.userId ? String(params.userId) : null;
-    const key = String(params.key || (params.local ? "local:" + userId : params.camera ? "cam:" + userId : params.own ? "own:" + userId : userId) || "");
+    const inst = String(params.inst || "");
+    const base = params.local ? "local:" + userId : params.camera ? "cam:" + userId : params.own ? "own:" + userId : userId;
+    const key = String(params.key || viewerKey(base, inst) || "");
     if (!key) return;
     const existing = viewers.get(key);
     if (existing && existing.win && !existing.win.isDestroyed()) {
@@ -2809,7 +2997,8 @@ function openVideoWindow(params) {
     }
     const vp = videoPrefs();
     if (typeof vp.alpha === "number") _videoAlpha = Math.max(0.2, Math.min(1, vp.alpha));
-    const place = viewerStartPlace();
+    const main = isMainNow(inst);
+    const place = viewerStartPlace(main, inst);
     const preview = place.preview;
     const startBounds = place.bounds;
     const win = new BrowserWindow({
@@ -2826,7 +3015,7 @@ function openVideoWindow(params) {
         }
     });
     const v = {
-        key, userId, win, params: { ...params, key },
+        key, userId, inst, main, win, params: { ...params, key, inst },
         local: !!params.local, camera: !!params.camera, own: !!params.own, sourceId: params.sourceId || null,
         preview, savedBounds: boundsOnScreen(vp.bounds) ? vp.bounds : null,
         place: startBounds || null,     // the layout's spot; sizing works from this, not from current bounds
@@ -2891,12 +3080,13 @@ function openVideoWindow(params) {
 
     win.on("closed", () => {
         if (viewers.get(key) === v) {
-            const idx = [...viewers.keys()].indexOf(key);
+            const g = groupOf(v.main, v.inst);
+            const idx = viewersIn(g).indexOf(v);
             viewers.delete(key);
-            if (!v._swapped) reflowViewers(idx);
+            if (!v._swapped) reflowViewers(g, idx);
         }
         // "closed": the window is gone for good (not a reconnect), so Discord can stop watching too
-        if (!v.local) queuePluginCommand("stop-stream", key, v._swapped ? "" : "closed");
+        if (!v.local) queuePluginCommand("stop-stream", key, v._swapped ? "" : "closed", v.inst);
     });
 }
 
@@ -2915,19 +3105,22 @@ function myStreamCaptureId() {
 
 // My own stream: from Discord's pipeline via the plugin (what Discord
 // captured to send); if Discord has none, a local capture of the window.
-function openOwnStream() {
+function openOwnStream(winId) {
     const cur = myStreamCaptureId();
     if (!cur) { videoLog("own stream: not streaming"); return; }
-    if (viewers.has("own:" + cur.userId) || viewers.has("local:" + cur.userId)) return;
-    openVideoWindow({ own: true, userId: cur.userId });
-    queuePluginCommand("watch-own", cur.userId);
+    const inst = String(winId || "");
+    if (viewers.has(viewerKey("own:" + cur.userId, inst)) || viewers.has(viewerKey("local:" + cur.userId, inst))) return;
+    openVideoWindow({ own: true, userId: cur.userId, inst });
+    queuePluginCommand("watch-own", cur.userId, "", inst);
 }
 
 // The plugin couldn't get Discord's own-stream track: swap to local capture.
-function ownStreamToLocal() {
+function ownStreamToLocal(winId) {
     const cur = myStreamCaptureId();
     if (!cur) return;
-    const v = viewers.get("own:" + cur.userId);
+    const inst = String(winId || "");
+    const ownKey = viewerKey("own:" + cur.userId, inst);
+    const v = viewers.get(ownKey);
     let bounds = null;
     const order = [...viewers.keys()];
     if (v && v.win && !v.win.isDestroyed()) {
@@ -2937,13 +3130,13 @@ function ownStreamToLocal() {
         viewers.delete(v.key);
         try { v.win.close(); } catch (e) {}
     }
-    openVideoWindow({ local: true, userId: cur.userId, sourceId: cur.src });
-    const nk = "local:" + cur.userId;
+    openVideoWindow({ local: true, userId: cur.userId, sourceId: cur.src, inst });
+    const nk = viewerKey("local:" + cur.userId, inst);
     const nv = viewers.get(nk);
     if (nv) {
         if (bounds) { try { nv.win.setBounds(bounds); } catch (e) {} }
         // put it back where the "own" window was in the order
-        const at = order.indexOf("own:" + cur.userId);
+        const at = order.indexOf(ownKey);
         if (at >= 0) {
             const rest = [...viewers.entries()].filter(([k]) => k !== nk);
             rest.splice(Math.min(at, rest.length), 0, [nk, nv]);
@@ -3026,10 +3219,10 @@ function closeVideoWindow(key) {
     }
 }
 
-function queuePluginCommand(action, userId, name) {
+function queuePluginCommand(action, userId, name, sourceId = "") {
     commandQueue.push({
         id: nextCommandId++, action, userId: String(userId || ""),
-        sourceId: "", name: name || "", sound: null, createdAt: Date.now()
+        sourceId: sourceId ? String(sourceId) : "", name: name || "", sound: null, createdAt: Date.now()
     });
     flushCommandWaiters();
 }
@@ -3110,7 +3303,7 @@ function saveVideoBoundsSoon(v) {
     v._saveTimer = setTimeout(() => {
         v._saveTimer = null;
         if (!v.win || v.win.isDestroyed()) return;
-        if (viewers.values().next().value !== v) return;
+        if (viewersIn("")[0] !== v) return;
         const p = videoPrefs();
         const b = v.win.getBounds();
         if (v.preview) p.previewBounds = b; else p.bounds = b;
@@ -3139,7 +3332,7 @@ function applyVideoAspect(v, w, h) {
 
 function toggleVideoPreview(v) {
     if (!v || !v.win || v.win.isDestroyed()) return;
-    const first = viewers.values().next().value === v;
+    const first = viewersIn("")[0] === v;
     const p = videoPrefs();
     const cur = v.win.getBounds();
     if (!v.preview) {
@@ -3245,6 +3438,7 @@ app.on("before-quit", () => { isQuitting = true; });
 app.on("will-quit", () => {
     if (popupWindow && !popupWindow.isDestroyed()) { try { popupWindow.close(); } catch (e) {} }
     globalShortcut.unregisterAll();
+    for (const id of [...notifyWindows.keys()]) destroyNotifyWindow(id);
     stopFgProbe();
     if (_monitorRetryTimer) clearInterval(_monitorRetryTimer);
     if (_saveWindowsTimer) clearTimeout(_saveWindowsTimer);
